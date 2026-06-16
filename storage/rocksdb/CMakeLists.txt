@@ -311,6 +311,10 @@ IF (NOT HAVE_EXTERNAL_ROCKSDB)
     ${CMAKE_SOURCE_DIR}/rocksdb/tools/ldb_cmd.cc
     ${CMAKE_SOURCE_DIR}/rocksdb/tools/sst_dump_tool.cc
     ${CMAKE_SOURCE_DIR}/rocksdb/utilities/blob_db/blob_dump_tool.cc
+    # RocksDB 10.10: ldb/sst_dump unconditionally call
+    # DbStressCustomCompressionManager::Register(); its definition lives in a
+    # db_stress source that is not part of LIB_SOURCES, so add it explicitly.
+    ${CMAKE_SOURCE_DIR}/rocksdb/db_stress_tool/db_stress_compression_manager.cc
   )
   TARGET_LINK_LIBRARIES(rocksdb_tool rocksdb_sources)
 
@@ -321,3 +325,13 @@ IF (NOT HAVE_EXTERNAL_ROCKSDB)
   TARGET_LINK_LIBRARIES(ldb rocksdb_tool)
 
 ENDIF()
+
+# RocksDB 10.10 public headers require C++20 (using-enum, defaulted operator==,
+# enum-scope using). MySQL 8.0.32 compiles globally at C++17, so override only
+# the RocksDB-touching targets to C++20; the rest of the server stays C++17.
+# -std=c++20 is appended after the global -std=c++17 and gcc honors the last one.
+FOREACH(rdb_cxx20_tgt rocksdb_sources rocksdb rocksdb_se rocksdb_tool sst_dump ldb)
+  IF(TARGET ${rdb_cxx20_tgt})
+    TARGET_COMPILE_OPTIONS(${rdb_cxx20_tgt} PRIVATE -std=c++20)
+  ENDIF()
+ENDFOREACH()

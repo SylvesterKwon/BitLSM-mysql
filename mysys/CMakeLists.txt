@@ -202,6 +202,11 @@ LIST(APPEND MYSYS_SOURCES
   my_wsfile.cc
 )
 
+# my_wsenv/my_wsfile include RocksDB 10.10 headers, which require C++20.
+# The rest of mysys stays at the global C++17; -std=c++20 is appended after it
+# and gcc honors the last -std.
+ADD_COMPILE_FLAGS(my_wsenv.cc my_wsfile.cc COMPILE_FLAGS "-std=c++20")
+
 IF(FREEBSD)
   ADD_COMPILE_FLAGS(stacktrace.cc COMPILE_FLAGS ${LIBUNWIND_CFLAGS})
 ENDIF()
