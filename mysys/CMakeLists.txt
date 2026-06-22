@@ -185,12 +185,14 @@ IF(HAVE_EXTERNAL_ROCKSDB)
 ELSE()
   MESSAGE(STATUS "mysys: Using local RocksDB")
 
-  IF (NOT EXISTS "${CMAKE_SOURCE_DIR}/rocksdb/Makefile")
+  # rocksdb is sourced from the BitLSM submodule, which nests vanilla rocksdb
+  # under third_party/rocksdb (see storage/rocksdb/CMakeLists.txt).
+  IF (NOT EXISTS "${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb/Makefile")
     MESSAGE(SEND_ERROR
-      "Missing Makefile in rocksdb directory. Try \"git submodule update\".")
+      "Missing Makefile in rocksdb directory. Try \"git submodule update --init --recursive\".")
   ENDIF()
 
-  SET(ROCKSDB_ROOT ${CMAKE_SOURCE_DIR}/rocksdb)
+  SET(ROCKSDB_ROOT ${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb)
 ENDIF()
 
 INCLUDE_DIRECTORIES(

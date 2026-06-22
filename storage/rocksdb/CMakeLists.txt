@@ -18,16 +18,16 @@ IF(HAVE_EXTERNAL_ROCKSDB)
 ELSE()
   MESSAGE(STATUS "MyRocks: Using local RocksDB")
 
-  IF (NOT EXISTS "${CMAKE_SOURCE_DIR}/rocksdb/Makefile")
-    MESSAGE(SEND_ERROR "Missing Makefile in rocksdb directory. Try \"git submodule update\".")
+  IF (NOT EXISTS "${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb/Makefile")
+    MESSAGE(SEND_ERROR "Missing Makefile in rocksdb directory. Try \"git submodule update --init --recursive\".")
   ENDIF()
 
-  SET(ROCKSDB_ROOT ${CMAKE_SOURCE_DIR}/rocksdb)
+  SET(ROCKSDB_ROOT ${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb)
 
   # We assume that make checkout_folly has already been run before attempting
   # to build with folly.
   IF(ROCKSDB_FOLLY)
-    IF (NOT EXISTS "${CMAKE_SOURCE_DIR}/rocksdb/third-party/folly")
+    IF (NOT EXISTS "${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb/third-party/folly")
       MESSAGE(SEND_ERROR "Missing folly in rocksdb directory. Try \"make checkout_folly\".")
     ENDIF()
     ADD_DEFINITIONS(-DUSE_FOLLY -DFOLLY_NO_CONFIG)
@@ -61,7 +61,7 @@ ELSE()
   # split the list into lines
   STRING(REGEX MATCHALL "[^\n]+" ROCKSDB_LIB_SOURCES ${SCRIPT_OUTPUT})
 
-  SET(ROCKSDB_ROOT ${CMAKE_SOURCE_DIR}/rocksdb)
+  SET(ROCKSDB_ROOT ${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb)
 ENDIF()
 
 IF (WITH_UBSAN)
@@ -109,8 +109,8 @@ append_cflags_if_supported(-Wno-invalid-offsetof)
 # Suppress warnings for all clang versions
 IF(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   remove_compile_flags(-Winconsistent-missing-destructor-override -Wdeprecated)
-  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-shadow-field FILES ../../rocksdb/memtable/hash_skiplist_rep.cc)
-  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-conditional-uninitialized FILES ../../rocksdb/env/fs_posix.cc)
+  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-shadow-field FILES ../../rocksdb/third_party/rocksdb/memtable/hash_skiplist_rep.cc)
+  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-conditional-uninitialized FILES ../../rocksdb/third_party/rocksdb/env/fs_posix.cc)
 
   # platform007 (tbb, etc) has throw() which is deprecated
   append_cflags_if_supported(-Wno-deprecated-dynamic-exception-spec)
@@ -118,7 +118,7 @@ ENDIF()
 
 # Suppress warnings for clang-15 or newer
 IF(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 15)
-  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-unused-but-set-variable FILES ../../rocksdb/db/version_edit_handler.cc ../../rocksdb/cache/lru_cache.cc)
+  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-unused-but-set-variable FILES ../../rocksdb/third_party/rocksdb/db/version_edit_handler.cc ../../rocksdb/third_party/rocksdb/cache/lru_cache.cc)
   ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-array-parameter FILES ha_rocksdb.cc)
 ENDIF()
 
@@ -130,14 +130,14 @@ ENDIF()
 
 # Suppress warnings for gcc-6.x or newer
 IF(CMAKE_COMPILER_IS_GNUCXX AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 6)
-  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-logical-op FILES ../../rocksdb/file/filename.cc)
+  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-logical-op FILES ../../rocksdb/third_party/rocksdb/file/filename.cc)
 ENDIF()
 
 # Suppress warnings for gcc-12 or newer
 IF(CMAKE_COMPILER_IS_GNUCXX AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 12)
   IF(HAVE_AVX512F)
     MESSAGE(STATUS "AVX-512: add -Wno-uninitialized for xxhash.cc (check https://gcc.gnu.org/bugzilla/show_bug.cgi?id=105593)")
-    ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-uninitialized -Wno-maybe-uninitialized FILES ../../rocksdb/util/xxhash.cc ${BUNDLED_LZ4_PATH}/xxhash.c)
+    ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-uninitialized -Wno-maybe-uninitialized FILES ../../rocksdb/third_party/rocksdb/util/xxhash.cc ${BUNDLED_LZ4_PATH}/xxhash.c)
   ENDIF()
 ENDIF()
 
@@ -148,10 +148,26 @@ IF(FB_WITH_WSENV)
   )
 ENDIF()
 
+# CRoaring for the BitLSM bitmap layer, via FetchContent (mirrors BitLSM's own
+# CMakeLists). Provides the `roaring` target; ${croaring_SOURCE_DIR}/cpp/roaring
+# holds roaring.hh for the flat `#include "roaring.hh"` used by the SABI sources.
+INCLUDE(FetchContent)
+SET(ENABLE_ROARING_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+  croaring
+  GIT_REPOSITORY https://github.com/RoaringBitmap/CRoaring.git
+  GIT_TAG v4.7.0
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(croaring)
+
 INCLUDE_DIRECTORIES(
   ${ROCKSDB_ROOT}
   ${ROCKSDB_ROOT}/include
   ${ROCKSDB_ROOT}/third-party/gtest-1.8.1/fused-src
+  ${CMAKE_SOURCE_DIR}/rocksdb/src/include
+  ${croaring_SOURCE_DIR}/cpp/roaring
+  ${CMAKE_SOURCE_DIR}/rocksdb/third_party/folly-tdigest/include
 )
 
 SET(ROCKSDB_SE_SOURCES
@@ -181,6 +197,7 @@ SET(ROCKSDB_SE_SOURCES
   sql_dd.cc sql_dd.h
   rdb_cmd_srv_helper.cc rdb_cmd_srv_helper.h
   rdb_vector_db.cc rdb_vector_db.h
+  rdb_bitlsm_smoke.cc
   rdb_bulk_load.cc rdb_bulk_load.h
   clone/common.h clone/common.cc clone/donor.h clone/donor.cc clone/client.cc
 )
@@ -288,7 +305,10 @@ IF(NOT CMAKE_SYSTEM_NAME MATCHES "Darwin")
 ENDIF()
 
 ADD_LIBRARY(rocksdb_sources ${ROCKSDB_LIB_SOURCES})
-TARGET_LINK_LIBRARIES(rocksdb_sources ${rocksdb_static_libs})
+# `roaring` PUBLIC so it propagates to every consumer of rocksdb_sources
+# (rocksdb_se, rocksdb plugin, rocksdb_tool -> sst_dump/ldb). The SABI sources
+# compiled into rocksdb_sources reference CRoaring symbols.
+TARGET_LINK_LIBRARIES(rocksdb_sources ${rocksdb_static_libs} roaring)
 
 IF (ROCKSDB_DYNAMIC_PLUGIN)
   MYSQL_ADD_PLUGIN(rocksdb ${ROCKSDB_SE_SOURCES} STORAGE_ENGINE DEFAULT
@@ -307,21 +327,21 @@ ENDIF()
 IF (NOT HAVE_EXTERNAL_ROCKSDB)
   # TODO: read this file list from src.mk:TOOL_SOURCES
   ADD_LIBRARY(rocksdb_tool
-    ${CMAKE_SOURCE_DIR}/rocksdb/tools/ldb_tool.cc
-    ${CMAKE_SOURCE_DIR}/rocksdb/tools/ldb_cmd.cc
-    ${CMAKE_SOURCE_DIR}/rocksdb/tools/sst_dump_tool.cc
-    ${CMAKE_SOURCE_DIR}/rocksdb/utilities/blob_db/blob_dump_tool.cc
+    ${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb/tools/ldb_tool.cc
+    ${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb/tools/ldb_cmd.cc
+    ${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb/tools/sst_dump_tool.cc
+    ${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb/utilities/blob_db/blob_dump_tool.cc
     # RocksDB 10.10: ldb/sst_dump unconditionally call
     # DbStressCustomCompressionManager::Register(); its definition lives in a
     # db_stress source that is not part of LIB_SOURCES, so add it explicitly.
-    ${CMAKE_SOURCE_DIR}/rocksdb/db_stress_tool/db_stress_compression_manager.cc
+    ${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb/db_stress_tool/db_stress_compression_manager.cc
   )
   TARGET_LINK_LIBRARIES(rocksdb_tool rocksdb_sources)
 
-  MYSQL_ADD_EXECUTABLE(sst_dump ${CMAKE_SOURCE_DIR}/rocksdb/tools/sst_dump.cc)
+  MYSQL_ADD_EXECUTABLE(sst_dump ${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb/tools/sst_dump.cc)
   TARGET_LINK_LIBRARIES(sst_dump rocksdb_tool)
 
-  MYSQL_ADD_EXECUTABLE(ldb ${CMAKE_SOURCE_DIR}/rocksdb/tools/ldb.cc)
+  MYSQL_ADD_EXECUTABLE(ldb ${CMAKE_SOURCE_DIR}/rocksdb/third_party/rocksdb/tools/ldb.cc)
   TARGET_LINK_LIBRARIES(ldb rocksdb_tool)
 
 ENDIF()

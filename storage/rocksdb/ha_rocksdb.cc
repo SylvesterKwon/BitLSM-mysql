@@ -137,6 +137,9 @@ extern "C" void RocksDbThreadYield() {
 
 namespace myrocks {
 
+// M2 smoke: defined in rdb_bitlsm_smoke.cc. TEMPORARY -- replaced in M3.
+bool rdb_bitlsm_smoke_check();
+
 static st_global_stats global_stats;
 static st_export_stats export_stats;
 static st_memory_stats memory_stats;
@@ -9831,6 +9834,11 @@ static int rocksdb_init_func(void *const p) {
   int ret = rocksdb_init_internal(p);
   if (ret) {
     rocksdb_done_func(p);
+  } else {
+    // M2 smoke: prove the BitLSM bitmap API links and runs inside rocksdb_se.
+    // TEMPORARY -- replaced by Rdb_bitlsm_handler in M3.
+    LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, "BitLSM API smoke: %s",
+                    myrocks::rdb_bitlsm_smoke_check() ? "OK" : "FAILED");
   }
   return ret;
 }
