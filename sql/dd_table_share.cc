@@ -1484,6 +1484,11 @@ static bool fill_index_from_dd(THD *thd, TABLE_SHARE *share,
 
   fill_fb_vector_index_from_dd(&share->mem_root, idx_options, keyinfo);
 
+  // M3a-2: restore BITLSM_INDEX flag from the data dictionary.
+  if (idx_options.exists("bitlsm")) {
+    keyinfo->m_is_bitlsm = true;
+  }
+
   // Read comment
   dd::String_type comment = idx_obj->comment();
   keyinfo->comment.length = comment.length();

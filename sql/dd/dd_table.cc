@@ -1121,6 +1121,11 @@ static void fill_dd_indexes_from_keyinfo(
       }
     }
 
+    // storing bitlsm marker (M3a-2: DD persistence of KEY::m_is_bitlsm)
+    if (key->is_bitlsm_index()) {
+      idx_options->set("bitlsm", (uint)1);
+    }
+
     /*
       If we have no primary key, then we pick the first candidate primary
       key and promote it. When we promote, the field's of key_part needs to
