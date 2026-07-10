@@ -2702,6 +2702,11 @@ bool store_create_info(THD *thd, Table_ref *table_list, String *packet,
 /**
   show fb vector index options
 */
+static void store_bitlsm_index_options(String *packet, KEY *key_info) {
+  if (!key_info->is_bitlsm_index()) return;
+  packet->append(STRING_WITH_LEN(" BITLSM_INDEX"));
+}
+
 static void store_fb_vector_index_options(String *packet, KEY *key_info) {
   if (!key_info->is_fb_vector_index()) {
     return;
@@ -2753,6 +2758,7 @@ static void store_key_options(THD *thd, String *packet, TABLE *table,
     }
 
     store_fb_vector_index_options(packet, key_info);
+    store_bitlsm_index_options(packet, key_info);
 
     if ((key_info->flags & HA_USES_BLOCK_SIZE) &&
         table->s->key_block_size != key_info->block_size) {
