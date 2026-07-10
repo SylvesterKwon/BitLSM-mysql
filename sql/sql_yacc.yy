@@ -1445,6 +1445,7 @@ void warn_about_deprecated_binary(THD *thd)
 %token<lexer.keyword> OPID_SYM 10023              /* FB MYSQL */
 %token  LAST_INSERT_IDS_SYM 10024                /* FB MYSQL */
 %token<lexer.keyword> RAFT_LOG_POSITION_SYM 10025   /* FB MYSQL */
+%token<lexer.keyword> BITLSM_INDEX_SYM 10026            /* FB MYSQL */
 
 /*
   Resolve column attribute ambiguity -- force precedence of "UNIQUE KEY" against
@@ -8165,6 +8166,10 @@ common_index_option:
         | FB_VECTOR_TRAINED_INDEX_TABLE_SYM opt_equal TEXT_STRING_sys
           {
             $$ = make_fb_vector_trained_index_table_attribute(YYMEM_ROOT, to_lex_cstring($3));
+          }
+        | BITLSM_INDEX_SYM
+          {
+            $$ = make_bitlsm_index_attribute(YYMEM_ROOT);
           }
         ;
 

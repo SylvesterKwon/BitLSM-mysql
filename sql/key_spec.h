@@ -85,6 +85,7 @@ class KEY_CREATE_INFO {
   LEX_CSTRING m_fb_vector_index_type = EMPTY_CSTR;
   LEX_CSTRING m_fb_vector_trained_index_id = EMPTY_CSTR;
   LEX_CSTRING m_fb_vector_trained_index_table = EMPTY_CSTR;
+  bool m_is_bitlsm = false;  // set by BITLSM_INDEX marker (see parse_tree_nodes)
 };
 
 extern KEY_CREATE_INFO default_key_create_info;

@@ -109,6 +109,7 @@ static const SYMBOL symbols[] = {
     {SYM("BINARY", BINARY_SYM)},
     {SYM("BINLOG", BINLOG_SYM)},
     {SYM("BIT", BIT_SYM)},
+    {SYM("BITLSM_INDEX", BITLSM_INDEX_SYM)},
     {SYM("BLOB", BLOB_SYM)},
     {SYM("BLOCK", BLOCK_SYM)},
     {SYM("BOOL", BOOL_SYM)},

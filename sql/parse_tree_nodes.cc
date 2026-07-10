@@ -4978,6 +4978,21 @@ PT_base_index_option *make_fb_vector_trained_index_table_attribute(
       });
 }
 
+/**
+   create a bitlsm index marker attribute
+
+   @param mem_root Memory arena.
+
+   @return PT_base_index_option* to PT_attribute object.
+ */
+PT_base_index_option *make_bitlsm_index_attribute(MEM_ROOT *mem_root) {
+  return new (mem_root) PT_attribute<bool, PT_base_index_option>(
+      true, +[](bool, Table_ddl_parse_context *pc) {
+        pc->key_create_info->m_is_bitlsm = true;
+        return false;
+      });
+}
+
 PT_column_attr_base *make_column_fb_vector_dimension_attribute(
     MEM_ROOT *mem_root, ulong attr) {
   return new (mem_root) PT_attribute<ulong, PT_column_attr_base>(
