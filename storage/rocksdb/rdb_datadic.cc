@@ -401,6 +401,7 @@ uint Rdb_key_def::setup(const TABLE &tbl, const Rdb_tbl_def &tbl_def,
       if (!hidden_pk_exists) pk_info = &tbl.key_info[tbl.s->primary_key];
       m_name = std::string(key_info->name);
       m_vector_index_config = key_info->fb_vector_index_config;
+      m_is_bitlsm = key_info->is_bitlsm_index();
     } else {
       m_name = HIDDEN_PK_NAME;
     }

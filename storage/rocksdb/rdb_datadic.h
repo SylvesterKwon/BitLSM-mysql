@@ -661,6 +661,8 @@ class Rdb_key_def {
 
   Rdb_vector_index *get_vector_index() const { return m_vector_index.get(); }
 
+  bool is_bitlsm_index() const { return m_is_bitlsm; }
+
   /* Check if keypart #kp can be unpacked from index tuple */
   inline bool can_unpack(const uint kp) const;
   /* Check if keypart #kp needs unpack info */
@@ -872,6 +874,8 @@ class Rdb_key_def {
   rocksdb::ColumnFamilyHandle *m_cf_handle = nullptr;
 
   FB_vector_index_config m_vector_index_config{};
+
+  bool m_is_bitlsm = false;
 
   std::unique_ptr<Rdb_vector_index> m_vector_index;
 
