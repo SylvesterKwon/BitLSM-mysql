@@ -889,6 +889,9 @@ class Rdb_key_def {
                                         const Rdb_tbl_def &tbl_def,
                                         Rdb_cmd_srv_helper &cmd_srv_helper);
 
+  [[nodiscard]] uint setup_bitlsm_index(const TABLE &tbl,
+                                        const Rdb_tbl_def &tbl_def);
+
   static void pack_variable_format(const uchar *src, size_t src_len,
                                    uchar **dst);
 

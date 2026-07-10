@@ -412,6 +412,12 @@ uint Rdb_key_def::setup(const TABLE &tbl, const Rdb_tbl_def &tbl_def,
       return rtn;
     }
 
+    uint bitlsm_rtn = setup_bitlsm_index(tbl, tbl_def);
+    if (bitlsm_rtn) {
+      RDB_MUTEX_UNLOCK_CHECK(m_mutex);
+      return bitlsm_rtn;
+    }
+
     m_is_unique_sk = false;
     m_user_defined_sk_parts = 0;
     if (secondary_key) {
@@ -3710,6 +3716,55 @@ uint Rdb_key_def::setup_vector_index(const TABLE &tbl,
   return create_vector_index(cmd_srv_helper, tbl_def.base_dbname(),
                              m_vector_index_config, m_cf_handle, m_index_number,
                              m_vector_index);
+}
+
+uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
+                                     const Rdb_tbl_def &tbl_def) {
+  if (!m_is_bitlsm) {
+    return HA_EXIT_SUCCESS;
+  }
+
+  // Defensive: the server layer (prepare_bitlsm_index) already enforces a
+  // plain secondary index, but re-check in case a KEY reaches here mislabeled.
+  if (is_primary_key()) {
+    LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                    "BITLSM_INDEX is not supported on the primary key");
+    return HA_ERR_UNSUPPORTED;
+  }
+  if (tbl_def.get_table_type() != TABLE_TYPE::USER_TABLE) {
+    LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                    "BITLSM_INDEX is only supported on user tables");
+    return HA_ERR_UNSUPPORTED;
+  }
+  // No TTL / special index flags (the bitmap has no notion of TTL rows yet).
+  if (m_index_flags_bitmap != 0) {
+    LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                    "BITLSM_INDEX is not supported with TTL or index flags");
+    return HA_ERR_UNSUPPORTED;
+  }
+
+  // D10: attribute columns must not be primary-key columns. MyRocks stores PK
+  // columns only in the key (not the value), and the compaction-thread
+  // extractor (M3a-4) reads only the value; a PK-column attribute would be
+  // invisible to it. (Skipped for hidden-PK tables: no user PK columns exist.)
+  if (!Rdb_key_def::table_has_hidden_pk(tbl)) {
+    const KEY *key_info = &tbl.key_info[m_keyno];
+    const KEY *pk_info = &tbl.key_info[tbl.s->primary_key];
+    for (uint i = 0; i < key_info->actual_key_parts; i++) {
+      const Field *field = key_info->key_part[i].field;
+      for (uint kp = 0; kp < pk_info->user_defined_key_parts; kp++) {
+        // key_part->fieldnr is 1-based.
+        if (field->field_index() + 1 == pk_info->key_part[kp].fieldnr) {
+          LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                          "BITLSM_INDEX attribute cannot be a primary key "
+                          "column");
+          return HA_ERR_UNSUPPORTED;
+        }
+      }
+    }
+  }
+
+  return HA_EXIT_SUCCESS;
 }
 
 // See Rdb_charset_space_info::spaces_xfrm
