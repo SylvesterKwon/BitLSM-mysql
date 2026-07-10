@@ -14367,6 +14367,12 @@ int ha_rocksdb::update_write_indexes(const struct update_row_info &row_info,
       continue;
     }
 
+    // D3: a BITLSM_INDEX has no keyspace of its own (the SABI bitmap lives in
+    // the data CF's SST). Do not materialize secondary-key entries for it.
+    if (m_key_descr_arr[key_id]->is_bitlsm_index()) {
+      continue;
+    }
+
     rc = update_write_sk(table, *m_key_descr_arr[key_id], row_info,
                          bulk_load_sk);
     if (rc != HA_EXIT_SUCCESS) {
