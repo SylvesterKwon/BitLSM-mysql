@@ -7257,6 +7257,77 @@ static bool prepare_preexisting_foreign_key(
 /**
   set vector index info to key_info
 */
+// §3.5 attribute type support for BITLSM_INDEX. ORDERED: integer/float/temporal
+// (<=8B, order-preserving okey); UNORDERED equality on raw bytes => binary
+// collation strings only. Everything else (DECIMAL/BLOB/TEXT/JSON/ENUM/SET/
+// non-binary string) is rejected.
+static bool bitlsm_type_supported(const Create_field *cf) {
+  switch (cf->sql_type) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+    case MYSQL_TYPE_FLOAT:
+    case MYSQL_TYPE_DOUBLE:
+    case MYSQL_TYPE_DATE:
+    case MYSQL_TYPE_NEWDATE:
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_DATETIME2:
+    case MYSQL_TYPE_TIMESTAMP:
+    case MYSQL_TYPE_TIMESTAMP2:
+      return true;
+    case MYSQL_TYPE_STRING:
+    case MYSQL_TYPE_VARCHAR:
+      return cf->charset == &my_charset_bin ||
+             (cf->charset != nullptr && (cf->charset->state & MY_CS_BINSORT));
+    default:
+      return false;
+  }
+}
+
+// Validate a BITLSM_INDEX declaration and stamp KEY::m_is_bitlsm. Server-layer
+// checks only (D3 non-unique, D10 non-virtual, §3.5 supported types); the
+// non-PK-column check and CF constraints (D5) run in the storage engine
+// (Rdb_key_def setup, M3a-2), mirroring how fb_vector splits validation.
+// Returns true on error (my_error already raised).
+static bool prepare_bitlsm_index(const Key_spec *key, KEY *key_info,
+                                 List<Create_field> *create_list) {
+  if (!key->key_create_info.m_is_bitlsm) return false;  // not a bitlsm index
+
+  // D3: virtual keyspace => plain non-unique secondary index only.
+  if (key->type != KEYTYPE_MULTIPLE) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0),
+             "BITLSM_INDEX can only be a plain (non-PRIMARY/UNIQUE) index");
+    return true;
+  }
+
+  for (const Key_part_spec *kp : key->columns) {
+    const char *col = kp->get_field_name();
+    const Create_field *cf = nullptr;
+    for (const Create_field &f : *create_list)
+      if (my_strcasecmp(system_charset_info, f.field_name, col) == 0) {
+        cf = &f;
+        break;
+      }
+    if (cf == nullptr) continue;  // resolved by the generic key column builder
+
+    if (cf->is_virtual_gcol()) {  // D10: value doesn't store virtual columns
+      my_error(ER_WRONG_ARGUMENTS, MYF(0),
+               "BITLSM_INDEX cannot index a virtual generated column");
+      return true;
+    }
+    if (!bitlsm_type_supported(cf)) {  // §3.5
+      my_error(ER_WRONG_ARGUMENTS, MYF(0),
+               "BITLSM_INDEX column type is not supported");
+      return true;
+    }
+  }
+
+  key_info->m_is_bitlsm = true;
+  return false;
+}
+
 static bool prepare_fb_vector_index(const Key_spec *key, KEY *key_info) {
   if (key->key_create_info.m_fb_vector_index_type.length == 0) {
     // not a vector index, do nothing and return
@@ -7512,6 +7583,10 @@ static bool prepare_key(
   if (key_info->block_size) key_info->flags |= HA_USES_BLOCK_SIZE;
 
   if (prepare_fb_vector_index(key, key_info)) {
+    return true;
+  }
+
+  if (prepare_bitlsm_index(key, key_info, create_list)) {
     return true;
   }
 

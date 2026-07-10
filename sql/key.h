@@ -177,6 +177,9 @@ class KEY {
     return fb_vector_index_config.type() != FB_VECTOR_INDEX_TYPE::NONE;
   }
 
+  bool m_is_bitlsm = false;
+  bool is_bitlsm_index() const { return m_is_bitlsm; }
+
   /**
     in tmp tables, the object is created via alloc,
     need to initialize some fields manually here
