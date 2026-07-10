@@ -1,0 +1,60 @@
+--source include/have_rocksdb.inc
+
+# M3a-1: BITLSM_INDEX DDL surface (parse + server-layer validation).
+# Non-PK-column check and CF constraints (D5) are validated in the storage
+# engine (M3a-2) and are intentionally NOT covered here.
+
+--echo # Accept: numeric + date + binary-string attributes on a non-PK secondary index
+CREATE TABLE t_ok (
+  id BIGINT NOT NULL,
+  ln INT NOT NULL,
+  shipdate DATE,
+  discount DOUBLE,
+  quantity INT,
+  city VARBINARY(32),
+  PRIMARY KEY (id, ln) COMMENT 'cfname=t_ok_cf',
+  INDEX bi (shipdate, discount, quantity, city) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SHOW CREATE TABLE t_ok;
+DROP TABLE t_ok;
+
+--echo # Reject: BITLSM_INDEX on a PRIMARY key (must be a plain secondary index)
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_primary (
+  id BIGINT NOT NULL,
+  a INT,
+  PRIMARY KEY (id) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+--echo # Reject: BITLSM_INDEX on a UNIQUE key
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_unique (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_unique_cf',
+  a INT,
+  UNIQUE KEY uk (a) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+--echo # Reject: unsupported type (DECIMAL)
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_dec (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_dec_cf',
+  d DECIMAL(10,2),
+  INDEX bi (d) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+--echo # Reject: unsupported type (non-binary VARCHAR)
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_txt (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_txt_cf',
+  s VARCHAR(32) CHARACTER SET utf8mb4,
+  INDEX bi (s) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+--echo # Reject: virtual generated column
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_vg (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_vg_cf',
+  a INT,
+  b INT AS (a+1) VIRTUAL,
+  INDEX bi (b) BITLSM_INDEX
+) ENGINE=ROCKSDB;
