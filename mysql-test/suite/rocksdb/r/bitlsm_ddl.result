@@ -19,7 +19,7 @@ t_ok	CREATE TABLE `t_ok` (
   `quantity` int DEFAULT NULL,
   `city` varbinary(32) DEFAULT NULL,
   PRIMARY KEY (`id`,`ln`) COMMENT 'cfname=t_ok_cf',
-  KEY `bi` (`shipdate`,`discount`,`quantity`,`city`)
+  KEY `bi` (`shipdate`,`discount`,`quantity`,`city`) BITLSM_INDEX
 ) ENGINE=ROCKSDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 DROP TABLE t_ok;
 # Reject: BITLSM_INDEX on a PRIMARY key (must be a plain secondary index)

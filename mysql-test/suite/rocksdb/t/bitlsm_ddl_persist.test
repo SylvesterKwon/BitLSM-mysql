@@ -1,0 +1,25 @@
+--source include/have_rocksdb.inc
+
+--echo # BITLSM_INDEX flag must survive DD round-trip (reopen + restart).
+CREATE TABLE t_persist (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_persist_cf',
+  a INT,
+  b DOUBLE,
+  INDEX bi (a, b) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+--echo # (1) SHOW CREATE re-emits BITLSM_INDEX right after CREATE
+SHOW CREATE TABLE t_persist;
+
+--echo # (2) FLUSH TABLES forces a DD reopen; flag must persist
+FLUSH TABLES;
+SHOW CREATE TABLE t_persist;
+
+--echo # (3) server restart; flag must persist
+--source include/restart_mysqld.inc
+SHOW CREATE TABLE t_persist;
+
+--echo # (4) mysqldump round-trip reproduces BITLSM_INDEX
+--exec $MYSQL_DUMP --compact test t_persist
+
+DROP TABLE t_persist;
