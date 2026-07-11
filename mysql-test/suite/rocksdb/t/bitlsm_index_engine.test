@@ -1,0 +1,52 @@
+--source include/have_rocksdb.inc
+
+# setup_bitlsm_index logs an ERROR-level reason on rejection (mirrors
+# setup_vector_index); the reject cases below trigger it intentionally.
+--disable_query_log
+call mtr.add_suppression("BITLSM_INDEX");
+--enable_query_log
+
+--echo # Reject: a BITLSM_INDEX attribute that is a primary-key column
+# setup_bitlsm_index returns HA_ERR_UNSUPPORTED, surfaced as ER_GET_ERRNO
+# ("Got error N from storage engine"); the descriptive reason is in the error
+# log. Same surfacing as fb_vector's setup_vector_index rejections.
+--error ER_GET_ERRNO
+CREATE TABLE t_pkcol (
+  id BIGINT NOT NULL,
+  a INT,
+  PRIMARY KEY (id, a) COMMENT 'cfname=t_pkcol_cf',
+  INDEX bi (a) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+--echo # A BITLSM_INDEX writes NO secondary-key entries (compare with a normal index).
+CREATE TABLE t_norm (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_norm_cf',
+  a INT, b INT,
+  INDEX ni (a, b)
+) ENGINE=ROCKSDB;
+CREATE TABLE t_bit (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_bit_cf',
+  a INT, b INT,
+  INDEX bi (a, b) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+INSERT INTO t_norm VALUES (1,10,100),(2,20,200),(3,30,300);
+INSERT INTO t_bit  VALUES (1,10,100),(2,20,200),(3,30,300);
+
+--echo # Flush memtables so entries land in SST (visible in ROCKSDB_INDEX_FILE_MAP).
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+
+--echo # Normal secondary index 'ni' has SST entries; bitlsm index 'bi' has none.
+SELECT COUNT(*) > 0 AS norm_sk_has_entries
+FROM INFORMATION_SCHEMA.ROCKSDB_INDEX_FILE_MAP m
+JOIN INFORMATION_SCHEMA.ROCKSDB_DDL d
+  ON m.COLUMN_FAMILY = d.COLUMN_FAMILY AND m.INDEX_NUMBER = d.INDEX_NUMBER
+WHERE d.TABLE_NAME = 't_norm' AND d.INDEX_NAME = 'ni';
+
+SELECT COUNT(*) AS bit_sk_entries
+FROM INFORMATION_SCHEMA.ROCKSDB_INDEX_FILE_MAP m
+JOIN INFORMATION_SCHEMA.ROCKSDB_DDL d
+  ON m.COLUMN_FAMILY = d.COLUMN_FAMILY AND m.INDEX_NUMBER = d.INDEX_NUMBER
+WHERE d.TABLE_NAME = 't_bit' AND d.INDEX_NAME = 'bi';
+
+DROP TABLE t_norm, t_bit;

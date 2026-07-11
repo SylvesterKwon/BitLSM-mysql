@@ -1,0 +1,39 @@
+# Reject: a BITLSM_INDEX attribute that is a primary-key column
+CREATE TABLE t_pkcol (
+id BIGINT NOT NULL,
+a INT,
+PRIMARY KEY (id, a) COMMENT 'cfname=t_pkcol_cf',
+INDEX bi (a) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+ERROR HY000: Got error 1 - 'Operation not permitted' from storage engine
+# A BITLSM_INDEX writes NO secondary-key entries (compare with a normal index).
+CREATE TABLE t_norm (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_norm_cf',
+a INT, b INT,
+INDEX ni (a, b)
+) ENGINE=ROCKSDB;
+CREATE TABLE t_bit (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_bit_cf',
+a INT, b INT,
+INDEX bi (a, b) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+INSERT INTO t_norm VALUES (1,10,100),(2,20,200),(3,30,300);
+INSERT INTO t_bit  VALUES (1,10,100),(2,20,200),(3,30,300);
+# Flush memtables so entries land in SST (visible in ROCKSDB_INDEX_FILE_MAP).
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+# Normal secondary index 'ni' has SST entries; bitlsm index 'bi' has none.
+SELECT COUNT(*) > 0 AS norm_sk_has_entries
+FROM INFORMATION_SCHEMA.ROCKSDB_INDEX_FILE_MAP m
+JOIN INFORMATION_SCHEMA.ROCKSDB_DDL d
+ON m.COLUMN_FAMILY = d.COLUMN_FAMILY AND m.INDEX_NUMBER = d.INDEX_NUMBER
+WHERE d.TABLE_NAME = 't_norm' AND d.INDEX_NAME = 'ni';
+norm_sk_has_entries
+1
+SELECT COUNT(*) AS bit_sk_entries
+FROM INFORMATION_SCHEMA.ROCKSDB_INDEX_FILE_MAP m
+JOIN INFORMATION_SCHEMA.ROCKSDB_DDL d
+ON m.COLUMN_FAMILY = d.COLUMN_FAMILY AND m.INDEX_NUMBER = d.INDEX_NUMBER
+WHERE d.TABLE_NAME = 't_bit' AND d.INDEX_NAME = 'bi';
+bit_sk_entries
+0
+DROP TABLE t_norm, t_bit;
