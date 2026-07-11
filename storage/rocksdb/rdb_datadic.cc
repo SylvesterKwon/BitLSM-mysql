@@ -55,6 +55,7 @@
 /* MyRocks header files */
 #include "./ha_rocksdb.h"
 #include "./ha_rocksdb_proto.h"
+#include "./rdb_bitlsm.h"
 #include "./rdb_cf_manager.h"
 #include "./rdb_utils.h"
 
@@ -3718,6 +3719,21 @@ uint Rdb_key_def::setup_vector_index(const TABLE &tbl,
                              m_vector_index);
 }
 
+// Map a MySQL column type to a SABI attribute role. §3.5: strings (already
+// gated to binary collation in M3a-1) are UNORDERED opaque bytes; integer /
+// float / temporal are ORDERED (order-preserving okey). The precise physical
+// encoding (signed/float/width) is the extractor's concern (M3a-4).
+static bit_lsm::AttrRole bitlsm_role_of(const Field *field) {
+  switch (field->real_type()) {
+    case MYSQL_TYPE_STRING:
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_VAR_STRING:
+      return bit_lsm::AttrRole::UNORDERED;
+    default:
+      return bit_lsm::AttrRole::ORDERED;
+  }
+}
+
 uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
                                      const Rdb_tbl_def &tbl_def) {
   if (!m_is_bitlsm) {
@@ -3765,6 +3781,32 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
         }
       }
     }
+  }
+
+  // Bind this CF to a SABIFactory so its SSTs build the SABI bitmap. Roles are
+  // derived from the attribute column types (M3a-1 already gated to supported
+  // types). The extractor is a no-op stub in M3a-3b; M3a-4 wires the real
+  // Rdb_converter-based extractor.
+  bit_lsm::SABISchema schema;
+  const KEY *ki = &tbl.key_info[m_keyno];
+  schema.roles.reserve(ki->user_defined_key_parts);
+  for (uint i = 0; i < ki->user_defined_key_parts; i++) {
+    schema.roles.push_back(bitlsm_role_of(ki->key_part[i].field));
+  }
+  schema.rho = 0.1;  // default bitmap budget; tunable later
+  const uint32_t attr_num = schema.attr_num();
+  auto factory = std::make_shared<bit_lsm::SABIFactory>(schema, [attr_num] {
+    return std::make_unique<Rdb_bitlsm_noop_extractor>(attr_num);
+  });
+  if (!Rdb_bitlsm_registry::instance().bind(m_cf_handle->GetName(), schema.roles,
+                                            factory)) {
+    // D5/D17: this CF already hosts a different bitlsm schema. Fail loudly
+    // instead of silently letting the last writer win.
+    LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                    "BITLSM_INDEX: column family '%s' already hosts a different "
+                    "bitlsm schema (only one bitlsm table per CF is supported)",
+                    m_cf_handle->GetName().c_str());
+    return HA_ERR_UNSUPPORTED;
   }
 
   return HA_EXIT_SUCCESS;
