@@ -3750,7 +3750,10 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
   if (!Rdb_key_def::table_has_hidden_pk(tbl)) {
     const KEY *key_info = &tbl.key_info[m_keyno];
     const KEY *pk_info = &tbl.key_info[tbl.s->primary_key];
-    for (uint i = 0; i < key_info->actual_key_parts; i++) {
+    // Only the user-declared key parts are attributes; a secondary index's
+    // actual_key_parts also includes PK columns appended for covering, which
+    // would false-match the PK-membership check below.
+    for (uint i = 0; i < key_info->user_defined_key_parts; i++) {
       const Field *field = key_info->key_part[i].field;
       for (uint kp = 0; kp < pk_info->user_defined_key_parts; kp++) {
         // key_part->fieldnr is 1-based.
