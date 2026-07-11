@@ -22,6 +22,8 @@
 /* This C++ files header file */
 #include "./rdb_cf_options.h"
 
+#include "./rdb_bitlsm.h"
+
 /* C++ system header files */
 #include <string>
 
@@ -413,6 +415,22 @@ bool Rdb_cf_options::get_cf_options(const std::string &cf_name,
         std::make_shared<Rdb_sst_partitioner_factory>(
             opts->comparator->GetRootComparator(), opts->num_levels,
             Rdb_cf_manager::is_cf_name_reverse(cf_name));
+  }
+
+  // Install a per-CF BitLSM UDI factory on data CFs. It stays dormant (null
+  // builder/reader) until Rdb_key_def::setup_bitlsm_index binds this cf_name,
+  // so non-bitlsm CFs pay no per-row cost (RocksDB skips the wrapper on a null
+  // builder). Reuses the shared block cache / table options.
+  if (cf_name != DEFAULT_SYSTEM_CF_NAME && cf_name != DEFAULT_TMP_CF_NAME &&
+      cf_name != DEFAULT_TMP_SYSTEM_CF_NAME) {
+    const auto *bbt =
+        opts->table_factory->GetOptions<rocksdb::BlockBasedTableOptions>();
+    if (bbt != nullptr) {
+      rocksdb::BlockBasedTableOptions tbo = *bbt;
+      tbo.user_defined_index_factory =
+          std::make_shared<Rdb_bitlsm_udi_factory>(cf_name);
+      opts->table_factory.reset(rocksdb::NewBlockBasedTableFactory(tbo));
+    }
   }
   return true;
 }
