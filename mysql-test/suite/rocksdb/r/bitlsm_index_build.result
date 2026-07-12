@@ -1,0 +1,44 @@
+# SABI builds on flush without crashing; data stays intact; survives restart.
+CREATE TABLE t_build (
+id BIGINT NOT NULL,
+a INT, b DOUBLE, c VARBINARY(16),
+PRIMARY KEY (id) COMMENT 'cfname=t_build_cf',
+INDEX bi (a, b, c) COMMENT 'cfname=t_build_cf' BITLSM_INDEX
+) ENGINE=ROCKSDB;
+INSERT INTO t_build VALUES
+(1, 10, 1.5, 'x'), (2, 20, 2.5, 'y'), (3, 30, 3.5, 'z');
+# Force flush: SABIBuilder::OnKeyAdded runs per row, SABI block written.
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+# Full-scan read (index read path is M3b) returns all rows intact.
+SELECT id, a, b, c FROM t_build ORDER BY id;
+id	a	b	c
+1	10	1.5	x
+2	20	2.5	y
+3	30	3.5	z
+# Restart: the SABI SST reopens via the self-describing (v5) reader, with
+# no schema binding yet -- this is the case the pre-v5 reader corrupted.
+# restart
+INSERT INTO t_build VALUES (4, 40, 4.5, 'w');
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+SELECT id, a, b, c FROM t_build ORDER BY id;
+id	a	b	c
+1	10	1.5	x
+2	20	2.5	y
+3	30	3.5	z
+4	40	4.5	w
+DROP TABLE t_build;
+# D5/D17 fail-loud: a second bitlsm schema on the same CF is rejected.
+CREATE TABLE t_b1 (
+id BIGINT NOT NULL,
+a INT,
+PRIMARY KEY (id) COMMENT 'cfname=shared_bit_cf',
+INDEX bi (a) COMMENT 'cfname=shared_bit_cf' BITLSM_INDEX
+) ENGINE=ROCKSDB;
+CREATE TABLE t_b2 (
+id BIGINT NOT NULL,
+x VARBINARY(8),
+PRIMARY KEY (id) COMMENT 'cfname=shared_bit_cf',
+INDEX bi (x) COMMENT 'cfname=shared_bit_cf' BITLSM_INDEX
+) ENGINE=ROCKSDB;
+ERROR HY000: Got error 1 - 'Operation not permitted' from storage engine
+DROP TABLE t_b1;

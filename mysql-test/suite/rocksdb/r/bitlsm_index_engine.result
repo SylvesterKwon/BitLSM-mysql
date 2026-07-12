@@ -13,9 +13,10 @@ a INT, b INT,
 INDEX ni (a, b)
 ) ENGINE=ROCKSDB;
 CREATE TABLE t_bit (
-id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_bit_cf',
+id BIGINT NOT NULL,
 a INT, b INT,
-INDEX bi (a, b) BITLSM_INDEX
+PRIMARY KEY (id) COMMENT 'cfname=t_bit_cf',
+INDEX bi (a, b) COMMENT 'cfname=t_bit_cf' BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 INSERT INTO t_norm VALUES (1,10,100),(2,20,200),(3,30,300);
 INSERT INTO t_bit  VALUES (1,10,100),(2,20,200),(3,30,300);

@@ -1,0 +1,56 @@
+--source include/have_rocksdb.inc
+
+# A BITLSM_INDEX binds the column family its own Rdb_key_def lives in, and the
+# SABI bitmap is built from that CF's row values. So the bitlsm index MUST share
+# a CF with the primary key (the clustered data) -- otherwise SABI would build
+# over an empty CF. Co-locate both on a dedicated CF via matching index
+# comments: 'cfname=' only takes effect as a KEY comment (a table-constraint
+# PRIMARY KEY or an index), never as an inline column comment.
+
+--echo # SABI builds on flush without crashing; data stays intact; survives restart.
+CREATE TABLE t_build (
+  id BIGINT NOT NULL,
+  a INT, b DOUBLE, c VARBINARY(16),
+  PRIMARY KEY (id) COMMENT 'cfname=t_build_cf',
+  INDEX bi (a, b, c) COMMENT 'cfname=t_build_cf' BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+INSERT INTO t_build VALUES
+  (1, 10, 1.5, 'x'), (2, 20, 2.5, 'y'), (3, 30, 3.5, 'z');
+
+--echo # Force flush: SABIBuilder::OnKeyAdded runs per row, SABI block written.
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+
+--echo # Full-scan read (index read path is M3b) returns all rows intact.
+SELECT id, a, b, c FROM t_build ORDER BY id;
+
+--echo # Restart: the SABI SST reopens via the self-describing (v5) reader, with
+--echo # no schema binding yet -- this is the case the pre-v5 reader corrupted.
+--source include/restart_mysqld.inc
+INSERT INTO t_build VALUES (4, 40, 4.5, 'w');
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+SELECT id, a, b, c FROM t_build ORDER BY id;
+
+DROP TABLE t_build;
+
+--echo # D5/D17 fail-loud: a second bitlsm schema on the same CF is rejected.
+# t_b1 binds shared_bit_cf with roles [ORDERED]; t_b2 tries the same CF with a
+# DIFFERENT schema (roles [UNORDERED]) and must be rejected. (Same-schema rebind
+# is idempotent, so the two schemas must actually differ to exercise D5.)
+CREATE TABLE t_b1 (
+  id BIGINT NOT NULL,
+  a INT,
+  PRIMARY KEY (id) COMMENT 'cfname=shared_bit_cf',
+  INDEX bi (a) COMMENT 'cfname=shared_bit_cf' BITLSM_INDEX
+) ENGINE=ROCKSDB;
+--disable_query_log
+call mtr.add_suppression("BITLSM_INDEX: column family");
+--enable_query_log
+--error ER_GET_ERRNO
+CREATE TABLE t_b2 (
+  id BIGINT NOT NULL,
+  x VARBINARY(8),
+  PRIMARY KEY (id) COMMENT 'cfname=shared_bit_cf',
+  INDEX bi (x) COMMENT 'cfname=shared_bit_cf' BITLSM_INDEX
+) ENGINE=ROCKSDB;
+DROP TABLE t_b1;

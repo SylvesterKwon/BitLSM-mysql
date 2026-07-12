@@ -7,7 +7,7 @@ discount DOUBLE,
 quantity INT,
 city VARBINARY(32),
 PRIMARY KEY (id, ln) COMMENT 'cfname=t_ok_cf',
-INDEX bi (shipdate, discount, quantity, city) BITLSM_INDEX
+INDEX bi (shipdate, discount, quantity, city) COMMENT 'cfname=t_ok_cf' BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 SHOW CREATE TABLE t_ok;
 Table	Create Table
@@ -19,7 +19,7 @@ t_ok	CREATE TABLE `t_ok` (
   `quantity` int DEFAULT NULL,
   `city` varbinary(32) DEFAULT NULL,
   PRIMARY KEY (`id`,`ln`) COMMENT 'cfname=t_ok_cf',
-  KEY `bi` (`shipdate`,`discount`,`quantity`,`city`) BITLSM_INDEX
+  KEY `bi` (`shipdate`,`discount`,`quantity`,`city`) BITLSM_INDEX COMMENT 'cfname=t_ok_cf'
 ) ENGINE=ROCKSDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 DROP TABLE t_ok;
 # Reject: BITLSM_INDEX on a PRIMARY key (must be a plain secondary index)

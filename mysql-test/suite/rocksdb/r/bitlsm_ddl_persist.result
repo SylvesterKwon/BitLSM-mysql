@@ -1,51 +1,52 @@
 # BITLSM_INDEX flag must survive DD round-trip (reopen + restart).
 CREATE TABLE t_persist (
-id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_persist_cf',
+id BIGINT NOT NULL,
 a INT,
 b DOUBLE,
-INDEX bi (a, b) BITLSM_INDEX
+PRIMARY KEY (id) COMMENT 'cfname=t_persist_cf',
+INDEX bi (a, b) COMMENT 'cfname=t_persist_cf' BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 # (1) SHOW CREATE re-emits BITLSM_INDEX right after CREATE
 SHOW CREATE TABLE t_persist;
 Table	Create Table
 t_persist	CREATE TABLE `t_persist` (
-  `id` bigint NOT NULL COMMENT 'cfname=t_persist_cf',
+  `id` bigint NOT NULL,
   `a` int DEFAULT NULL,
   `b` double DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  KEY `bi` (`a`,`b`) BITLSM_INDEX
+  PRIMARY KEY (`id`) COMMENT 'cfname=t_persist_cf',
+  KEY `bi` (`a`,`b`) BITLSM_INDEX COMMENT 'cfname=t_persist_cf'
 ) ENGINE=ROCKSDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 # (2) FLUSH TABLES forces a DD reopen; flag must persist
 FLUSH TABLES;
 SHOW CREATE TABLE t_persist;
 Table	Create Table
 t_persist	CREATE TABLE `t_persist` (
-  `id` bigint NOT NULL COMMENT 'cfname=t_persist_cf',
+  `id` bigint NOT NULL,
   `a` int DEFAULT NULL,
   `b` double DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  KEY `bi` (`a`,`b`) BITLSM_INDEX
+  PRIMARY KEY (`id`) COMMENT 'cfname=t_persist_cf',
+  KEY `bi` (`a`,`b`) BITLSM_INDEX COMMENT 'cfname=t_persist_cf'
 ) ENGINE=ROCKSDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 # (3) server restart; flag must persist
 # restart
 SHOW CREATE TABLE t_persist;
 Table	Create Table
 t_persist	CREATE TABLE `t_persist` (
-  `id` bigint NOT NULL COMMENT 'cfname=t_persist_cf',
+  `id` bigint NOT NULL,
   `a` int DEFAULT NULL,
   `b` double DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  KEY `bi` (`a`,`b`) BITLSM_INDEX
+  PRIMARY KEY (`id`) COMMENT 'cfname=t_persist_cf',
+  KEY `bi` (`a`,`b`) BITLSM_INDEX COMMENT 'cfname=t_persist_cf'
 ) ENGINE=ROCKSDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 # (4) mysqldump round-trip reproduces BITLSM_INDEX
 /*!40101 SET @saved_cs_client     = @@character_set_client */;
 /*!50503 SET character_set_client = utf8mb4 */;
 CREATE TABLE `t_persist` (
-  `id` bigint NOT NULL COMMENT 'cfname=t_persist_cf',
+  `id` bigint NOT NULL,
   `a` int DEFAULT NULL,
   `b` double DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  KEY `bi` (`a`,`b`) BITLSM_INDEX
+  PRIMARY KEY (`id`) COMMENT 'cfname=t_persist_cf',
+  KEY `bi` (`a`,`b`) BITLSM_INDEX COMMENT 'cfname=t_persist_cf'
 ) ENGINE=ROCKSDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 DROP TABLE t_persist;

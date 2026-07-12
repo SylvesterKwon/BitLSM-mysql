@@ -13,7 +13,7 @@ CREATE TABLE t_ok (
   quantity INT,
   city VARBINARY(32),
   PRIMARY KEY (id, ln) COMMENT 'cfname=t_ok_cf',
-  INDEX bi (shipdate, discount, quantity, city) BITLSM_INDEX
+  INDEX bi (shipdate, discount, quantity, city) COMMENT 'cfname=t_ok_cf' BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 SHOW CREATE TABLE t_ok;
 DROP TABLE t_ok;

@@ -1,11 +1,15 @@
 --source include/have_rocksdb.inc
 
 --echo # BITLSM_INDEX flag must survive DD round-trip (reopen + restart).
+# Co-locate PK data and the bitlsm index on one dedicated CF (never 'default':
+# the registry is process-global, so sharing 'default' across tables/tests
+# cross-contaminates the D5 one-schema-per-CF check).
 CREATE TABLE t_persist (
-  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_persist_cf',
+  id BIGINT NOT NULL,
   a INT,
   b DOUBLE,
-  INDEX bi (a, b) BITLSM_INDEX
+  PRIMARY KEY (id) COMMENT 'cfname=t_persist_cf',
+  INDEX bi (a, b) COMMENT 'cfname=t_persist_cf' BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 
 --echo # (1) SHOW CREATE re-emits BITLSM_INDEX right after CREATE
