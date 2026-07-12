@@ -1,0 +1,162 @@
+# Mixed-type bitlsm table (INT signed, DOUBLE, VARBINARY), with negative
+# values and NULLs in each index column. The bi index carries no cfname.
+CREATE TABLE t_read (
+id BIGINT NOT NULL,
+a INT, b DOUBLE, c VARBINARY(16),
+d INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_read_cf',
+INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+INSERT INTO t_read VALUES
+(1,  -50,  -1.5, 'alpha', 100),
+(2,    0,   0.0, 'beta',  200),
+(3,   10,   2.5, 'gamma', 300),
+(4,   10,   2.5, 'gamma', 400),
+(5,   25,  99.9, 'delta', 500),
+(6,  100, 100.0, 'x',     600),
+(7,   10,  NULL, 'gamma', 700),
+(8, NULL,   2.5, 'gamma', 800),
+(9,   10,   2.5, NULL,    900),
+(10,  50,  50.0, 'zeta',  NULL);
+#
+# The optimizer must actually route FORCE INDEX(bi) into the bitlsm read
+# path (otherwise the differential checks below would pass trivially via a
+# table scan on both sides). EXPLAIN shows key=bi, and because d is not in
+# the index the WHERE is pushed as an index condition (ICP).
+EXPLAIN SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= 0 AND b < 100 AND c = 'gamma';
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	t_read	NULL	range	bi	bi	14	NULL	#	#	Using index condition
+Warnings:
+Note	1003	/* select#1 */ select `test`.`t_read`.`id` AS `id`,`test`.`t_read`.`a` AS `a`,`test`.`t_read`.`b` AS `b`,`test`.`t_read`.`c` AS `c`,`test`.`t_read`.`d` AS `d` from `test`.`t_read` FORCE INDEX (`bi`) where ((`test`.`t_read`.`c` = 'gamma') and (`test`.`t_read`.`a` >= 0) and (`test`.`t_read`.`b` < 100))
+include/assert.inc [FORCE INDEX(bi) range access is routed to the bitlsm index]
+include/assert.inc [FORCE INDEX(bi) exact/ref access is routed to the bitlsm index]
+#
+# ==== Phase 1: data in the memtable ====
+# Q1 multi-AND (a>=0 AND b<100 AND c='gamma')
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= 0 AND b < 100 AND c = 'gamma' ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+include/assert.inc [Q1 multi-AND (a>=0 AND b<100 AND c='gamma'): FORCE INDEX(bi) row set identical to full scan]
+# Q2 empty result (a > 1000)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a > 1000 ORDER BY id;
+id	a	b	c	d
+include/assert.inc [Q2 empty result (a > 1000): FORCE INDEX(bi) row set identical to full scan]
+# Q3 all rows (a >= -2147483648 OR a IS NULL)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= -2147483648 OR a IS NULL ORDER BY id;
+id	a	b	c	d
+1	-50	-1.5	alpha	100
+2	0	0	beta	200
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+5	25	99.9	delta	500
+6	100	100	x	600
+7	10	NULL	gamma	700
+8	NULL	2.5	gamma	800
+9	10	2.5	NULL	900
+10	50	50	zeta	NULL
+include/assert.inc [Q3 all rows (a >= -2147483648 OR a IS NULL): FORCE INDEX(bi) row set identical to full scan]
+# Q4 INT equality (a = 10)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a = 10 ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+7	10	NULL	gamma	700
+9	10	2.5	NULL	900
+include/assert.inc [Q4 INT equality (a = 10): FORCE INDEX(bi) row set identical to full scan]
+# Q5 boundary >= drops NULL a (a >= 10)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= 10 ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+5	25	99.9	delta	500
+6	100	100	x	600
+7	10	NULL	gamma	700
+9	10	2.5	NULL	900
+10	50	50	zeta	NULL
+include/assert.inc [Q5 boundary >= drops NULL a (a >= 10): FORCE INDEX(bi) row set identical to full scan]
+# Q6 IS NULL on b (b IS NULL)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE b IS NULL ORDER BY id;
+id	a	b	c	d
+7	10	NULL	gamma	700
+include/assert.inc [Q6 IS NULL on b (b IS NULL): FORCE INDEX(bi) row set identical to full scan]
+# Q7 DOUBLE range (b >= 0.0 AND b < 50.0)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE b >= 0.0 AND b < 50.0 ORDER BY id;
+id	a	b	c	d
+2	0	0	beta	200
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+8	NULL	2.5	gamma	800
+9	10	2.5	NULL	900
+include/assert.inc [Q7 DOUBLE range (b >= 0.0 AND b < 50.0): FORCE INDEX(bi) row set identical to full scan]
+# Q8 VARBINARY equality (c = 'x')
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE c = 'x' ORDER BY id;
+id	a	b	c	d
+6	100	100	x	600
+include/assert.inc [Q8 VARBINARY equality (c = 'x'): FORCE INDEX(bi) row set identical to full scan]
+#
+# ==== Phase 2: data flushed to an SST (SABI block present) ====
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+# Q1 multi-AND (a>=0 AND b<100 AND c='gamma')
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= 0 AND b < 100 AND c = 'gamma' ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+include/assert.inc [Q1 multi-AND (a>=0 AND b<100 AND c='gamma'): FORCE INDEX(bi) row set identical to full scan]
+# Q2 empty result (a > 1000)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a > 1000 ORDER BY id;
+id	a	b	c	d
+include/assert.inc [Q2 empty result (a > 1000): FORCE INDEX(bi) row set identical to full scan]
+# Q3 all rows (a >= -2147483648 OR a IS NULL)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= -2147483648 OR a IS NULL ORDER BY id;
+id	a	b	c	d
+1	-50	-1.5	alpha	100
+2	0	0	beta	200
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+5	25	99.9	delta	500
+6	100	100	x	600
+7	10	NULL	gamma	700
+8	NULL	2.5	gamma	800
+9	10	2.5	NULL	900
+10	50	50	zeta	NULL
+include/assert.inc [Q3 all rows (a >= -2147483648 OR a IS NULL): FORCE INDEX(bi) row set identical to full scan]
+# Q4 INT equality (a = 10)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a = 10 ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+7	10	NULL	gamma	700
+9	10	2.5	NULL	900
+include/assert.inc [Q4 INT equality (a = 10): FORCE INDEX(bi) row set identical to full scan]
+# Q5 boundary >= drops NULL a (a >= 10)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= 10 ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+5	25	99.9	delta	500
+6	100	100	x	600
+7	10	NULL	gamma	700
+9	10	2.5	NULL	900
+10	50	50	zeta	NULL
+include/assert.inc [Q5 boundary >= drops NULL a (a >= 10): FORCE INDEX(bi) row set identical to full scan]
+# Q6 IS NULL on b (b IS NULL)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE b IS NULL ORDER BY id;
+id	a	b	c	d
+7	10	NULL	gamma	700
+include/assert.inc [Q6 IS NULL on b (b IS NULL): FORCE INDEX(bi) row set identical to full scan]
+# Q7 DOUBLE range (b >= 0.0 AND b < 50.0)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE b >= 0.0 AND b < 50.0 ORDER BY id;
+id	a	b	c	d
+2	0	0	beta	200
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+8	NULL	2.5	gamma	800
+9	10	2.5	NULL	900
+include/assert.inc [Q7 DOUBLE range (b >= 0.0 AND b < 50.0): FORCE INDEX(bi) row set identical to full scan]
+# Q8 VARBINARY equality (c = 'x')
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE c = 'x' ORDER BY id;
+id	a	b	c	d
+6	100	100	x	600
+include/assert.inc [Q8 VARBINARY equality (c = 'x'): FORCE INDEX(bi) row set identical to full scan]
+DROP TABLE t_read;

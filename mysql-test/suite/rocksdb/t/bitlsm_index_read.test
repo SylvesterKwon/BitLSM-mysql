@@ -1,0 +1,64 @@
+--source include/have_rocksdb.inc
+
+# M3b-1: bitlsm index read-path plumbing (full scan through the index path).
+#
+# A BITLSM_INDEX (a, b, c) has NO secondary-key entries of its own (D3), so a
+# normal index range scan finds nothing. When the optimizer picks the index
+# (FORCE INDEX(bi)), the engine instead full-scans the PK data CF and lets
+# Index Condition Pushdown filter each row against the pushed WHERE -- returning
+# results IDENTICAL to a full table scan. This is deliberately a full scan (no
+# bitmap acceleration yet; that is M3b-3). This test is DIFFERENTIAL: for every
+# query it asserts FORCE INDEX(bi) == IGNORE INDEX(bi) (full scan), in both the
+# memtable and the flushed-SST states.
+
+--echo # Mixed-type bitlsm table (INT signed, DOUBLE, VARBINARY), with negative
+--echo # values and NULLs in each index column. The bi index carries no cfname.
+CREATE TABLE t_read (
+  id BIGINT NOT NULL,
+  a INT, b DOUBLE, c VARBINARY(16),
+  d INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_read_cf',
+  INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+# d is a payload column NOT in bi, so queries selecting it make the index
+# non-covering and force the WHERE through Index Condition Pushdown.
+INSERT INTO t_read VALUES
+  (1,  -50,  -1.5, 'alpha', 100),
+  (2,    0,   0.0, 'beta',  200),
+  (3,   10,   2.5, 'gamma', 300),
+  (4,   10,   2.5, 'gamma', 400),
+  (5,   25,  99.9, 'delta', 500),
+  (6,  100, 100.0, 'x',     600),
+  (7,   10,  NULL, 'gamma', 700),
+  (8, NULL,   2.5, 'gamma', 800),
+  (9,   10,   2.5, NULL,    900),
+  (10,  50,  50.0, 'zeta',  NULL);
+
+--echo #
+--echo # The optimizer must actually route FORCE INDEX(bi) into the bitlsm read
+--echo # path (otherwise the differential checks below would pass trivially via a
+--echo # table scan on both sides). EXPLAIN shows key=bi, and because d is not in
+--echo # the index the WHERE is pushed as an index condition (ICP).
+--replace_column 10 # 11 #
+EXPLAIN SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= 0 AND b < 100 AND c = 'gamma';
+# Machine-enforced routing guards (range access and exact/ref access).
+--let $bi_range_key = query_get_value(EXPLAIN SELECT id FROM t_read FORCE INDEX(bi) WHERE a >= 10, key, 1)
+--let $assert_text = FORCE INDEX(bi) range access is routed to the bitlsm index
+--let $assert_cond = "$bi_range_key" = "bi"
+--source include/assert.inc
+--let $bi_ref_key = query_get_value(EXPLAIN SELECT id FROM t_read FORCE INDEX(bi) WHERE a = 10, key, 1)
+--let $assert_text = FORCE INDEX(bi) exact/ref access is routed to the bitlsm index
+--let $assert_cond = "$bi_ref_key" = "bi"
+--source include/assert.inc
+
+--echo #
+--echo # ==== Phase 1: data in the memtable ====
+--source suite/rocksdb/include/bitlsm_index_read_battery.inc
+
+--echo #
+--echo # ==== Phase 2: data flushed to an SST (SABI block present) ====
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+--source suite/rocksdb/include/bitlsm_index_read_battery.inc
+
+DROP TABLE t_read;
