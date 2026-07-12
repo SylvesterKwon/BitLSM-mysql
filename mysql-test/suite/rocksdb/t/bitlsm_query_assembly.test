@@ -1,0 +1,127 @@
+--source include/have_rocksdb.inc
+--source include/have_debug.inc
+
+# M3b-2: BitLSM query assembly. The engine translates the WHERE pushed as an
+# index condition on a BITLSM_INDEX into a bit_lsm::BitLSMQuery (CNF), validates
+# it, and (debug builds) exposes the assembled query's ToString() through the
+# session status var rocksdb_bitlsm_last_query. This test drives a SELECT for
+# each WHERE shape and asserts the exact assembled-query string.
+#
+# The assembled query is only a PRUNING HINT and does NOT change result rows in
+# M3b-2 (that is M3b-3); correctness is still guaranteed by ICP re-evaluation.
+# The differential bitlsm_index_read test cannot see the translation (safe
+# conservative omission leaves results unchanged), so this test verifies
+# TRANSLATION COMPLETENESS -- the exact string -- directly.
+#
+# The invariant under test: the assembled query is a WEAKENING (necessary
+# condition) of the WHERE. Untranslatable sub-conditions are OMITTED, never
+# mistranslated:
+#   - AND: each conjunct is translated independently; unrepresentable conjuncts
+#     are dropped (dropping a conjunct only weakens).
+#   - OR:  translated only if EVERY disjunct is representable, else the whole OR
+#     is dropped (dropping a disjunct would strengthen -- unsafe).
+#   - UNORDERED (VARBINARY) attrs are equality-only.
+
+CREATE TABLE t_asm (
+  id BIGINT NOT NULL,
+  a INT, b DOUBLE, c VARBINARY(16),
+  d INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_asm_cf',
+  INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+# d is a payload column NOT in bi, so selecting it makes bi non-covering and the
+# WHERE is pushed through Index Condition Pushdown -- the point the translator
+# reads. attr mapping: a -> a0 (signed int64), b -> a1 (double), c -> a2
+# (unordered binary string).
+INSERT INTO t_asm VALUES
+  (1, -50, -1.5, 'alpha', 100),
+  (2,   1,  0.0, 'x',     200),
+  (3,   2,  2.5, 'gamma', 300),
+  (4,  10,  4.0, 'x',     400),
+  (5,  25, 99.9, 'delta', 500),
+  (6, 100, 2.5,  'gamma', 600);
+
+--echo #
+--echo # Routing guards: the shapes exercised below must reach the bitlsm read
+--echo # path (key=bi). A bitlsm index without a leading-column predicate falls
+--echo # back to a table scan (bi has no keyspace of its own), so the assembled
+--echo # query would go stale -- these guards catch that regression.
+--let $k = query_get_value(EXPLAIN SELECT id FROM t_asm FORCE INDEX(bi) WHERE a >= 10, key, 1)
+--let $assert_text = range shape (a >= 10) routes to the bitlsm index
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+--let $k = query_get_value(EXPLAIN SELECT id FROM t_asm FORCE INDEX(bi) WHERE a IS NOT NULL AND b = 2.5, key, 1)
+--let $assert_text = IS-NOT-NULL + non-leading-eq shape routes to the bitlsm index
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+
+--echo #
+--echo # (1) Single comparison on a signed INT column (attr a0).
+--let $w = a >= 10
+--let $expected = a0>=10
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (2) Multi-AND across all three columns -> one clause per conjunct. The
+--echo # clause order follows the optimizer's pushed condition, not source order.
+--let $w = a >= 10 AND b < 5 AND c = 'x'
+--let $expected = a2='x' AND a0>=10 AND a1<5
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (3) OR on one column -> a single OR-clause of EQUALs.
+--let $w = a = 1 OR a = 2
+--let $expected = (a0=1 OR a0=2)
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (4) IN-list on one column -> an OR-clause of EQUALs.
+--let $w = a IN (1, 2, 3)
+--let $expected = (a0=1 OR a0=2 OR a0=3)
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (5) AND with one untranslatable conjunct (arithmetic (a+b)>3): only the
+--echo # translatable conjunct survives (dropping a conjunct weakens -> safe).
+--let $w = a >= 10 AND (a + b) > 3
+--let $expected = a0>=10
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (6) OR with one untranslatable disjunct (ABS(b)=2): the WHOLE OR is
+--echo # omitted (dropping a disjunct would strengthen -> unsafe); the guarding
+--echo # AND conjunct still translates.
+--let $w = a >= 5 AND (a = 1 OR ABS(b) = 2)
+--let $expected = a0>=5
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (7) UNORDERED (VARBINARY) attr with a non-EQUAL op (c > 'x') is omitted;
+--echo # the ordered conjunct survives.
+--let $w = a >= 0 AND c > 'x'
+--let $expected = a0>=0
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (8a) Type mapping: DOUBLE equality -> a1=<double>. IS NOT NULL forces
+--echo # routing through bi and is itself omitted (unrepresentable), isolating
+--echo # the b comparand.
+--let $w = a IS NOT NULL AND b = 2.5
+--let $expected = a1=2.5
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (8b) Type mapping: VARBINARY equality -> a2='<bytes>'.
+--let $w = a IS NOT NULL AND c = 'gamma'
+--let $expected = a2='gamma'
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (9) Everything untranslatable (IS NOT NULL + arithmetic) -> empty query
+--echo # (a valid "no pruning" result).
+--let $w = a IS NOT NULL AND (a + b) > 3
+--let $expected =
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+DROP TABLE t_asm;

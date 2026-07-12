@@ -1,0 +1,80 @@
+CREATE TABLE t_asm (
+id BIGINT NOT NULL,
+a INT, b DOUBLE, c VARBINARY(16),
+d INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_asm_cf',
+INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+INSERT INTO t_asm VALUES
+(1, -50, -1.5, 'alpha', 100),
+(2,   1,  0.0, 'x',     200),
+(3,   2,  2.5, 'gamma', 300),
+(4,  10,  4.0, 'x',     400),
+(5,  25, 99.9, 'delta', 500),
+(6, 100, 2.5,  'gamma', 600);
+#
+# Routing guards: the shapes exercised below must reach the bitlsm read
+# path (key=bi). A bitlsm index without a leading-column predicate falls
+# back to a table scan (bi has no keyspace of its own), so the assembled
+# query would go stale -- these guards catch that regression.
+include/assert.inc [range shape (a >= 10) routes to the bitlsm index]
+include/assert.inc [IS-NOT-NULL + non-leading-eq shape routes to the bitlsm index]
+#
+# (1) Single comparison on a signed INT column (attr a0).
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 10;
+# WHERE a >= 10
+#   assembled: [a0>=10]
+#
+# (2) Multi-AND across all three columns -> one clause per conjunct. The
+# clause order follows the optimizer's pushed condition, not source order.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 10 AND b < 5 AND c = 'x';
+# WHERE a >= 10 AND b < 5 AND c = 'x'
+#   assembled: [a2='x' AND a0>=10 AND a1<5]
+#
+# (3) OR on one column -> a single OR-clause of EQUALs.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a = 1 OR a = 2;
+# WHERE a = 1 OR a = 2
+#   assembled: [(a0=1 OR a0=2)]
+#
+# (4) IN-list on one column -> an OR-clause of EQUALs.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a IN (1, 2, 3);
+# WHERE a IN (1, 2, 3)
+#   assembled: [(a0=1 OR a0=2 OR a0=3)]
+#
+# (5) AND with one untranslatable conjunct (arithmetic (a+b)>3): only the
+# translatable conjunct survives (dropping a conjunct weakens -> safe).
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 10 AND (a + b) > 3;
+# WHERE a >= 10 AND (a + b) > 3
+#   assembled: [a0>=10]
+#
+# (6) OR with one untranslatable disjunct (ABS(b)=2): the WHOLE OR is
+# omitted (dropping a disjunct would strengthen -> unsafe); the guarding
+# AND conjunct still translates.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 5 AND (a = 1 OR ABS(b) = 2);
+# WHERE a >= 5 AND (a = 1 OR ABS(b) = 2)
+#   assembled: [a0>=5]
+#
+# (7) UNORDERED (VARBINARY) attr with a non-EQUAL op (c > 'x') is omitted;
+# the ordered conjunct survives.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND c > 'x';
+# WHERE a >= 0 AND c > 'x'
+#   assembled: [a0>=0]
+#
+# (8a) Type mapping: DOUBLE equality -> a1=<double>. IS NOT NULL forces
+# routing through bi and is itself omitted (unrepresentable), isolating
+# the b comparand.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a IS NOT NULL AND b = 2.5;
+# WHERE a IS NOT NULL AND b = 2.5
+#   assembled: [a1=2.5]
+#
+# (8b) Type mapping: VARBINARY equality -> a2='<bytes>'.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a IS NOT NULL AND c = 'gamma';
+# WHERE a IS NOT NULL AND c = 'gamma'
+#   assembled: [a2='gamma']
+#
+# (9) Everything untranslatable (IS NOT NULL + arithmetic) -> empty query
+# (a valid "no pruning" result).
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a IS NOT NULL AND (a + b) > 3;
+# WHERE a IS NOT NULL AND (a + b) > 3
+#   assembled: []
+DROP TABLE t_asm;
