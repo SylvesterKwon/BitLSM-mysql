@@ -1,0 +1,320 @@
+/* Copyright (c) Meta Platforms, Inc. and affiliates. */
+
+#include "./rdb_bitlsm_query.h"
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+
+/* MySQL server: Item tree, Field metadata, KEY. */
+#include "sql/field.h"
+#include "sql/item.h"
+#include "sql/item_cmpfunc.h"  // Item_cond, Item_func_in
+#include "sql/item_func.h"
+#include "sql/key.h"
+#include "sql/sql_list.h"
+
+namespace myrocks {
+
+namespace {
+
+using bit_lsm::AttrSpec;
+using bit_lsm::BitLSMOptions;
+using bit_lsm::BitLSMQuery;
+using bit_lsm::CompareOp;
+using bit_lsm::OrClause;
+using bit_lsm::QueryCondition;
+
+// Which variant alternative an attribute's comparand must use. Mirrors the
+// role/encoding derivation in rdb_datadic.cc::bitlsm_derive_enc so the query's
+// comparand type can never disagree with how rows were binned. SKIP marks an
+// attribute the query translator does not (yet) know how to encode a literal
+// for (e.g. DATE): conditions on it are conservatively omitted.
+enum class ValKind { SKIP, I64, U64, DBL, STR };
+
+// Per-attribute translation metadata, keyed by the table field index.
+struct AttrMeta {
+  uint32_t attr_idx;  // position in the index's user-defined key parts
+  ValKind kind;
+};
+
+// Map a Field to (AttrSpec, ValKind). All types here are the ones the extractor
+// accepts (the table would not exist otherwise); DATE and anything unexpected
+// still get a placeholder AttrSpec so attr_idx alignment is preserved, but are
+// marked SKIP so no condition is emitted for them.
+static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
+  using bit_lsm::ORDERED;
+  using bit_lsm::UNORDERED;
+  const bool nullable = f->is_nullable();
+  switch (f->real_type()) {
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG: {
+      const bool uns = f->is_unsigned();
+      uint8_t w = static_cast<uint8_t>(f->pack_length());
+      if (w == 3) w = 4;  // INT24 -> nearest valid AttrSpec width
+      *spec = AttrSpec(ORDERED, w, /*is_signed=*/!uns, /*is_float=*/false,
+                       nullable);
+      *kind = uns ? ValKind::U64 : ValKind::I64;
+      return;
+    }
+    case MYSQL_TYPE_FLOAT:
+      *spec = AttrSpec(ORDERED, 4, /*is_signed=*/true, /*is_float=*/true,
+                       nullable);
+      *kind = ValKind::DBL;
+      return;
+    case MYSQL_TYPE_DOUBLE:
+      *spec = AttrSpec(ORDERED, 8, /*is_signed=*/true, /*is_float=*/true,
+                       nullable);
+      *kind = ValKind::DBL;
+      return;
+    case MYSQL_TYPE_STRING:   // CHAR/BINARY (binary collation)
+    case MYSQL_TYPE_VARCHAR:  // VARCHAR/VARBINARY (binary collation)
+      *spec = AttrSpec(UNORDERED, 0, /*is_signed=*/false, /*is_float=*/false,
+                       nullable);
+      *kind = ValKind::STR;
+      return;
+    default:
+      *spec = AttrSpec(ORDERED, 8, /*is_signed=*/true, /*is_float=*/false,
+                       nullable);
+      *kind = ValKind::SKIP;
+      return;
+  }
+}
+
+// Shared context for one translation: field_index -> attr metadata.
+struct Ctx {
+  std::unordered_map<uint, AttrMeta> by_field;
+};
+
+// If `it` (after unwrapping refs) is an index-column field, return its Field and
+// fill *meta; otherwise return nullptr.
+static const Field *index_field_of(Item *it, const Ctx &ctx, AttrMeta *meta) {
+  Item *r = it->real_item();
+  if (r->type() != Item::FIELD_ITEM) return nullptr;
+  const Field *f = static_cast<Item_field *>(r)->field;
+  auto found = ctx.by_field.find(f->field_index());
+  if (found == ctx.by_field.end()) return nullptr;
+  *meta = found->second;
+  return f;
+}
+
+// Map a comparison functype to a CompareOp; `flip` is true when the index field
+// is on the RIGHT-hand side (const OP field), which reverses the direction.
+static bool map_op(Item_func::Functype ft, bool flip, CompareOp *op) {
+  switch (ft) {
+    case Item_func::EQ_FUNC:
+      *op = CompareOp::EQUAL;
+      return true;
+    case Item_func::LT_FUNC:
+      *op = flip ? CompareOp::GREATER : CompareOp::LESS;
+      return true;
+    case Item_func::LE_FUNC:
+      *op = flip ? CompareOp::GREATER_EQUAL : CompareOp::LESS_EQUAL;
+      return true;
+    case Item_func::GT_FUNC:
+      *op = flip ? CompareOp::LESS : CompareOp::GREATER;
+      return true;
+    case Item_func::GE_FUNC:
+      *op = flip ? CompareOp::LESS_EQUAL : CompareOp::GREATER_EQUAL;
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Extract a constant literal from `it` into `*out`, coerced to `kind`. Returns
+// false if the literal is NULL or (for an unsigned attr) negative -- in either
+// case the condition is omitted rather than risk a non-weakening translation.
+static bool extract_value(
+    Item *it, ValKind kind,
+    std::variant<int64_t, uint64_t, double, std::string> *out) {
+  switch (kind) {
+    case ValKind::I64: {
+      const longlong v = it->val_int();
+      if (it->null_value) return false;
+      *out = static_cast<int64_t>(v);
+      return true;
+    }
+    case ValKind::U64: {
+      const longlong v = it->val_int();
+      if (it->null_value) return false;
+      // A negative comparand against an unsigned attr has no safe okey; omit.
+      if (!it->unsigned_flag && v < 0) return false;
+      *out = static_cast<uint64_t>(v);
+      return true;
+    }
+    case ValKind::DBL: {
+      const double d = it->val_real();
+      if (it->null_value) return false;
+      *out = d;
+      return true;
+    }
+    case ValKind::STR: {
+      String buf;
+      String *s = it->val_str(&buf);
+      if (s == nullptr || it->null_value) return false;
+      *out = std::string(s->ptr(), s->length());
+      return true;
+    }
+    case ValKind::SKIP:
+    default:
+      return false;
+  }
+}
+
+// Try to translate a binary comparison (`field OP const` / `const OP field`)
+// into one QueryCondition. Returns false (omit) on any unrepresentable shape.
+static bool make_condition(Item_func *f, const Ctx &ctx, QueryCondition *cond) {
+  if (f->argument_count() != 2) return false;
+  Item *a0 = f->arguments()[0];
+  Item *a1 = f->arguments()[1];
+
+  AttrMeta meta{};
+  Item *cst = nullptr;
+  bool flip = false;
+  if (index_field_of(a0, ctx, &meta) != nullptr) {
+    cst = a1;
+    flip = false;
+  } else if (index_field_of(a1, ctx, &meta) != nullptr) {
+    cst = a0;
+    flip = true;
+  } else {
+    return false;  // neither side is an index column (or column-to-column)
+  }
+  if (!cst->const_item()) return false;  // e.g. column-to-column
+  if (meta.kind == ValKind::SKIP) return false;
+
+  CompareOp op;
+  if (!map_op(f->functype(), flip, &op)) return false;
+  // UNORDERED attrs are equality-only; a non-EQUAL op is not representable.
+  if (meta.kind == ValKind::STR && op != CompareOp::EQUAL) return false;
+
+  if (!extract_value(cst, meta.kind, &cond->value)) return false;
+  cond->attr_idx = meta.attr_idx;
+  cond->op = op;
+  return true;
+}
+
+// Translate a positive `field IN (c1, c2, ...)` into EQUAL conditions appended
+// to *clause (all on the same attr). Returns false (omit) otherwise.
+static bool make_in_terms(Item_func_in *in, const Ctx &ctx, OrClause *clause) {
+  if (in->negated) return false;  // NOT IN is a conjunction of !=, not an OR
+  const uint n = in->argument_count();
+  if (n < 2) return false;
+
+  AttrMeta meta{};
+  if (index_field_of(in->arguments()[0], ctx, &meta) == nullptr) return false;
+  if (meta.kind == ValKind::SKIP) return false;
+
+  for (uint i = 1; i < n; i++) {
+    Item *v = in->arguments()[i];
+    if (!v->const_item()) return false;
+    QueryCondition c{};
+    c.attr_idx = meta.attr_idx;
+    c.op = CompareOp::EQUAL;
+    if (!extract_value(v, meta.kind, &c.value)) return false;
+    clause->push_back(std::move(c));
+  }
+  return true;
+}
+
+// Append the OR-terms of a purely disjunctive, fully representable item to
+// *clause. A single comparison is a degenerate 1-term disjunction; IN expands
+// to n terms; OR is the union of its operands' terms (all-or-nothing). Any
+// non-disjunctive shape (e.g. an AND nested inside an OR) returns false so the
+// caller drops the whole clause -- preserving the weakening invariant.
+static bool collect_disjunction(Item *it, const Ctx &ctx, OrClause *clause) {
+  if (it->type() == Item::COND_ITEM) {
+    Item_cond *c = static_cast<Item_cond *>(it);
+    if (c->functype() != Item_func::COND_OR_FUNC) return false;
+    List_iterator<Item> li(*c->argument_list());
+    Item *sub;
+    while ((sub = li++)) {
+      if (!collect_disjunction(sub, ctx, clause)) return false;
+    }
+    return true;
+  }
+  if (it->type() == Item::FUNC_ITEM) {
+    Item_func *f = static_cast<Item_func *>(it);
+    switch (f->functype()) {
+      case Item_func::EQ_FUNC:
+      case Item_func::LT_FUNC:
+      case Item_func::LE_FUNC:
+      case Item_func::GT_FUNC:
+      case Item_func::GE_FUNC: {
+        QueryCondition cond{};
+        if (!make_condition(f, ctx, &cond)) return false;
+        clause->push_back(std::move(cond));
+        return true;
+      }
+      case Item_func::IN_FUNC:
+        return make_in_terms(static_cast<Item_func_in *>(f), ctx, clause);
+      default:
+        return false;
+    }
+  }
+  return false;
+}
+
+// Walk the AND-spine: each conjunct becomes its own clause_group. Nested ANDs
+// are flattened; a conjunct that is not representable as a pure disjunction is
+// silently dropped (dropping a conjunct only weakens the query).
+static void collect_conjunction(Item *it, const Ctx &ctx, BitLSMQuery *q) {
+  if (it->type() == Item::COND_ITEM) {
+    Item_cond *c = static_cast<Item_cond *>(it);
+    if (c->functype() == Item_func::COND_AND_FUNC) {
+      List_iterator<Item> li(*c->argument_list());
+      Item *sub;
+      while ((sub = li++)) collect_conjunction(sub, ctx, q);
+      return;
+    }
+    // A top-level OR falls through to collect_disjunction below.
+  }
+  OrClause clause;
+  if (collect_disjunction(it, ctx, &clause) && !clause.empty()) {
+    q->clause_groups.push_back(std::move(clause));
+  }
+}
+
+}  // namespace
+
+bool rdb_bitlsm_assemble_query(const KEY &key_info, Item *cond,
+                               BitLSMQuery *out_query,
+                               BitLSMOptions *out_options) {
+  // (1) Build the schema/options from the index Field types (single source of
+  // truth for role + comparand variant), and the field_index -> attr map.
+  Ctx ctx;
+  out_options->attr_specs.clear();
+  out_options->attr_specs.reserve(key_info.user_defined_key_parts);
+  for (uint i = 0; i < key_info.user_defined_key_parts; i++) {
+    const Field *f = key_info.key_part[i].field;
+    AttrSpec spec;
+    ValKind kind;
+    field_to_attr(f, &spec, &kind);
+    out_options->attr_specs.push_back(spec);
+    ctx.by_field.emplace(f->field_index(),
+                         AttrMeta{static_cast<uint32_t>(i), kind});
+  }
+  out_options->attr_num =
+      static_cast<uint32_t>(out_options->attr_specs.size());
+  out_options->rho = 0.1;       // matches setup_bitlsm_index default
+  out_options->read_seqno = 0;  // unused by Validate/ToString
+
+  // (2) Walk the pushed condition into a CNF BitLSMQuery.
+  out_query->clause_groups.clear();
+  if (cond != nullptr) collect_conjunction(cond, ctx, out_query);
+
+  // (3) Validate; on failure degrade to an empty (no-pruning) query, which is
+  // still a valid weakening.
+  const rocksdb::Status s = out_query->Validate(*out_options);
+  if (!s.ok()) {
+    out_query->clause_groups.clear();
+    return false;
+  }
+  return true;
+}
+
+}  // namespace myrocks

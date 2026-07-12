@@ -97,6 +97,7 @@
 #include "./ha_rockspart.h"
 #include "./logger.h"
 #include "./nosql_access.h"
+#include "./rdb_bitlsm_query.h"
 #include "./rdb_bulk_load.h"
 #include "./rdb_cf_manager.h"
 #include "./rdb_cf_options.h"
@@ -139,6 +140,15 @@ namespace myrocks {
 
 // M2 smoke: defined in rdb_bitlsm_smoke.cc. TEMPORARY -- replaced in M3.
 bool rdb_bitlsm_smoke_check();
+
+#ifndef NDEBUG
+// M3b-2 observability (debug builds only, zero cost in release): the ToString()
+// of the BitLSM query most recently assembled from a pushed WHERE on this
+// connection thread. Set in index_read_intern's bitlsm branch, read back by the
+// SHOW_SCOPE_SESSION status var rocksdb_bitlsm_last_query. thread_local because
+// mtr runs one statement at a time per connection thread.
+static thread_local std::string rdb_bitlsm_last_query_str;
+#endif
 
 static st_global_stats global_stats;
 static st_export_stats export_stats;
@@ -12238,6 +12248,23 @@ int ha_rocksdb::index_read_intern(uchar *const buf, const uchar *const key,
       m_bitlsm_ref_key.assign(reinterpret_cast<const char *>(m_sk_packed_tuple),
                               ref_len);
     }
+
+#ifndef NDEBUG
+    // M3b-2: assemble a BitLSM query from the pushed WHERE and expose its
+    // ToString() (via the rocksdb_bitlsm_last_query session status var) so the
+    // bitlsm_query_assembly test can verify the translation. OBSERVATION ONLY:
+    // the assembled query does not drive pruning yet (that is M3b-3); the read
+    // is still the ICP-filtered full scan below, so results are unchanged.
+    rdb_bitlsm_last_query_str.clear();
+    if (pushed_idx_cond && pushed_idx_cond_keyno == active_index) {
+      bit_lsm::BitLSMQuery bq;
+      bit_lsm::BitLSMOptions bopts;
+      rdb_bitlsm_assemble_query(table->key_info[active_index], pushed_idx_cond,
+                                &bq, &bopts);
+      rdb_bitlsm_last_query_str = bq.ToString();
+    }
+#endif
+
     uint pk_packed_size = 0;
     m_pk_descr->get_infimum_key(m_pk_packed_tuple, &pk_packed_size);
     const rocksdb::Slice pk_slice(
@@ -18712,7 +18739,29 @@ static int show_rocksdb_stall_vars(THD *thd MY_ATTRIBUTE((unused)),
   return 0;
 }
 
+#ifndef NDEBUG
+// M3b-2 observability: expose the ToString() of the last BitLSM query assembled
+// from a pushed WHERE on this session. SHOW_SCOPE_SESSION so mtr reads it with
+// `SHOW SESSION STATUS LIKE 'rocksdb_bitlsm_last_query'` right after a SELECT.
+static int rocksdb_show_bitlsm_last_query(THD *thd MY_ATTRIBUTE((unused)),
+                                          SHOW_VAR *var, char *buff) {
+  const std::string &s = rdb_bitlsm_last_query_str;
+  size_t n = std::min(s.size(),
+                      static_cast<size_t>(SHOW_VAR_FUNC_BUFF_SIZE - 1));
+  memcpy(buff, s.data(), n);
+  buff[n] = '\0';
+  var->type = SHOW_CHAR;
+  var->value = buff;
+  return 0;
+}
+#endif
+
 static SHOW_VAR rocksdb_status_vars[] = {
+#ifndef NDEBUG
+    {"rocksdb_bitlsm_last_query",
+     reinterpret_cast<char *>(&rocksdb_show_bitlsm_last_query), SHOW_FUNC,
+     SHOW_SCOPE_SESSION},
+#endif
     DEF_STATUS_VAR(block_cache_miss),
     DEF_STATUS_VAR(block_cache_hit),
     DEF_STATUS_VAR(block_cache_add),
