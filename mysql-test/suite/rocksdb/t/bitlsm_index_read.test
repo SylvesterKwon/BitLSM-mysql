@@ -1,15 +1,21 @@
 --source include/have_rocksdb.inc
 
-# M3b-1: bitlsm index read-path plumbing (full scan through the index path).
+# M3b-3: bitlsm index read served by SABI bitmap pruning + own-writes union.
 #
 # A BITLSM_INDEX (a, b, c) has NO secondary-key entries of its own (D3), so a
 # normal index range scan finds nothing. When the optimizer picks the index
-# (FORCE INDEX(bi)), the engine instead full-scans the PK data CF and lets
-# Index Condition Pushdown filter each row against the pushed WHERE -- returning
-# results IDENTICAL to a full table scan. This is deliberately a full scan (no
-# bitmap acceleration yet; that is M3b-3). This test is DIFFERENTIAL: for every
-# query it asserts FORCE INDEX(bi) == IGNORE INDEX(bi) (full scan), in both the
-# memtable and the flushed-SST states.
+# (FORCE INDEX(bi)), the engine serves the read from a candidate PK set built
+# as (a) SABI bitmap-pruned COMMITTED rows (a BitLSMIterator that skips SST
+# blocks whose bins cannot satisfy the pushed WHERE) UNION (b) this
+# transaction's own uncommitted PK writes, then authoritatively re-fetches and
+# re-verifies each -- returning results IDENTICAL to a full table scan.
+#
+# This test is DIFFERENTIAL: for every query it asserts FORCE INDEX(bi) ==
+# IGNORE INDEX(bi) (full scan) in both the memtable and the flushed-SST states
+# (Phases 1-2). Because FORCE INDEX now prunes via the bitmap, this proves the
+# pruning + the extractor okey encoding are correct end-to-end. Phase 3 adds
+# own-writes cases (in-transaction INSERT/UPDATE/DELETE) that exercise the
+# write-batch union (option B) against a committed base already in an SST.
 
 --echo # Mixed-type bitlsm table (INT signed, DOUBLE, VARBINARY), with negative
 --echo # values and NULLs in each index column. The bi index carries no cfname.
@@ -60,5 +66,74 @@ EXPLAIN SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= 0 AND b < 1
 --echo # ==== Phase 2: data flushed to an SST (SABI block present) ====
 SET GLOBAL rocksdb_force_flush_memtable_now = 1;
 --source suite/rocksdb/include/bitlsm_index_read_battery.inc
+
+--echo #
+--echo # ==== Phase 3: own uncommitted writes (option B: write-batch union) ====
+--echo # The committed base is now in an SST, so source (a) is the bitmap-pruned
+--echo # committed rows and source (b) is this transaction's uncommitted writes.
+--echo # Each case mutates rows inside a transaction and re-checks the same
+--echo # differential contract (FORCE INDEX(bi) == full scan) from inside the
+--echo # txn, then rolls back so the cases stay independent. A per-case row
+--echo # presence/absence assertion pins down that the write-batch union (not a
+--echo # coincidental full-scan-vs-full-scan tie) is what makes it pass.
+
+--echo #
+--echo # (A) in-transaction INSERT of a NEW matching row: source (a) cannot see
+--echo # it (uncommitted), so only the write-batch union (b) surfaces it.
+START TRANSACTION;
+INSERT INTO t_read VALUES (11, 10, 2.5, 'gamma', 1100);
+--let $qtitle = OW1 in-txn INSERT visible (a=10 AND c='gamma')
+--let $w = a = 10 AND c = 'gamma'
+--source suite/rocksdb/include/bitlsm_index_read_check.inc
+--let $present = `SELECT COUNT(*) FROM t_read FORCE INDEX(bi) WHERE a = 10 AND c = 'gamma' AND id = 11`
+--let $assert_text = OW1: in-txn inserted row 11 is visible through FORCE INDEX(bi)
+--let $assert_cond = $present = 1
+--source include/assert.inc
+ROLLBACK;
+
+--echo #
+--echo # (B) in-txn UPDATE makes a committed NON-matching row match: the bitmap
+--echo # prunes it out of (a) (committed value fails the predicate), so again
+--echo # only union (b) + authoritative re-fetch surfaces it. id=5 was a=25.
+START TRANSACTION;
+UPDATE t_read SET a = 10 WHERE id = 5;
+--let $qtitle = OW2 in-txn UPDATE into match (a=10 AND c='delta')
+--let $w = a = 10 AND c = 'delta'
+--source suite/rocksdb/include/bitlsm_index_read_check.inc
+--let $present = `SELECT COUNT(*) FROM t_read FORCE INDEX(bi) WHERE a = 10 AND c = 'delta' AND id = 5`
+--let $assert_text = OW2: in-txn updated row 5 now matches and is visible
+--let $assert_cond = $present = 1
+--source include/assert.inc
+ROLLBACK;
+
+--echo #
+--echo # (C) in-txn UPDATE makes a committed MATCHING row stop matching: the
+--echo # bitmap still yields id=6 from (a) (committed c='x'), but the
+--echo # authoritative re-fetch + ICP drops it. id=6 was c='x'.
+START TRANSACTION;
+UPDATE t_read SET c = 'y' WHERE id = 6;
+--let $qtitle = OW3 in-txn UPDATE out of match (c='x')
+--let $w = c = 'x'
+--source suite/rocksdb/include/bitlsm_index_read_check.inc
+--let $absent = `SELECT COUNT(*) FROM t_read FORCE INDEX(bi) WHERE c = 'x'`
+--let $assert_text = OW3: in-txn row 6 no longer matches c='x' via FORCE INDEX(bi)
+--let $assert_cond = $absent = 0
+--source include/assert.inc
+ROLLBACK;
+
+--echo #
+--echo # (D) in-txn DELETE of a committed matching row: the bitmap yields id=6
+--echo # from (a), but the authoritative multi_get resolves the tombstone to
+--echo # not-found and skips it.
+START TRANSACTION;
+DELETE FROM t_read WHERE id = 6;
+--let $qtitle = OW4 in-txn DELETE of matching row (c='x')
+--let $w = c = 'x'
+--source suite/rocksdb/include/bitlsm_index_read_check.inc
+--let $absent = `SELECT COUNT(*) FROM t_read FORCE INDEX(bi) WHERE c = 'x'`
+--let $assert_text = OW4: in-txn deleted row 6 is absent via FORCE INDEX(bi)
+--let $assert_cond = $absent = 0
+--source include/assert.inc
+ROLLBACK;
 
 DROP TABLE t_read;

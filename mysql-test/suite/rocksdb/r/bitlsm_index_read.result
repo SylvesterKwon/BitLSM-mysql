@@ -159,4 +159,65 @@ SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE c = 'x' ORDER BY id;
 id	a	b	c	d
 6	100	100	x	600
 include/assert.inc [Q8 VARBINARY equality (c = 'x'): FORCE INDEX(bi) row set identical to full scan]
+#
+# ==== Phase 3: own uncommitted writes (option B: write-batch union) ====
+# The committed base is now in an SST, so source (a) is the bitmap-pruned
+# committed rows and source (b) is this transaction's uncommitted writes.
+# Each case mutates rows inside a transaction and re-checks the same
+# differential contract (FORCE INDEX(bi) == full scan) from inside the
+# txn, then rolls back so the cases stay independent. A per-case row
+# presence/absence assertion pins down that the write-batch union (not a
+# coincidental full-scan-vs-full-scan tie) is what makes it pass.
+#
+# (A) in-transaction INSERT of a NEW matching row: source (a) cannot see
+# it (uncommitted), so only the write-batch union (b) surfaces it.
+START TRANSACTION;
+INSERT INTO t_read VALUES (11, 10, 2.5, 'gamma', 1100);
+# OW1 in-txn INSERT visible (a=10 AND c='gamma')
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a = 10 AND c = 'gamma' ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+7	10	NULL	gamma	700
+11	10	2.5	gamma	1100
+include/assert.inc [OW1 in-txn INSERT visible (a=10 AND c='gamma'): FORCE INDEX(bi) row set identical to full scan]
+include/assert.inc [OW1: in-txn inserted row 11 is visible through FORCE INDEX(bi)]
+ROLLBACK;
+#
+# (B) in-txn UPDATE makes a committed NON-matching row match: the bitmap
+# prunes it out of (a) (committed value fails the predicate), so again
+# only union (b) + authoritative re-fetch surfaces it. id=5 was a=25.
+START TRANSACTION;
+UPDATE t_read SET a = 10 WHERE id = 5;
+# OW2 in-txn UPDATE into match (a=10 AND c='delta')
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a = 10 AND c = 'delta' ORDER BY id;
+id	a	b	c	d
+5	10	99.9	delta	500
+include/assert.inc [OW2 in-txn UPDATE into match (a=10 AND c='delta'): FORCE INDEX(bi) row set identical to full scan]
+include/assert.inc [OW2: in-txn updated row 5 now matches and is visible]
+ROLLBACK;
+#
+# (C) in-txn UPDATE makes a committed MATCHING row stop matching: the
+# bitmap still yields id=6 from (a) (committed c='x'), but the
+# authoritative re-fetch + ICP drops it. id=6 was c='x'.
+START TRANSACTION;
+UPDATE t_read SET c = 'y' WHERE id = 6;
+# OW3 in-txn UPDATE out of match (c='x')
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE c = 'x' ORDER BY id;
+id	a	b	c	d
+include/assert.inc [OW3 in-txn UPDATE out of match (c='x'): FORCE INDEX(bi) row set identical to full scan]
+include/assert.inc [OW3: in-txn row 6 no longer matches c='x' via FORCE INDEX(bi)]
+ROLLBACK;
+#
+# (D) in-txn DELETE of a committed matching row: the bitmap yields id=6
+# from (a), but the authoritative multi_get resolves the tombstone to
+# not-found and skips it.
+START TRANSACTION;
+DELETE FROM t_read WHERE id = 6;
+# OW4 in-txn DELETE of matching row (c='x')
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE c = 'x' ORDER BY id;
+id	a	b	c	d
+include/assert.inc [OW4 in-txn DELETE of matching row (c='x'): FORCE INDEX(bi) row set identical to full scan]
+include/assert.inc [OW4: in-txn deleted row 6 is absent via FORCE INDEX(bi)]
+ROLLBACK;
 DROP TABLE t_read;
