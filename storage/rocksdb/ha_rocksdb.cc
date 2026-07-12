@@ -12217,6 +12217,41 @@ int ha_rocksdb::index_read_intern(uchar *const buf, const uchar *const key,
     DBUG_RETURN(rc);
   }
 
+  if (kd.is_bitlsm_index()) {
+    // M3b-1: the BITLSM_INDEX has no SK entries, so this "index read" is served
+    // by a full scan of the PK data CF. m_iterator was set up over the PK in
+    // index_init(). Each row is decoded in place and filtered by two
+    // composable predicates in index_next_with_direction_intern():
+    //   (1) the pushed ICP condition (covers range and multi-column WHEREs);
+    //   (2) an exact-key equality filter (below), needed because for a ref
+    //       access the server consumes the equality via the index key and does
+    //       NOT re-check it -- so we must reproduce it ourselves. A range/full
+    //       scan leaves m_bitlsm_ref_key empty and relies solely on ICP.
+    // The optimizer's range bounds are otherwise ignored: we always scan the
+    // whole PK (no bitmap pruning yet -- that is M3b-3).
+    m_full_key_lookup = false;
+    m_bitlsm_ref_key.clear();
+    if (key != nullptr && find_flag == HA_READ_KEY_EXACT) {
+      const uint ref_len = kd.pack_index_tuple(table, m_pack_buffer,
+                                               m_sk_packed_tuple, key,
+                                               keypart_map);
+      m_bitlsm_ref_key.assign(reinterpret_cast<const char *>(m_sk_packed_tuple),
+                              ref_len);
+    }
+    uint pk_packed_size = 0;
+    m_pk_descr->get_infimum_key(m_pk_packed_tuple, &pk_packed_size);
+    const rocksdb::Slice pk_slice(
+        reinterpret_cast<const char *>(m_pk_packed_tuple), pk_packed_size);
+    rc = m_iterator->seek(HA_READ_KEY_EXACT, pk_slice, /* full_key_match */ false,
+                          rocksdb::Slice() /* end_key */);
+    if (rc) {
+      DBUG_RETURN(rc);
+    }
+    rc = index_next_with_direction_intern(buf, /* move_forward */ true,
+                                          /* skip_next */ true);
+    DBUG_RETURN(rc);
+  }
+
   bool using_full_key = false;
   m_full_key_lookup = false;
 
@@ -12956,6 +12991,93 @@ int ha_rocksdb::index_next_with_direction_intern(uchar *const buf,
        /* row read for result vectors, increment vectors_row_read counter */
        rocksdb_vectors_rows_read++;
     }
+    DBUG_RETURN(rc);
+  }
+
+  if (kd.is_bitlsm_index()) {
+    // M3b-1: advance the PK data-CF full scan (m_iterator is over the PK).
+    // Decode each row in place from the (key, value) the iterator yields -- no
+    // separate PK point-lookup is needed -- then ICP-filter it against the
+    // pushed WHERE. The candidate stream is in PK order, NOT bitlsm-index
+    // order, so ICP_OUT_OF_RANGE only means THIS row's index columns fall
+    // outside the scanned range: it is a per-row exclusion, never a stop
+    // condition. We therefore treat it like ICP_NO_MATCH and keep scanning;
+    // the scan ends only when the PK keyspace is exhausted.
+    for (;;) {
+      if (thd) {
+        if (thd->killed) {
+          rc = HA_ERR_QUERY_INTERRUPTED;
+          break;
+        }
+        thd->check_yield();
+      }
+
+      assert(m_iterator != nullptr);
+      if (m_iterator == nullptr) {
+        rc = HA_ERR_INTERNAL_ERROR;
+        break;
+      }
+
+      if (skip_next) {
+        skip_next = false;
+      } else {
+        // A bitlsm full scan is forward-only (the index has no order to
+        // preserve), so we always advance forward regardless of move_forward.
+        rc = m_iterator->next();
+      }
+
+      if (rc) {
+        break;
+      }
+
+      const rocksdb::Slice &key = m_iterator->key();
+      const rocksdb::Slice &value = m_iterator->value();
+
+      m_last_rowkey.copy(key.data(), key.size(), &my_charset_bin);
+      rc = convert_record_from_storage_format(&key, &value, buf);
+      if (rc != HA_EXIT_SUCCESS) {
+        break;
+      }
+
+      // Exact-key (ref) filter: reproduce the equality the server consumed via
+      // the index key. Pack this row's bitlsm SK and require its prefix to
+      // equal the ref key (mem-comparable keys are prefix-consistent).
+      if (!m_bitlsm_ref_key.empty()) {
+        const uint sk_len =
+            kd.pack_record(table, m_pack_buffer, buf, m_sk_packed_tuple,
+                           nullptr /* unpack_info */,
+                           false /* store_row_debug_checksums */);
+        if (sk_len < m_bitlsm_ref_key.size() ||
+            memcmp(m_sk_packed_tuple, m_bitlsm_ref_key.data(),
+                   m_bitlsm_ref_key.size()) != 0) {
+          continue;
+        }
+      }
+
+      if (pushed_idx_cond && pushed_idx_cond_keyno == active_index) {
+        const enum icp_result icp_status = check_index_cond();
+        if (icp_status == ICP_NO_MATCH || icp_status == ICP_OUT_OF_RANGE) {
+          continue;
+        }
+        assert(icp_status == ICP_MATCH);
+      }
+
+      break;
+    }
+
+    if (!rc) {
+      update_row_stats(ROWS_READ);
+      table->m_status = 0;
+    }
+
+    if (rc == HA_ERR_KEY_NOT_FOUND) {
+      rc = HA_ERR_END_OF_FILE;
+    }
+
+    if (rc == HA_ERR_ROCKSDB_CORRUPT_DATA) {
+      rc = handle_rocksdb_corrupt_data_error(ha_thd());
+    }
+
     DBUG_RETURN(rc);
   }
 
@@ -14712,6 +14834,15 @@ int ha_rocksdb::index_init(uint idx, bool sorted MY_ATTRIBUTE((__unused__))) {
     m_iterator.reset(
         new Rdb_iterator_partial(thd, *m_key_descr_arr[active_index_pos()],
                                  *m_pk_descr, m_tbl_def, table, dd_table));
+  } else if (idx != table->s->primary_key &&
+             m_key_descr_arr[idx]->is_bitlsm_index()) {
+    // M3b-1: a BITLSM_INDEX writes no secondary-key entries (D3), so its own
+    // keyspace is empty. Reads are answered by a full scan of the PK data CF,
+    // filtered by ICP against the pushed WHERE. Point the scan iterator at the
+    // PK so the existing forward-iteration machinery walks the data rows.
+    // (Deliberately a full scan -- no bitmap acceleration yet, that is M3b-3.)
+    m_iterator.reset(
+        new Rdb_iterator_base(thd, this, *m_pk_descr, *m_pk_descr, m_tbl_def));
   } else {
     m_iterator.reset(new Rdb_iterator_base(thd, this,
                                            *m_key_descr_arr[active_index_pos()],

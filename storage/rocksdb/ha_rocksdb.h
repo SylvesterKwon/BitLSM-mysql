@@ -304,6 +304,15 @@ class ha_rocksdb : public my_core::handler, public blob_buffer {
   bool m_full_key_lookup = false;
 
   /*
+    M3b-1: for a BITLSM_INDEX read served by a full PK scan, this holds the
+    packed secondary-key of an exact (ref) lookup, so index_next can filter each
+    scanned row's key prefix against it. Empty when the current bitlsm read is a
+    range/full scan (the pushed ICP condition handles those). See
+    index_read_intern()/index_next_with_direction_intern().
+  */
+  std::string m_bitlsm_ref_key;
+
+  /*
     true means INSERT ON DUPLICATE KEY UPDATE. In such case we can optimize by
     remember the failed attempt (if there is one that violates uniqueness check)
     in write_row and in the following index_read to skip the lock check and read
