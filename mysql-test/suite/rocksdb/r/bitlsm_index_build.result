@@ -1,9 +1,10 @@
 # SABI builds on flush without crashing; data stays intact; survives restart.
+# The bitlsm index carries NO cfname -- it binds the PK's data CF automatically.
 CREATE TABLE t_build (
 id BIGINT NOT NULL,
 a INT, b DOUBLE, c VARBINARY(16),
 PRIMARY KEY (id) COMMENT 'cfname=t_build_cf',
-INDEX bi (a, b, c) COMMENT 'cfname=t_build_cf' BITLSM_INDEX
+INDEX bi (a, b, c) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 INSERT INTO t_build VALUES
 (1, 10, 1.5, 'x'), (2, 20, 2.5, 'y'), (3, 30, 3.5, 'z');
@@ -32,13 +33,13 @@ CREATE TABLE t_b1 (
 id BIGINT NOT NULL,
 a INT,
 PRIMARY KEY (id) COMMENT 'cfname=shared_bit_cf',
-INDEX bi (a) COMMENT 'cfname=shared_bit_cf' BITLSM_INDEX
+INDEX bi (a) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 CREATE TABLE t_b2 (
 id BIGINT NOT NULL,
 x VARBINARY(8),
 PRIMARY KEY (id) COMMENT 'cfname=shared_bit_cf',
-INDEX bi (x) COMMENT 'cfname=shared_bit_cf' BITLSM_INDEX
+INDEX bi (x) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 ERROR HY000: Got error 1 - 'Operation not permitted' from storage engine
 DROP TABLE t_b1;

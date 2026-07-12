@@ -325,6 +325,28 @@ IF(WITH_EMBEDDED_SERVER)
   ADD_SUBDIRECTORY(unittest)
 ENDIF()
 
+# Standalone gtest for the BitLSM row-value decoder (M3a-4). The decoder header
+# (rdb_bitlsm_extractor.h) depends only on bit_lsm_encoding.h, so this test links
+# nothing from the storage engine -- it drives ExtractAll over hand-built value
+# blobs. Build + run: `ninja rdb_bitlsm_decoder_test && \
+#   ./storage/rocksdb/rdb_bitlsm_decoder_test`. All include dirs it needs
+# (rocksdb/src/include, ${ROCKSDB_ROOT}/include, the fused gtest) are already in
+# INCLUDE_DIRECTORIES above.
+IF (NOT HAVE_EXTERNAL_ROCKSDB)
+  SET(GTEST_FUSED_DIR ${ROCKSDB_ROOT}/third-party/gtest-1.8.1/fused-src)
+  ADD_EXECUTABLE(rdb_bitlsm_decoder_test
+    rdb_bitlsm_decoder_test.cc
+    ${GTEST_FUSED_DIR}/gtest/gtest-all.cc
+    ${GTEST_FUSED_DIR}/gtest/gtest_main.cc)
+  TARGET_INCLUDE_DIRECTORIES(rdb_bitlsm_decoder_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+  # -w silences the fused gtest sources; C++20 (needed by the BitLSM headers) is
+  # applied by the rdb_cxx20_tgt FOREACH below, matching the other RocksDB
+  # targets.
+  TARGET_COMPILE_OPTIONS(rdb_bitlsm_decoder_test PRIVATE -w)
+  TARGET_LINK_LIBRARIES(rdb_bitlsm_decoder_test pthread)
+ENDIF()
+
 IF (NOT HAVE_EXTERNAL_ROCKSDB)
   # TODO: read this file list from src.mk:TOOL_SOURCES
   ADD_LIBRARY(rocksdb_tool
@@ -351,7 +373,8 @@ ENDIF()
 # enum-scope using). MySQL 8.0.32 compiles globally at C++17, so override only
 # the RocksDB-touching targets to C++20; the rest of the server stays C++17.
 # -std=c++20 is appended after the global -std=c++17 and gcc honors the last one.
-FOREACH(rdb_cxx20_tgt rocksdb_sources rocksdb rocksdb_se rocksdb_tool sst_dump ldb)
+FOREACH(rdb_cxx20_tgt rocksdb_sources rocksdb rocksdb_se rocksdb_tool sst_dump ldb
+                      rdb_bitlsm_decoder_test)
   IF(TARGET ${rdb_cxx20_tgt})
     TARGET_COMPILE_OPTIONS(${rdb_cxx20_tgt} PRIVATE -std=c++20)
   ENDIF()

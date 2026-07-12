@@ -1,18 +1,19 @@
 --source include/have_rocksdb.inc
 
-# A BITLSM_INDEX binds the column family its own Rdb_key_def lives in, and the
-# SABI bitmap is built from that CF's row values. So the bitlsm index MUST share
-# a CF with the primary key (the clustered data) -- otherwise SABI would build
-# over an empty CF. Co-locate both on a dedicated CF via matching index
-# comments: 'cfname=' only takes effect as a KEY comment (a table-constraint
-# PRIMARY KEY or an index), never as an inline column comment.
+# A BITLSM_INDEX is embedded in the primary key's data CF: the SABI bitmap is
+# built from that CF's row values and the index writes no SK entries of its own.
+# So the engine binds SABI to the PK's data CF and IGNORES the bitlsm index's own
+# column family -- the index needs no cfname. Only the PK carries 'cfname=' here
+# (a KEY comment; 'cfname=' has no effect as an inline column comment), giving
+# each table its own data CF.
 
 --echo # SABI builds on flush without crashing; data stays intact; survives restart.
+--echo # The bitlsm index carries NO cfname -- it binds the PK's data CF automatically.
 CREATE TABLE t_build (
   id BIGINT NOT NULL,
   a INT, b DOUBLE, c VARBINARY(16),
   PRIMARY KEY (id) COMMENT 'cfname=t_build_cf',
-  INDEX bi (a, b, c) COMMENT 'cfname=t_build_cf' BITLSM_INDEX
+  INDEX bi (a, b, c) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 
 INSERT INTO t_build VALUES
@@ -41,7 +42,7 @@ CREATE TABLE t_b1 (
   id BIGINT NOT NULL,
   a INT,
   PRIMARY KEY (id) COMMENT 'cfname=shared_bit_cf',
-  INDEX bi (a) COMMENT 'cfname=shared_bit_cf' BITLSM_INDEX
+  INDEX bi (a) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 --disable_query_log
 call mtr.add_suppression("BITLSM_INDEX: column family");
@@ -51,6 +52,6 @@ CREATE TABLE t_b2 (
   id BIGINT NOT NULL,
   x VARBINARY(8),
   PRIMARY KEY (id) COMMENT 'cfname=shared_bit_cf',
-  INDEX bi (x) COMMENT 'cfname=shared_bit_cf' BITLSM_INDEX
+  INDEX bi (x) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 DROP TABLE t_b1;
