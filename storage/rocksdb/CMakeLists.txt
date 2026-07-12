@@ -200,6 +200,7 @@ SET(ROCKSDB_SE_SOURCES
   rdb_bitlsm_smoke.cc
   rdb_bitlsm.cc rdb_bitlsm.h
   rdb_bitlsm_query.cc rdb_bitlsm_query.h
+  rdb_bitlsm_read.cc rdb_bitlsm_read.h
   rdb_bulk_load.cc rdb_bulk_load.h
   clone/common.h clone/common.cc clone/donor.h clone/donor.cc clone/client.cc
 )

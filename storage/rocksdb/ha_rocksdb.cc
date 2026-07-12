@@ -98,6 +98,7 @@
 #include "./logger.h"
 #include "./nosql_access.h"
 #include "./rdb_bitlsm_query.h"
+#include "./rdb_bitlsm_read.h"
 #include "./rdb_bulk_load.h"
 #include "./rdb_cf_manager.h"
 #include "./rdb_cf_options.h"
@@ -5045,6 +5046,23 @@ class Rdb_transaction {
   [[nodiscard]] virtual rocksdb::WriteBatchBase &get_indexed_write_batch(
       TABLE_TYPE table_type) = 0;
 
+  // M3b-3: the transaction's indexed write batch, for iterating this txn's own
+  // uncommitted writes per column family (WBWIIterator). Distinct from
+  // get_indexed_write_batch(): that hands out a writable batch and bumps the
+  // write counter; this is a read-only accessor for candidate generation.
+  // May be nullptr if the underlying transaction has not been started.
+  [[nodiscard]] virtual rocksdb::WriteBatchWithIndex *get_write_batch_with_index(
+      TABLE_TYPE table_type) = 0;
+
+  // M3b-3: the transaction's current read snapshot (the view rdb_tx_multi_get
+  // and rdb_tx_get read against), so bitmap candidate generation can be pinned
+  // to the SAME seqno as the authoritative fetch. nullptr means "read latest"
+  // (no snapshot acquired yet).
+  [[nodiscard]] const rocksdb::Snapshot *get_read_snapshot(
+      TABLE_TYPE table_type) const {
+    return m_read_opts[table_type].snapshot;
+  }
+
   [[nodiscard]] virtual rocksdb::Status get(
       rocksdb::ColumnFamilyHandle &column_family, const rocksdb::Slice &key,
       rocksdb::PinnableSlice *const value, TABLE_TYPE table_type) = 0;
@@ -5813,6 +5831,12 @@ class Rdb_transaction_impl : public Rdb_transaction {
     return *m_rocksdb_tx[table_type]->GetWriteBatch();
   }
 
+  [[nodiscard]] rocksdb::WriteBatchWithIndex *get_write_batch_with_index(
+      TABLE_TYPE table_type) override {
+    return m_rocksdb_tx[table_type] ? m_rocksdb_tx[table_type]->GetWriteBatch()
+                                    : nullptr;
+  }
+
   [[nodiscard]] rocksdb::Status get(rocksdb::ColumnFamilyHandle &column_family,
                                     const rocksdb::Slice &key,
                                     rocksdb::PinnableSlice *const value,
@@ -6351,6 +6375,11 @@ class Rdb_writebatch_impl : public Rdb_transaction {
 
     private_ctr_inc(m_write_count[table_type]);
     return m_batch;
+  }
+
+  [[nodiscard]] rocksdb::WriteBatchWithIndex *get_write_batch_with_index(
+      TABLE_TYPE /*table_type*/) override {
+    return &m_batch;
   }
 
   [[nodiscard]] rocksdb::Status get(rocksdb::ColumnFamilyHandle &column_family,
@@ -12228,17 +12257,24 @@ int ha_rocksdb::index_read_intern(uchar *const buf, const uchar *const key,
   }
 
   if (kd.is_bitlsm_index()) {
-    // M3b-1: the BITLSM_INDEX has no SK entries, so this "index read" is served
-    // by a full scan of the PK data CF. m_iterator was set up over the PK in
-    // index_init(). Each row is decoded in place and filtered by two
-    // composable predicates in index_next_with_direction_intern():
-    //   (1) the pushed ICP condition (covers range and multi-column WHEREs);
-    //   (2) an exact-key equality filter (below), needed because for a ref
-    //       access the server consumes the equality via the index key and does
-    //       NOT re-check it -- so we must reproduce it ourselves. A range/full
-    //       scan leaves m_bitlsm_ref_key empty and relies solely on ICP.
-    // The optimizer's range bounds are otherwise ignored: we always scan the
-    // whole PK (no bitmap pruning yet -- that is M3b-3).
+    // M3b-3: a BITLSM_INDEX writes no SK entries (D3), so this "index read" is
+    // served from the PK data CF, but candidates now come from SABI bitmap
+    // pruning instead of M3b-1's full PK scan. Two candidate sources are unioned
+    // (see the design's option B):
+    //   (a) bitmap-pruned COMMITTED rows -- a BitLSMIterator in Candidate mode
+    //       over the PK CF, pinned to the txn's read snapshot, skips SST blocks
+    //       whose SABI bins cannot satisfy the pushed WHERE; and
+    //   (b) this txn's own UNCOMMITTED PK writes (write batch), which the
+    //       committed-data iterator cannot see.
+    // Each candidate is then authoritatively re-fetched (rdb_tx_multi_get, which
+    // merges write batch + snapshot) and re-verified in
+    // index_next_with_direction_intern() by the SAME per-row filters M3b-1 used:
+    //   (1) an exact-key (ref) equality filter, needed because a ref access
+    //       consumes the equality via the index key and the server does not
+    //       re-check it; and
+    //   (2) the pushed ICP condition.
+    // Pruning changes only WHICH rows are fetched, never how they are verified,
+    // so results stay IDENTICAL to a full scan (differential-verified).
     m_full_key_lookup = false;
     m_bitlsm_ref_key.clear();
     if (key != nullptr && find_flag == HA_READ_KEY_EXACT) {
@@ -12249,31 +12285,111 @@ int ha_rocksdb::index_read_intern(uchar *const buf, const uchar *const key,
                               ref_len);
     }
 
+    // Translate the pushed WHERE into a bit_lsm query. The query is a
+    // conservative weakening (untranslatable parts are dropped -> no pruning,
+    // still correct), and its options are (re)derived from the index Field
+    // types -- the SAME source of truth the SABI bound to this CF was built from
+    // (M3a-4) -- so the query okey encoding agrees with how rows were binned.
+    // A missing/empty condition yields an empty query: all committed rows are
+    // candidates, but the options must still be schema-consistent.
+    bit_lsm::BitLSMQuery bq;
+    bit_lsm::BitLSMOptions bopts;
+    Item *const bitlsm_cond =
+        (pushed_idx_cond && pushed_idx_cond_keyno == active_index)
+            ? pushed_idx_cond
+            : nullptr;
+    rdb_bitlsm_assemble_query(table->key_info[active_index], bitlsm_cond, &bq,
+                              &bopts);
 #ifndef NDEBUG
-    // M3b-2: assemble a BitLSM query from the pushed WHERE and expose its
-    // ToString() (via the rocksdb_bitlsm_last_query session status var) so the
-    // bitlsm_query_assembly test can verify the translation. OBSERVATION ONLY:
-    // the assembled query does not drive pruning yet (that is M3b-3); the read
-    // is still the ICP-filtered full scan below, so results are unchanged.
-    rdb_bitlsm_last_query_str.clear();
-    if (pushed_idx_cond && pushed_idx_cond_keyno == active_index) {
-      bit_lsm::BitLSMQuery bq;
-      bit_lsm::BitLSMOptions bopts;
-      rdb_bitlsm_assemble_query(table->key_info[active_index], pushed_idx_cond,
-                                &bq, &bopts);
-      rdb_bitlsm_last_query_str = bq.ToString();
-    }
+    // M3b-2 observation hook: expose the assembled query via the
+    // rocksdb_bitlsm_last_query session status var for bitlsm_query_assembly.
+    rdb_bitlsm_last_query_str = bq.ToString();
 #endif
 
-    uint pk_packed_size = 0;
-    m_pk_descr->get_infimum_key(m_pk_packed_tuple, &pk_packed_size);
-    const rocksdb::Slice pk_slice(
-        reinterpret_cast<const char *>(m_pk_packed_tuple), pk_packed_size);
-    rc = m_iterator->seek(HA_READ_KEY_EXACT, pk_slice, /* full_key_match */ false,
-                          rocksdb::Slice() /* end_key */);
-    if (rc) {
-      DBUG_RETURN(rc);
+    // Pin candidate generation to the transaction's read snapshot so it and the
+    // authoritative fetch see the same seqno. For a non-locking read index_init
+    // already acquired it; force it here if a delayed/absent snapshot remains.
+    Rdb_transaction *const tx =
+        get_or_create_tx(table->in_use, m_tbl_def->get_table_type());
+    const TABLE_TYPE table_type = m_tbl_def->get_table_type();
+    if (tx->get_read_snapshot(table_type) == nullptr) {
+      tx->acquire_snapshot(true, table_type);
     }
+    const rocksdb::Snapshot *const tx_snapshot =
+        tx->get_read_snapshot(table_type);
+
+    rocksdb::ColumnFamilyHandle *const pk_cfh = &m_pk_descr->get_cf();
+
+    // (a) committed candidates.
+    std::vector<std::string> committed;
+    if (rocksdb_enable_udt_in_mem) {
+      // The pinned BitLSM iterator is not user-defined-timestamp aware: under
+      // UDT its candidate keys carry the embedded timestamp suffix, so the
+      // authoritative multi_get (which passes clean logical keys) would miss
+      // them. Fall back to a UDT-safe full PK scan for the committed source --
+      // no bitmap pruning under UDT, but correctness is preserved (the union
+      // with (b) and the per-row re-verify below are unchanged). m_iterator is
+      // MyRocks's native PK iterator and handles UDT transparently; the rows are
+      // in PK (index_id) order, so the scan stops once it leaves this PK's
+      // range.
+      uint pk_sz = 0;
+      m_pk_descr->get_infimum_key(m_pk_packed_tuple, &pk_sz);
+      const rocksdb::Slice pk_inf(
+          reinterpret_cast<const char *>(m_pk_packed_tuple), pk_sz);
+      int src = m_iterator->seek(HA_READ_KEY_EXACT, pk_inf,
+                                 /* full_key_match */ false,
+                                 rocksdb::Slice() /* end_key */);
+      while (src == HA_EXIT_SUCCESS) {
+        const rocksdb::Slice k = m_iterator->key();
+        if (!m_pk_descr->covers_key(k)) break;  // past this PK's index_id range
+        committed.emplace_back(k.data(), k.size());
+        src = m_iterator->next();
+      }
+      if (src != HA_EXIT_SUCCESS && src != HA_ERR_END_OF_FILE &&
+          src != HA_ERR_KEY_NOT_FOUND) {
+        DBUG_RETURN(src);
+      }
+    } else if (tx_snapshot != nullptr &&
+               !rdb_bitlsm_collect_candidates(rdb->GetBaseDB(), pk_cfh, bopts,
+                                              bq, tx_snapshot, &committed)) {
+      // D17 fail-loud: the iterator threw (bad args / corrupt SABI). Surface a
+      // corrupt-data error rather than silently under-returning rows.
+      DBUG_RETURN(handle_rocksdb_corrupt_data_error(thd));
+    }
+
+    // Union + dedup into a sorted key set, filtering to this table's PK
+    // index_id (CR-1): a shared CF may hold foreign rows, and an empty query
+    // admits every committed row including foreign ones.
+    std::set<std::string> cand_set;
+    for (auto &k : committed) {
+      if (m_pk_descr->covers_key(rocksdb::Slice(k))) {
+        cand_set.insert(std::move(k));
+      }
+    }
+    // (b) this txn's own uncommitted PK writes.
+    rocksdb::WriteBatchWithIndex *const wbwi =
+        tx->get_write_batch_with_index(table_type);
+    if (wbwi != nullptr) {
+      std::unique_ptr<rocksdb::WBWIIterator> wb_it(wbwi->NewIterator(pk_cfh));
+      for (wb_it->SeekToFirst(); wb_it->Valid(); wb_it->Next()) {
+        const rocksdb::WriteEntry we = wb_it->Entry();
+        // Point writes only; a delete-range entry is not a single PK candidate.
+        // Deletes are kept: multi_get resolves them to not-found and skips.
+        if (we.type != rocksdb::kPutRecord &&
+            we.type != rocksdb::kDeleteRecord &&
+            we.type != rocksdb::kSingleDeleteRecord &&
+            we.type != rocksdb::kMergeRecord) {
+          continue;
+        }
+        if (m_pk_descr->covers_key(we.key)) {
+          cand_set.emplace(we.key.data(), we.key.size());
+        }
+      }
+    }
+
+    m_bitlsm_candidates.assign(cand_set.begin(), cand_set.end());
+    m_bitlsm_cand_pos = 0;
+
     rc = index_next_with_direction_intern(buf, /* move_forward */ true,
                                           /* skip_next */ true);
     DBUG_RETURN(rc);
@@ -13022,14 +13138,19 @@ int ha_rocksdb::index_next_with_direction_intern(uchar *const buf,
   }
 
   if (kd.is_bitlsm_index()) {
-    // M3b-1: advance the PK data-CF full scan (m_iterator is over the PK).
-    // Decode each row in place from the (key, value) the iterator yields -- no
-    // separate PK point-lookup is needed -- then ICP-filter it against the
-    // pushed WHERE. The candidate stream is in PK order, NOT bitlsm-index
-    // order, so ICP_OUT_OF_RANGE only means THIS row's index columns fall
-    // outside the scanned range: it is a per-row exclusion, never a stop
-    // condition. We therefore treat it like ICP_NO_MATCH and keep scanning;
-    // the scan ends only when the PK keyspace is exhausted.
+    // M3b-3: walk the precomputed candidate PK set (bitmap-pruned committed rows
+    // ∪ this txn's own uncommitted writes; built in index_read_intern). For each
+    // candidate key, authoritatively fetch the row through the transaction
+    // (rdb_tx_multi_get merges write batch + snapshot) -- NOT via an iterator
+    // value, which is unavailable in Candidate mode -- decode it, and apply the
+    // same per-row filters M3b-1 used. Candidate order is PK order, NOT bitlsm-
+    // index order, so ICP_OUT_OF_RANGE is a per-row exclusion (skip and keep
+    // going), never an end-of-scan; the scan ends when the set is exhausted.
+    Rdb_transaction *const tx =
+        get_or_create_tx(table->in_use, m_tbl_def->get_table_type());
+    const TABLE_TYPE table_type = m_tbl_def->get_table_type();
+    rocksdb::ColumnFamilyHandle &pk_cfh = m_pk_descr->get_cf();
+
     for (;;) {
       if (thd) {
         if (thd->killed) {
@@ -13039,29 +13160,41 @@ int ha_rocksdb::index_next_with_direction_intern(uchar *const buf,
         thd->check_yield();
       }
 
-      assert(m_iterator != nullptr);
-      if (m_iterator == nullptr) {
-        rc = HA_ERR_INTERNAL_ERROR;
-        break;
-      }
-
       if (skip_next) {
+        // The first call (from index_read_intern) evaluates the cursor's
+        // current position (0) without advancing.
         skip_next = false;
       } else {
-        // A bitlsm full scan is forward-only (the index has no order to
-        // preserve), so we always advance forward regardless of move_forward.
-        rc = m_iterator->next();
+        // Forward-only: a bitlsm index has no order to preserve, so advance the
+        // candidate cursor regardless of move_forward.
+        m_bitlsm_cand_pos++;
       }
 
-      if (rc) {
+      if (m_bitlsm_cand_pos >= m_bitlsm_candidates.size()) {
+        rc = HA_ERR_END_OF_FILE;
         break;
       }
 
-      const rocksdb::Slice &key = m_iterator->key();
-      const rocksdb::Slice &value = m_iterator->value();
+      const std::string &pk = m_bitlsm_candidates[m_bitlsm_cand_pos];
+      const rocksdb::Slice pk_slice(pk);
 
-      m_last_rowkey.copy(key.data(), key.size(), &my_charset_bin);
-      rc = convert_record_from_storage_format(&key, &value, buf);
+      // Authoritative fetch at the txn's read view. A not-found means the
+      // candidate was deleted (own write) or absent at this snapshot -> skip.
+      rocksdb::PinnableSlice pin_value;
+      rocksdb::Status status;
+      rdb_tx_multi_get(tx, pk_cfh, 1, &pk_slice, &pin_value, table_type, &status,
+                       /* sorted_input */ true);
+      if (status.IsNotFound()) {
+        continue;
+      }
+      if (!status.ok()) {
+        rc = rdb_tx_set_status_error(*tx, status, *m_pk_descr, m_tbl_def);
+        break;
+      }
+
+      const rocksdb::Slice value_slice(pin_value.data(), pin_value.size());
+      m_last_rowkey.copy(pk.data(), pk.size(), &my_charset_bin);
+      rc = convert_record_from_storage_format(&pk_slice, &value_slice, buf);
       if (rc != HA_EXIT_SUCCESS) {
         break;
       }
@@ -14863,11 +14996,12 @@ int ha_rocksdb::index_init(uint idx, bool sorted MY_ATTRIBUTE((__unused__))) {
                                  *m_pk_descr, m_tbl_def, table, dd_table));
   } else if (idx != table->s->primary_key &&
              m_key_descr_arr[idx]->is_bitlsm_index()) {
-    // M3b-1: a BITLSM_INDEX writes no secondary-key entries (D3), so its own
-    // keyspace is empty. Reads are answered by a full scan of the PK data CF,
-    // filtered by ICP against the pushed WHERE. Point the scan iterator at the
-    // PK so the existing forward-iteration machinery walks the data rows.
-    // (Deliberately a full scan -- no bitmap acceleration yet, that is M3b-3.)
+    // A BITLSM_INDEX writes no secondary-key entries (D3), so its own keyspace
+    // is empty. As of M3b-3 reads are answered from a SABI bitmap-pruned
+    // candidate set (built in index_read_intern) fetched authoritatively via the
+    // transaction, not a PK iterator. This m_iterator over the PK is kept only
+    // to satisfy the handler's iterator lifecycle (index_end reset, non-null
+    // asserts); the bitlsm read path never seeks it.
     m_iterator.reset(
         new Rdb_iterator_base(thd, this, *m_pk_descr, *m_pk_descr, m_tbl_def));
   } else {
