@@ -41,9 +41,20 @@ class Rdb_bitlsm_registry {
 };
 
 // Per-CF UDI factory installed on every data CF's BlockBasedTableOptions. Knows
-// only its cf_name; dispatches to the bound SABIFactory via the registry.
-// Unbound -> null builder/reader -> RocksDB skips the UDI wrapper (zero
-// per-row cost on non-bitlsm / not-yet-bound CFs).
+// only its cf_name.
+//
+// Build path: dispatches to the bound SABIFactory via the registry. Unbound ->
+// null builder -> RocksDB skips the UDI wrapper (zero per-row cost on
+// non-bitlsm / not-yet-bound CFs). Building presupposes an open table, so the
+// CF is always bound by then.
+//
+// Read path: registry-independent. v5 SABI blobs are self-describing (the
+// directory persists attr roles), so a reader opens an SST with no schema
+// binding. This is essential: at DB open RocksDB creates SST readers BEFORE
+// Rdb_key_def binds the CF, so a registry-dependent reader would return null
+// and RocksDB would reject the SST as corrupt. NewReader delegates to a
+// schema-less SABIFactory that validates the v5 footer (rejecting old v4 SSTs
+// loudly) and self-describes.
 class Rdb_bitlsm_udi_factory : public rocksdb::UserDefinedIndexFactory {
  public:
   explicit Rdb_bitlsm_udi_factory(std::string cf_name)
@@ -52,6 +63,11 @@ class Rdb_bitlsm_udi_factory : public rocksdb::UserDefinedIndexFactory {
   rocksdb::UserDefinedIndexBuilder *NewBuilder() const override;
   std::unique_ptr<rocksdb::UserDefinedIndexReader> NewReader(
       rocksdb::Slice &index_block) const override;
+  // RocksDB calls this overload at SST open; it validates the v5 footer then
+  // self-describes, so restart open no longer depends on CF-binding order.
+  rocksdb::Status NewReader(
+      const rocksdb::UserDefinedIndexOption &option, rocksdb::Slice &index_block,
+      std::unique_ptr<rocksdb::UserDefinedIndexReader> &reader) const override;
 
  private:
   std::string m_cf_name;
