@@ -413,7 +413,7 @@ uint Rdb_key_def::setup(const TABLE &tbl, const Rdb_tbl_def &tbl_def,
       return rtn;
     }
 
-    uint bitlsm_rtn = setup_bitlsm_index(tbl, tbl_def);
+    uint bitlsm_rtn = setup_bitlsm_index(tbl, tbl_def, cmd_srv_helper);
     if (bitlsm_rtn) {
       RDB_MUTEX_UNLOCK_CHECK(m_mutex);
       return bitlsm_rtn;
@@ -3719,23 +3719,78 @@ uint Rdb_key_def::setup_vector_index(const TABLE &tbl,
                              m_vector_index);
 }
 
-// Map a MySQL column type to a SABI attribute role. §3.5: strings (already
-// gated to binary collation in M3a-1) are UNORDERED opaque bytes; integer /
-// float / temporal are ORDERED (order-preserving okey). The precise physical
-// encoding (signed/float/width) is the extractor's concern (M3a-4).
-static bit_lsm::AttrRole bitlsm_role_of(const Field *field) {
+// Derive the extractor encoding AND the SABI role for a BITLSM attribute column
+// from its Field type. Single source of truth so the build-time role (which
+// picks ORDERED vs UNORDERED binning) and the extract-time encoding can never
+// disagree (a mismatch would mis-bin rows).
+//
+// M3a-4 SCOPE: only the encodings below are implemented. M3a-1 DDL also accepts
+// DATETIME/DATETIME2/TIMESTAMP/TIMESTAMP2, but their packed->monotone-okey
+// conversion is not written yet, so they are rejected here (the `false` return)
+// rather than silently mis-extracted. TIME/TIME2/YEAR/BLOB are already refused
+// by the DDL gate and reach here only defensively. Extend both this switch and
+// Rdb_bitlsm_extractor when adding a type.
+static bool bitlsm_derive_enc(const Field *field,
+                              Rdb_bitlsm_attr_plan::Enc *enc,
+                              bit_lsm::AttrRole *role) {
+  using Enc = Rdb_bitlsm_attr_plan::Enc;
   switch (field->real_type()) {
-    case MYSQL_TYPE_STRING:
-    case MYSQL_TYPE_VARCHAR:
-    case MYSQL_TYPE_VAR_STRING:
-      return bit_lsm::AttrRole::UNORDERED;
+    case MYSQL_TYPE_TINY:
+    case MYSQL_TYPE_SHORT:
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+    case MYSQL_TYPE_LONGLONG:
+      *enc = field->is_unsigned() ? Enc::INT_UNSIGNED : Enc::INT_SIGNED;
+      *role = bit_lsm::ORDERED;
+      return true;
+    case MYSQL_TYPE_FLOAT:
+      *enc = Enc::FLOAT32;
+      *role = bit_lsm::ORDERED;
+      return true;
+    case MYSQL_TYPE_DOUBLE:
+      *enc = Enc::FLOAT64;
+      *role = bit_lsm::ORDERED;
+      return true;
+    case MYSQL_TYPE_NEWDATE:  // DATE stored as 3B little-endian, order-monotone
+      *enc = Enc::DATE3;
+      *role = bit_lsm::ORDERED;
+      return true;
+    case MYSQL_TYPE_STRING:   // CHAR/BINARY, fixed width (binary collation)
+    case MYSQL_TYPE_VARCHAR:  // VARCHAR/VARBINARY (binary collation)
+      *enc = Enc::BINARY_STR;
+      *role = bit_lsm::UNORDERED;
+      return true;
     default:
-      return bit_lsm::AttrRole::ORDERED;
+      return false;  // not yet supported by the extractor
+  }
+}
+
+// Physical shape of a STORE_ALL value field, matching exactly how
+// Rdb_converter::encode_value_slice writes it (VARCHAR / BLOB|JSON / else). Used
+// for every walked field (target or skipped) so the cursor advances correctly.
+static Rdb_bitlsm_attr_plan::Shape bitlsm_shape_of(const Field *field,
+                                                   uint32_t *len) {
+  switch (field->real_type()) {
+    case MYSQL_TYPE_VARCHAR: {
+      const auto *v = reinterpret_cast<const Field_varstring *>(field);
+      *len = v->get_length_bytes();  // 1 or 2
+      return Rdb_bitlsm_attr_plan::Shape::VARLEN;
+    }
+    case MYSQL_TYPE_BLOB:
+    case MYSQL_TYPE_JSON: {
+      const auto *b = reinterpret_cast<const Field_blob *>(field);
+      *len = b->pack_length() - portable_sizeof_char_ptr;
+      return Rdb_bitlsm_attr_plan::Shape::BLOB;
+    }
+    default:
+      *len = field->pack_length();
+      return Rdb_bitlsm_attr_plan::Shape::FIXED;
   }
 }
 
 uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
-                                     const Rdb_tbl_def &tbl_def) {
+                                     const Rdb_tbl_def &tbl_def,
+                                     Rdb_cmd_srv_helper &cmd_srv_helper) {
   if (!m_is_bitlsm) {
     return HA_EXIT_SUCCESS;
   }
@@ -3783,29 +3838,149 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
     }
   }
 
-  // Bind this CF to a SABIFactory so its SSTs build the SABI bitmap. Roles are
-  // derived from the attribute column types (M3a-1 already gated to supported
-  // types). The extractor is a no-op stub in M3a-3b; M3a-4 wires the real
-  // Rdb_converter-based extractor.
-  bit_lsm::SABISchema schema;
   const KEY *ki = &tbl.key_info[m_keyno];
+  const bool hidden_pk = Rdb_key_def::table_has_hidden_pk(tbl);
+
+  // (1) Derive per-attribute encoding + role from the Field types. This is the
+  // single source of truth: schema.roles (build-time binning) and the
+  // extractor encodings come from the same switch, so they cannot disagree.
+  // Reject types the extractor does not yet handle (M3a-4 scope).
+  bit_lsm::SABISchema schema;
   schema.roles.reserve(ki->user_defined_key_parts);
+  // field_index -> (attr slot, encoding) for the target columns.
+  std::unordered_map<uint, std::pair<uint32_t, Rdb_bitlsm_attr_plan::Enc>>
+      attr_of_field;
   for (uint i = 0; i < ki->user_defined_key_parts; i++) {
-    schema.roles.push_back(bitlsm_role_of(ki->key_part[i].field));
+    const Field *field = ki->key_part[i].field;
+    Rdb_bitlsm_attr_plan::Enc enc;
+    bit_lsm::AttrRole role;
+    if (!bitlsm_derive_enc(field, &enc, &role)) {
+      LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                      "BITLSM_INDEX: attribute type not yet supported by the "
+                      "extractor (M3a-4 scope)");
+      return HA_ERR_UNSUPPORTED;
+    }
+    schema.roles.push_back(role);
+    attr_of_field.emplace(field->field_index(),
+                          std::make_pair(static_cast<uint32_t>(i), enc));
   }
   schema.rho = 0.1;  // default bitmap budget; tunable later
-  const uint32_t attr_num = schema.attr_num();
-  auto factory = std::make_shared<bit_lsm::SABIFactory>(schema, [attr_num] {
-    return std::make_unique<Rdb_bitlsm_noop_extractor>(attr_num);
-  });
-  if (!Rdb_bitlsm_registry::instance().bind(m_cf_handle->GetName(), schema.roles,
-                                            factory)) {
+
+  // The extractor classifies preceding value fields via the PK's pack info
+  // (can_unpack / has_unpack_info). setup() runs PK-first in alloc_key_buffers,
+  // but other callers (add-index / restore) give no such guarantee, so force
+  // the PK's (idempotent) setup here rather than risk misclassifying a field.
+  const std::shared_ptr<Rdb_key_def> &pk_def = tbl_def.get_pk_def();
+  const KEY *pk_info =
+      hidden_pk ? nullptr : &tbl.key_info[tbl.s->primary_key];
+  if (!hidden_pk) {
+    const uint pk_rtn = pk_def->setup(tbl, tbl_def, cmd_srv_helper);
+    if (pk_rtn) return pk_rtn;
+  }
+
+  // (2) Build the immutable walk plan snapshot. Replicates the value-blob
+  // layout logic of Rdb_converter::setup_field_encoders / encode_value_slice:
+  // null-bitmap bit assignment (every nullable field, in field order),
+  // STORE_ALL vs STORE_NONE/SOME (PK columns decodable from key/unpack_info are
+  // absent from the value), and per-field physical shape.
+  auto plan = std::make_shared<Rdb_bitlsm_attr_plan>();
+  plan->attr_num = schema.attr_num();
+  plan->ttl_bytes =
+      pk_def->has_ttl() ? static_cast<uint32_t>(ROCKSDB_SIZEOF_TTL_RECORD) : 0;
+  plan->pk_index_number = pk_def->get_index_number();
+
+  uchar cur_null_mask = 0x1;
+  uint32_t null_bytes_length = 0;
+  int last_target = -1;
+  for (uint i = 0; i < tbl.s->fields; i++) {
+    const Field *field = tbl.field[i];
+
+    // Null-bitmap slot: assigned to EVERY nullable field in field order,
+    // regardless of storage type or virtual-ness (matches setup_field_encoders).
+    const bool nullable = field->is_nullable();
+    uint32_t this_null_offset = 0;
+    uint8_t this_null_mask = 0;
+    if (nullable) {
+      this_null_mask = cur_null_mask;
+      this_null_offset = null_bytes_length;
+      if (cur_null_mask == 0x80) {
+        cur_null_mask = 0x1;
+        null_bytes_length++;
+      } else {
+        cur_null_mask = cur_null_mask << 1;
+      }
+    }
+
+    // Storage type: a PK column decodable from the key (STORE_NONE) or from
+    // key + unpack_info (STORE_SOME) is not present in the value blob.
+    bool store_all = true;
+    if (pk_info != nullptr) {
+      for (uint kp = 0; kp < pk_info->user_defined_key_parts; kp++) {
+        if (field->field_index() + 1 == pk_info->key_part[kp].fieldnr) {
+          if (pk_def->has_unpack_info(kp)) {
+            store_all = false;
+            plan->maybe_unpack_info = true;
+          } else if (pk_def->can_unpack(kp)) {
+            store_all = false;
+          }
+          break;
+        }
+      }
+    }
+    if (!store_all) continue;                 // not in the value
+    if (field->is_virtual_gcol()) continue;   // virtual cols are never written
+
+    Rdb_bitlsm_attr_plan::WalkEntry e{};
+    e.nullable = nullable;
+    e.null_offset = this_null_offset;
+    e.null_mask = this_null_mask;
+    uint32_t shape_len = 0;
+    e.shape = bitlsm_shape_of(field, &shape_len);
+    e.len = shape_len;
+    auto it = attr_of_field.find(field->field_index());
+    if (it != attr_of_field.end()) {
+      e.is_target = true;
+      e.attr_index = it->second.first;
+      e.enc = it->second.second;
+      last_target = static_cast<int>(plan->walk.size());
+    }
+    plan->walk.push_back(e);
+  }
+  if (cur_null_mask != 0x1) null_bytes_length++;  // trailing partial byte
+  plan->null_bytes_len = null_bytes_length;
+  // Fields past the last attribute never need walking.
+  if (last_target < 0) {
+    // No attribute landed in the value -- should be impossible after the checks
+    // above (attributes are non-PK, non-virtual). Fail loud rather than build a
+    // degenerate plan.
+    LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                    "BITLSM_INDEX: no attribute column found in the primary-key "
+                    "value (internal inconsistency)");
+    return HA_ERR_UNSUPPORTED;
+  }
+  plan->walk.resize(last_target + 1);
+
+  // (3) CF binding: bind the SABIFactory to the PRIMARY KEY's data CF. SABI is
+  // embedded in and reads the PK CF's row values, so it must live where the rows
+  // do. The bitlsm index writes no SK entries (D3 suppression), so its own CF is
+  // vestigial and is deliberately IGNORED -- the index needs no cfname of its
+  // own; whatever it inherits is irrelevant. The registry is always keyed by the
+  // PK data CF, so two tables trip the D5 one-schema-per-CF check only when they
+  // genuinely share a data CF.
+  const std::string pk_cf_name = pk_def->get_cf().GetName();
+
+  std::shared_ptr<const Rdb_bitlsm_attr_plan> const_plan = plan;
+  auto factory =
+      std::make_shared<bit_lsm::SABIFactory>(schema, [const_plan] {
+        return std::make_unique<Rdb_bitlsm_extractor>(const_plan);
+      });
+  if (!Rdb_bitlsm_registry::instance().bind(pk_cf_name, schema.roles, factory)) {
     // D5/D17: this CF already hosts a different bitlsm schema. Fail loudly
     // instead of silently letting the last writer win.
     LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                     "BITLSM_INDEX: column family '%s' already hosts a different "
                     "bitlsm schema (only one bitlsm table per CF is supported)",
-                    m_cf_handle->GetName().c_str());
+                    pk_cf_name.c_str());
     return HA_ERR_UNSUPPORTED;
   }
 

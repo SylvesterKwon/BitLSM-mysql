@@ -12,6 +12,11 @@
 #include "bit_lsm_encoding.h"  // bit_lsm::AttrExtractor, EncodedAttr, SABISchema
 #include "sabi.h"              // bit_lsm::SABIFactory
 
+/* Real per-row decoder + its bind-time plan (M3a-4). Kept in a separate,
+   RocksDB-header-free unit so the hot path stays lightweight and unit-testable
+   (see rdb_bitlsm_decoder_test.cc). */
+#include "./rdb_bitlsm_extractor.h"  // Rdb_bitlsm_attr_plan, Rdb_bitlsm_extractor
+
 namespace myrocks {
 
 // Process-global map cf_name -> bound SABIFactory. Written by
@@ -71,21 +76,6 @@ class Rdb_bitlsm_udi_factory : public rocksdb::UserDefinedIndexFactory {
 
  private:
   std::string m_cf_name;
-};
-
-// No-op extractor: yields SQL NULL for every attribute. M3a-3b uses this so the
-// SABI block is produced without the real row decoder (M3a-4 replaces it).
-class Rdb_bitlsm_noop_extractor : public bit_lsm::AttrExtractor {
- public:
-  explicit Rdb_bitlsm_noop_extractor(uint32_t attr_num)
-      : m_attr_num(attr_num) {}
-  void ExtractAll(std::string_view /*key*/, std::string_view /*value*/,
-                  bit_lsm::EncodedAttr *out) override {
-    for (uint32_t i = 0; i < m_attr_num; ++i) out[i] = std::monostate{};
-  }
-
- private:
-  uint32_t m_attr_num;
 };
 
 }  // namespace myrocks
