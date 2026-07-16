@@ -1,0 +1,77 @@
+--source include/have_rocksdb.inc
+--source include/have_debug.inc
+
+# A4: SELECT ... FOR UPDATE / FOR SHARE is SQLCOM_SELECT but takes per-row PK
+# locks that the non-locking BitLSM candidate scan (SABI bitmap prune + tx
+# multi_get) would silently skip -- leaving the "locked" rows unlocked. The
+# optimizer must NOT auto-select a BITLSM_INDEX for a locking read.
+#
+# EXPLAIN does not apply the locking clause (the parsed lock stays TL_READ), so
+# it cannot observe the guard. Instead we watch the debug status var
+# rocksdb_bitlsm_last_query, which the read path sets ONLY when the BitLSM index
+# is actually used: a plain SELECT updates it; a locking read that falls back to
+# a lock-taking access path leaves it untouched (the sentinel). (String compared
+# via mysqltest if, not assert.inc, since the value embeds single quotes.)
+
+CREATE TABLE t_fu (
+  id BIGINT NOT NULL,
+  a INT, b DOUBLE, c VARBINARY(16), d INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_fu_cf',
+  INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+# 100 rows; c is selective ('x' -> 3 rows, 'z' -> 3 rows) so the cost model
+# auto-selects bitlsm for a c-only predicate.
+INSERT INTO t_fu (id, a, b, c, d)
+WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 100)
+SELECT n, n % 50, n + 0.5, IF(n <= 3, 'x', IF(n <= 6, 'z', 'common')), n FROM s;
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+
+--disable_query_log
+--disable_result_log
+
+# (1) A plain SELECT on a non-leading predicate auto-selects bitlsm; the read
+#     path records the assembled query (sentinel = a2='z').
+SELECT d FROM t_fu WHERE c = 'z';
+--let $q = query_get_value(SHOW SESSION STATUS LIKE 'rocksdb_bitlsm_last_query', Value, 1)
+--echo # (1) plain c='z' -> last_query=[$q]  (expect a2='z' = bitlsm used)
+if ($q != a2='z') {
+  --die A4: plain SELECT WHERE c='z' did not auto-select bitlsm
+}
+
+# (2) FOR UPDATE must NOT use bitlsm: the sentinel stays a2='z'.
+SELECT d FROM t_fu WHERE c = 'x' FOR UPDATE;
+--let $q = query_get_value(SHOW SESSION STATUS LIKE 'rocksdb_bitlsm_last_query', Value, 1)
+--echo # (2) FOR UPDATE c='x' -> last_query=[$q]  (expect a2='z' = bitlsm NOT used)
+if ($q != a2='z') {
+  --die A4: FOR UPDATE used bitlsm (sentinel changed to $q) -- guard failed
+}
+
+# (3) FOR SHARE must NOT use bitlsm either.
+SELECT d FROM t_fu WHERE c = 'x' FOR SHARE;
+--let $q = query_get_value(SHOW SESSION STATUS LIKE 'rocksdb_bitlsm_last_query', Value, 1)
+--echo # (3) FOR SHARE c='x' -> last_query=[$q]  (expect a2='z' = bitlsm NOT used)
+if ($q != a2='z') {
+  --die A4: FOR SHARE used bitlsm (sentinel changed to $q) -- guard failed
+}
+
+# (4) A following PLAIN SELECT on c='x' DOES use bitlsm: sentinel updates.
+SELECT d FROM t_fu WHERE c = 'x';
+--let $q = query_get_value(SHOW SESSION STATUS LIKE 'rocksdb_bitlsm_last_query', Value, 1)
+--echo # (4) plain c='x' -> last_query=[$q]  (expect a2='x' = bitlsm used)
+if ($q != a2='x') {
+  --die A4: plain SELECT WHERE c='x' did not auto-select bitlsm
+}
+
+--enable_result_log
+--enable_query_log
+
+# (5) The answer is identical regardless of the locking clause.
+--let $c_plain = `SELECT COUNT(*) FROM t_fu WHERE c = 'x'`
+--let $c_fu    = `SELECT COUNT(*) FROM t_fu WHERE c = 'x' FOR UPDATE`
+--let $c_fs    = `SELECT COUNT(*) FROM t_fu WHERE c = 'x' FOR SHARE`
+--let $assert_text = FOR UPDATE / FOR SHARE return the same rows as plain (=3)
+--let $assert_cond = $c_plain = 3 AND $c_fu = 3 AND $c_fs = 3
+--source include/assert.inc
+
+DROP TABLE t_fu;

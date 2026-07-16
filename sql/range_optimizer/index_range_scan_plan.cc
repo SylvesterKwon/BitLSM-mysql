@@ -692,9 +692,22 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
   // scan does, tripping the engine's row-lock accounting. Every index -- incl.
   // the BitLSM index, whose PK-suffix keyparts match a WHERE on the PK -- is
   // considered for DML too, so without this guard a DML "WHERE id=..." would
-  // auto-select BitLSM via a non-leading (PK-suffix) tree and break. SELECT ...
-  // FOR UPDATE is also SQLCOM_SELECT and remains an untested edge (spike scope).
+  // auto-select BitLSM via a non-leading (PK-suffix) tree and break.
+  //
+  // A4: SELECT ... FOR UPDATE / FOR SHARE is also SQLCOM_SELECT, but it takes
+  // per-row PK locks that the non-locking candidate scan would silently skip
+  // (leaving the "locked" rows unlocked). Exclude locking reads from BitLSM
+  // auto-selection -- a locking read falls back to a lock-taking access path.
+  // lock_descriptor() is the parsed lock intent (TL_WRITE = FOR UPDATE,
+  // TL_READ_WITH_SHARED_LOCKS = FOR SHARE); a missing table ref is treated as
+  // non-plain and excluded (conservative).
+  const auto *const bitlsm_tl = param->table->pos_in_table_list;
+  const bool bitlsm_locking_read =
+      bitlsm_tl == nullptr ||
+      bitlsm_tl->lock_descriptor().type == TL_READ_WITH_SHARED_LOCKS ||
+      bitlsm_tl->lock_descriptor().type >= TL_WRITE_ALLOW_WRITE;
   const bool is_bitlsm = thd->lex->sql_command == SQLCOM_SELECT &&
+                         !bitlsm_locking_read &&
                          param->table->key_info[keynr].is_bitlsm_index();
   // BitLSM ALWAYS uses the synthetic whole-index path, even for a leading-column
   // RANGE. On the normal path a leading range is consumed as the access bound

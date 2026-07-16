@@ -1,0 +1,16 @@
+CREATE TABLE t_fu (
+id BIGINT NOT NULL,
+a INT, b DOUBLE, c VARBINARY(16), d INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_fu_cf',
+INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+INSERT INTO t_fu (id, a, b, c, d)
+WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n < 100)
+SELECT n, n % 50, n + 0.5, IF(n <= 3, 'x', IF(n <= 6, 'z', 'common')), n FROM s;
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+# (1) plain c='z' -> last_query=[a2='z']  (expect a2='z' = bitlsm used)
+# (2) FOR UPDATE c='x' -> last_query=[a2='z']  (expect a2='z' = bitlsm NOT used)
+# (3) FOR SHARE c='x' -> last_query=[a2='z']  (expect a2='z' = bitlsm NOT used)
+# (4) plain c='x' -> last_query=[a2='x']  (expect a2='x' = bitlsm used)
+include/assert.inc [FOR UPDATE / FOR SHARE return the same rows as plain (=3)]
+DROP TABLE t_fu;
