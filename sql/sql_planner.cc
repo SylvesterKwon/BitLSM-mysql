@@ -259,6 +259,20 @@ Key_use *Optimize_table_order::find_best_ref(
     table_map table_deps = 0;
     const uint key = keyuse->key;
     const KEY *const keyinfo = table->key_info + key;
+
+    // C4: never take a ref/eq_ref access on a BITLSM index. A ref access
+    // consumes the equality as the index key, so it is not pushed as an index
+    // condition and never reaches SABI bitmap pruning -- the equality attribute
+    // contributes zero pruning. Skipping ref here routes the equality through
+    // the whole-index range path (index_range_scan_plan.cc check_quick_select),
+    // where it stays a residual condition pushed via ICP into the SABI query and
+    // prunes. (Also correct for DML: a BitLSM ref access is non-locking.)
+    if (keyinfo->is_bitlsm_index()) {
+      do {
+        ++keyuse;
+      } while (keyuse->table_ref == tab->table_ref && keyuse->key == key);
+      continue;
+    }
     /*
       Bitmap of keyparts in this index that have a condition
 

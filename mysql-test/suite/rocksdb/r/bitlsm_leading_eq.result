@@ -1,0 +1,26 @@
+CREATE TABLE t_le (
+id BIGINT NOT NULL,
+a INT, b DOUBLE, c VARBINARY(16), d INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_le_cf',
+INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+INSERT INTO t_le VALUES
+(1,10,1.5,'x',100),(2,10,2.5,'y',200),(3,20,3.5,'x',300),
+(4,10,4.5,'x',400),(5,20,5.5,'z',500),(6,10,6.5,'x',600);
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+# (1) The assembled SABI query for a leading equality INCLUDES the leading
+#     attribute a0 (proving it was pushed via ICP, not consumed by a ref
+#     key). Before C4 this was just [a2='x'] with a0 absent.
+#   assembled = [a2='x' AND a0=10]
+#
+# (2) The leading equality is routed through a range (whole-index) access,
+#     NOT a ref access (type must not be 'ref'; key stays bi).
+EXPLAIN SELECT d FROM t_le FORCE INDEX(bi) WHERE a = 10 AND c = 'x';
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	t_le	NULL	range	bi	bi	0	#	#	100.00	Using index condition
+Warnings:
+Note	1003	/* select#1 */ select `test`.`t_le`.`d` AS `d` from `test`.`t_le` FORCE INDEX (`bi`) where ((`test`.`t_le`.`c` = 'x') and (`test`.`t_le`.`a` = 10))
+#
+# (3) Differential: the FORCE INDEX answer is identical to a full scan.
+include/assert.inc [leading-eq FORCE INDEX(bi) result identical to full scan]
+DROP TABLE t_le;

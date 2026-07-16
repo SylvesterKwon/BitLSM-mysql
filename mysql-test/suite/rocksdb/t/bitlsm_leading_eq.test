@@ -1,0 +1,53 @@
+--source include/have_rocksdb.inc
+--source include/have_debug.inc
+
+# C4: a LEADING EQUALITY (a=const) on a BITLSM_INDEX now prunes. Before, the
+# equality was served by a ref access that consumed it as the index key, so it
+# was never pushed as an index condition and never reached the SABI query -- the
+# leading attribute contributed zero pruning. Excluding ref for BitLSM indexes
+# (sql_planner.cc find_best_ref) routes the equality through the whole-index
+# range path, where it stays a residual pushed via ICP into the SABI query and
+# prunes. Correctness is unchanged (the answer equals a full scan); this only
+# adds pruning.
+
+CREATE TABLE t_le (
+  id BIGINT NOT NULL,
+  a INT, b DOUBLE, c VARBINARY(16), d INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_le_cf',
+  INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+INSERT INTO t_le VALUES
+  (1,10,1.5,'x',100),(2,10,2.5,'y',200),(3,20,3.5,'x',300),
+  (4,10,4.5,'x',400),(5,20,5.5,'z',500),(6,10,6.5,'x',600);
+# a=10 AND c='x' -> ids {1,4,6} = 3 rows.
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+
+--echo # (1) The assembled SABI query for a leading equality INCLUDES the leading
+--echo #     attribute a0 (proving it was pushed via ICP, not consumed by a ref
+--echo #     key). Before C4 this was just [a2='x'] with a0 absent.
+--disable_query_log
+--disable_result_log
+SELECT d FROM t_le FORCE INDEX(bi) WHERE a = 10 AND c = 'x';
+--let $q = query_get_value(SHOW SESSION STATUS LIKE 'rocksdb_bitlsm_last_query', Value, 1)
+--enable_result_log
+--enable_query_log
+--echo #   assembled = [$q]
+if ($q != a2='x' AND a0=10) {
+  --die C4: leading equality a=10 not pushed into the SABI query (got [$q])
+}
+
+--echo #
+--echo # (2) The leading equality is routed through a range (whole-index) access,
+--echo #     NOT a ref access (type must not be 'ref'; key stays bi).
+--replace_column 9 # 10 #
+EXPLAIN SELECT d FROM t_le FORCE INDEX(bi) WHERE a = 10 AND c = 'x';
+
+--echo #
+--echo # (3) Differential: the FORCE INDEX answer is identical to a full scan.
+--let $diff = `SELECT (SELECT COUNT(*) FROM (SELECT id FROM t_le FORCE INDEX(bi) WHERE a=10 AND c='x' EXCEPT SELECT id FROM t_le IGNORE INDEX(bi) WHERE a=10 AND c='x') x) + (SELECT COUNT(*) FROM (SELECT id FROM t_le IGNORE INDEX(bi) WHERE a=10 AND c='x' EXCEPT SELECT id FROM t_le FORCE INDEX(bi) WHERE a=10 AND c='x') y)`
+--let $assert_text = leading-eq FORCE INDEX(bi) result identical to full scan
+--let $assert_cond = $diff = 0
+--source include/assert.inc
+
+DROP TABLE t_le;
