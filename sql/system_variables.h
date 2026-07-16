@@ -712,6 +712,18 @@ struct System_variables {
   bool fb_vector_use_iterator_bounds;
 
   /**
+    BitLSM (SABI) index optimizer knobs (M4b). Dead-simple, SABI-API-free
+    selectivity estimate used when the range optimizer costs a BITLSM_INDEX
+    for a non-leading predicate. A larger cost_factor divides the estimated
+    BitLSM access cost, making the optimizer prefer the BitLSM index; the two
+    per-condition selectivities feed the independence-assumption product used
+    to turn a pushed WHERE into a candidate-row estimate.
+  */
+  double bitlsm_index_cost_factor;
+  double bitlsm_eq_selectivity;
+  double bitlsm_range_selectivity;
+
+  /**
     This session var can be used to control whether index conditions are pushed
     down to the storage engine (ICP) for ORDER BY ... DESC statements that end
     up using the REF plan. This is not applicable to Range plans. This was

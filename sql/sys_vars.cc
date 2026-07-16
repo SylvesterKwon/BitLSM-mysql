@@ -10516,6 +10516,37 @@ static Sys_var_uint Sys_fb_vector_index_cost_factor(
     VALID_RANGE(1, 100000), DEFAULT(1000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(nullptr));
 
+// BitLSM (SABI) index optimizer knobs (M4b). See index_range_scan_plan.cc,
+// check_quick_select(), the bitlsm_synthetic block: a dead-simple,
+// SABI-API-free selectivity estimate turns a pushed WHERE into a candidate-row
+// count and prices the BitLSM access as candidate * per-fetch cost / factor.
+static Sys_var_double Sys_bitlsm_index_cost_factor(
+    "bitlsm_index_cost_factor",
+    "Divides the estimated cost of a BITLSM_INDEX candidate scan. A larger "
+    "value makes the optimizer more likely to auto-select the BitLSM index "
+    "over a full table scan. Default: 1.0",
+    HINT_UPDATEABLE SESSION_VAR(bitlsm_index_cost_factor), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0.001, 1e6), DEFAULT(1.0), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(nullptr), ON_UPDATE(nullptr));
+
+static Sys_var_double Sys_bitlsm_eq_selectivity(
+    "bitlsm_eq_selectivity",
+    "Assumed per-keypart selectivity of an equality (keypart = const) "
+    "predicate in the dead-simple BitLSM candidate-count estimator. "
+    "Default: 0.1",
+    HINT_UPDATEABLE SESSION_VAR(bitlsm_eq_selectivity), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0.0001, 1.0), DEFAULT(0.1), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(nullptr), ON_UPDATE(nullptr));
+
+static Sys_var_double Sys_bitlsm_range_selectivity(
+    "bitlsm_range_selectivity",
+    "Assumed per-keypart selectivity of a range (<, >, BETWEEN, open "
+    "interval) predicate in the dead-simple BitLSM candidate-count estimator. "
+    "Default: 0.33",
+    HINT_UPDATEABLE SESSION_VAR(bitlsm_range_selectivity), CMD_LINE(OPT_ARG),
+    VALID_RANGE(0.0001, 1.0), DEFAULT(0.33), NO_MUTEX_GUARD, NOT_IN_BINLOG,
+    ON_CHECK(nullptr), ON_UPDATE(nullptr));
+
 static Sys_var_uint Sys_fb_vector_search_limit_multiplier(
     "fb_vector_search_limit_multiplier",
     "This parameter indicates to the storage engine the filtering effect "

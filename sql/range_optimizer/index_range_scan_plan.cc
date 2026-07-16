@@ -592,6 +592,61 @@ bool check_for_unique_range(RANGE_SEQ_IF *seq, void *seq_init_param,
   return false;
 }
 
+// M4b: dead-simple, SABI-API-free selectivity estimate for a BITLSM_INDEX.
+// Walks the SEL_ROOT the range optimizer built from the pushed WHERE and
+// multiplies a magic per-keypart selectivity across the constrained keyparts
+// (independence assumption). Each keypart "level" is the R-B interval list for
+// one index column: adjacent SEL_ARGs (->next) are OR-ed points/ranges on that
+// column, and ->next_key_part descends to the next AND-ed column. We classify a
+// level as EQUALITY (one single-point interval -> eq_sel), IN-LIST (n
+// single-point intervals -> n*eq_sel, capped at 1.0), or RANGE (any non-point
+// interval, or anything we cannot classify -> range_sel, the conservative /
+// less-selective choice). Returns a selectivity in (0, 1].
+//
+// Intentionally rough: real SABI selectivity + attribute correlation is a later
+// phase (M5). The output feeds candidate_count = table_rows * selectivity, i.e.
+// the number of PK re-fetches the BitLSM read path will perform.
+static double bitlsm_estimate_selectivity(const SEL_ROOT *tree, double eq_sel,
+                                          double range_sel) {
+  double selectivity = 1.0;
+  for (const SEL_ROOT *level = tree; level != nullptr;) {
+    // Only KEY_RANGE levels carry real interval constraints. A MAYBE_KEY / empty
+    // level is an unknown constraint -> treat the rest as unconstrained, stop.
+    if (level->type != SEL_ROOT::Type::KEY_RANGE || level->root == nullptr)
+      break;
+    SEL_ARG *first = level->root->first();
+    if (first == nullptr) break;  // dummy node holding only next_key_part
+
+    int point_count = 0;
+    bool has_range = false;
+    for (SEL_ARG *arg = first; arg != nullptr; arg = arg->next) {
+      if (arg->field != nullptr && arg->is_singlepoint())
+        ++point_count;
+      else
+        has_range = true;  // open/half-open interval, or unclassifiable
+    }
+
+    double kp_sel;
+    if (has_range || point_count == 0) {
+      // Any non-point interval (or an unclassifiable keypart) -> RANGE. Being
+      // less selective here makes us less likely to wrongly pick BitLSM.
+      kp_sel = range_sel;
+    } else {
+      // Pure equality (point_count == 1) or IN-list (n points).
+      kp_sel = std::min(1.0, point_count * eq_sel);
+    }
+    selectivity *= kp_sel;
+
+    // Descend to the next AND-ed keypart via the first interval's next_key_part.
+    // Rough: sibling intervals may carry different subtrees; the dead-simple
+    // estimator does not model that.
+    level = first->next_key_part;
+  }
+  if (selectivity <= 0.0) selectivity = eq_sel;  // guard: never collapse to 0
+  if (selectivity > 1.0) selectivity = 1.0;
+  return selectivity;
+}
+
 ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
                            bool index_only, SEL_ROOT *tree,
                            bool update_tbl_stats, enum_order order_direction,
@@ -650,11 +705,27 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
     return HA_POS_ERROR;  // Don't use tree
 
   if (bitlsm_synthetic) {
-    // dead-simple estimator (M4a): assume a conjunctive predicate keeps ~10%
-    // of rows as candidates. Real SABI-based selectivity is M4b.
+    // M4b: replace the M4a hardcoded cost with a dead-simple, SABI-API-free
+    // selectivity estimate that VARIES with the predicate, so BitLSM is chosen
+    // only when the pushed WHERE is selective enough to beat a full scan. Real
+    // SABI selectivity + attribute correlation is a later phase (M5); the
+    // interface (output = candidate count) is kept so M5 can swap in here.
     ha_rows table_rows = file->stats.records;
     if (table_rows == 0) table_rows = 1;
-    rows = std::max<ha_rows>(1, table_rows / 10);
+
+    // (1) Selectivity from the SEL_TREE. Magic per-condition selectivities,
+    // multiplied across constrained keyparts (independence). Tunable sysvars.
+    const double eq_sel = thd->variables.bitlsm_eq_selectivity;
+    const double range_sel = thd->variables.bitlsm_range_selectivity;
+    const double total_selectivity =
+        bitlsm_estimate_selectivity(tree, eq_sel, range_sel);
+
+    // candidate_count = rows the BitLSM read path re-fetches by PK. This is the
+    // estimator's output and the unit both rows and cost are derived from.
+    const ha_rows candidate_count = std::max<ha_rows>(
+        1, static_cast<ha_rows>(static_cast<double>(table_rows) *
+                                total_selectivity));
+    rows = candidate_count;
 
     // Force the default MRR impl so execution goes read_range_first ->
     // index_first -> index_read_intern (the BitLSM branch), the most
@@ -665,11 +736,39 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
     *is_imerge_scan = false;
     if (unique_range) *unique_range = false;
 
-    // Deliberately cheap so BitLSM beats a full table scan during bring-up
-    // (tunable later via a cost factor / real estimator). ~rows candidate
-    // fetches, heavily discounted.
+    // (2) Cost that GROWS with candidate_count: bitmap prune overhead + one
+    // random PK re-fetch (tx multi_get, row-at-a-time) per candidate. Each
+    // candidate is priced as a RANDOM point lookup, which is meaningfully
+    // costlier than reading one row in a sequential table scan. We derive that
+    // per-fetch cost from the table's OWN full-scan cost per row, so the
+    // BitLSM-vs-full-scan decision reduces to a stable RATIO -- roughly
+    // "auto-select BitLSM iff estimated selectivity < 1/kRandomFetchFactor"
+    // (~0.2 by default). Anchoring to the scan cost makes the decision immune
+    // to absolute cost jitter (MyRocks data_file_length estimates wobble run to
+    // run and between memtable/SST states); both sides scale together so the
+    // boundary stays put. A non-selective predicate (candidate ~ table_rows) is
+    // then priced well above a full scan and loses; a selective one wins.
+    const Cost_model_table *const cost_model = param->table->cost_model();
+    const double full_scan_cost =
+        file->table_scan_cost().total_cost() +
+        cost_model->row_evaluate_cost(static_cast<double>(table_rows));
+    const double scan_cost_per_row =
+        full_scan_cost / static_cast<double>(table_rows);
+    // A random PK point re-fetch ~ this many sequential rows. With the default
+    // eq/range selectivities (0.1 / 0.33) the auto-select threshold lands near
+    // selectivity ~ 1/factor ~ 0.2: single-equality predicates win, broad
+    // ranges lose. TODO(M5): replace with a real SABI-derived per-fetch cost.
+    const double kBitlsmRandomFetchFactor = 5.0;
+    const double per_fetch_cost = kBitlsmRandomFetchFactor * scan_cost_per_row;
+    const double prune_overhead = cost_model->row_evaluate_cost(1.0);
+    double cost_cpu =
+        prune_overhead +
+        static_cast<double>(candidate_count) * per_fetch_cost;
+    double cost_factor = thd->variables.bitlsm_index_cost_factor;
+    if (cost_factor <= 0.0) cost_factor = 1.0;  // guard (range enforces > 0)
+    cost_cpu /= cost_factor;
     cost->reset();
-    cost->add_cpu(static_cast<double>(rows) * 0.001);
+    cost->add_cpu(cost_cpu);
 
     param->table->quick_rows[keynr] = rows;
     if (update_tbl_stats) {
