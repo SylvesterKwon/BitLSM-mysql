@@ -614,8 +614,75 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
   /* Handle cases when we don't have a valid non-empty list of range */
   if (!tree) return HA_POS_ERROR;
   if (tree->type == SEL_ROOT::Type::IMPOSSIBLE) return 0L;
-  if (tree->type != SEL_ROOT::Type::KEY_RANGE || tree->root->part != 0)
+
+  // M4a spike (BitLSM optimizer auto-selection, risk R1). A BITLSM_INDEX
+  // answers arbitrary attribute-subset predicates, so the keypart it constrains
+  // is frequently NOT the leading one. The stock gate below discards any tree
+  // whose root keypart isn't part 0 -- *before* any cost hook runs -- which
+  // blocks BitLSM from being costed at all (even under FORCE INDEX). Exempt
+  // BitLSM from the gate. When the tree is non-leading (or otherwise not a
+  // plain KEY_RANGE) we must ALSO skip the Sel_arg_range_sequence /
+  // multi_range_read_info_const machinery below: it assumes keyparts start at
+  // 0 and are contiguous, which a non-leading BitLSM tree violates (malformed
+  // min/max keys). Instead we hand back a synthetic (rows, cost). This is
+  // safe because at execution ha_rocksdb::index_read_intern's is_bitlsm_index()
+  // branch ignores range bounds entirely and serves the read via SABI bitmap
+  // pruning + PK re-fetch, so a rough estimate is all the planner needs. A
+  // *leading* BitLSM tree (part 0) still passes the original condition and
+  // falls through to the normal, already-working path (M3b FORCE INDEX).
+  //
+  // Restrict to plain SELECT: the BitLSM read path is a NON-locking snapshot
+  // candidate scan (bitmap prune + tx multi_get). If it were chosen for DML
+  // (UPDATE/DELETE), the scan would not take the per-row PK locks a locking
+  // scan does, tripping the engine's row-lock accounting. Every index -- incl.
+  // the BitLSM index, whose PK-suffix keyparts match a WHERE on the PK -- is
+  // considered for DML too, so without this guard a DML "WHERE id=..." would
+  // auto-select BitLSM via a non-leading (PK-suffix) tree and break. SELECT ...
+  // FOR UPDATE is also SQLCOM_SELECT and remains an untested edge (spike scope).
+  const bool is_bitlsm = thd->lex->sql_command == SQLCOM_SELECT &&
+                         param->table->key_info[keynr].is_bitlsm_index();
+  const bool bitlsm_synthetic =
+      is_bitlsm &&
+      (tree->type != SEL_ROOT::Type::KEY_RANGE || tree->root->part != 0);
+
+  if (!is_bitlsm &&
+      (tree->type != SEL_ROOT::Type::KEY_RANGE || tree->root->part != 0))
     return HA_POS_ERROR;  // Don't use tree
+
+  if (bitlsm_synthetic) {
+    // dead-simple estimator (M4a): assume a conjunctive predicate keeps ~10%
+    // of rows as candidates. Real SABI-based selectivity is M4b.
+    ha_rows table_rows = file->stats.records;
+    if (table_rows == 0) table_rows = 1;
+    rows = std::max<ha_rows>(1, table_rows / 10);
+
+    // Force the default MRR impl so execution goes read_range_first ->
+    // index_first -> index_read_intern (the BitLSM branch), the most
+    // predictable route into our bitmap read path.
+    *mrr_flags = HA_MRR_USE_DEFAULT_IMPL | HA_MRR_NO_ASSOCIATION;
+    *bufsize = thd->variables.read_rnd_buff_size;
+    *is_ror_scan = false;     // never an index-merge / ROR child
+    *is_imerge_scan = false;
+    if (unique_range) *unique_range = false;
+
+    // Deliberately cheap so BitLSM beats a full table scan during bring-up
+    // (tunable later via a cost factor / real estimator). ~rows candidate
+    // fetches, heavily discounted.
+    cost->reset();
+    cost->add_cpu(static_cast<double>(rows) * 0.001);
+
+    param->table->quick_rows[keynr] = rows;
+    if (update_tbl_stats) {
+      param->table->quick_keys.set_bit(keynr);
+      param->table->quick_key_parts[keynr] =
+          param->table->key_info[keynr].user_defined_key_parts;
+      param->table->quick_n_ranges[keynr] = 1;
+      param->table->quick_condition_rows =
+          min(param->table->quick_condition_rows, rows);
+    }
+    param->table->possible_quick_keys.set_bit(keynr);
+    return rows;
+  }
 
   timespec time_beg;
   int cpu_res = -1;
@@ -1029,16 +1096,36 @@ AccessPath *get_key_scans_params(THD *thd, RANGE_OPT_PARAM *param,
     return nullptr;
   }
 
+  KEY *used_key = &param->table->key_info[param->real_keynr[best_idx]];
+
   Quick_ranges ranges(param->return_mem_root);
-  unsigned used_key_parts, num_exact_key_parts;
-  if (get_ranges_from_tree(param->return_mem_root, param->table,
-                           param->key[best_idx], param->real_keynr[best_idx],
-                           key_to_read, MAX_REF_PARTS, &used_key_parts,
-                           &num_exact_key_parts, &ranges)) {
+  unsigned used_key_parts = 0, num_exact_key_parts = 0;
+  // M4a spike R1: a non-leading BitLSM tree (see check_quick_select above)
+  // cannot be turned into a valid index range -- get_ranges_from_tree /
+  // Sel_arg range building assume the tree is rooted at keypart 0, so it would
+  // store a non-leading column's value into the leading keypart slot and build
+  // a malformed range. Instead inject a single WHOLE-INDEX range (min=-inf,
+  // max=+inf). At execution this drives read_range_first(nullptr,...) ->
+  // index_first -> index_read_intern, where the is_bitlsm_index() branch
+  // ignores the (cosmetic) bounds and serves the read from the SABI bitmap +
+  // PK re-fetch. A *leading* BitLSM tree keeps the normal path unchanged.
+  const bool bitlsm_whole_index =
+      used_key->is_bitlsm_index() &&
+      (key_to_read->type != SEL_ROOT::Type::KEY_RANGE ||
+       key_to_read->root->part != 0);
+  if (bitlsm_whole_index) {
+    QUICK_RANGE *whole = new (param->return_mem_root) QUICK_RANGE();  // full
+    if (whole == nullptr || ranges.push_back(whole)) {
+      return nullptr;
+    }
+    used_key_parts = used_key->user_defined_key_parts;
+    num_exact_key_parts = 0;
+  } else if (get_ranges_from_tree(
+                 param->return_mem_root, param->table, param->key[best_idx],
+                 param->real_keynr[best_idx], key_to_read, MAX_REF_PARTS,
+                 &used_key_parts, &num_exact_key_parts, &ranges)) {
     return nullptr;
   }
-
-  KEY *used_key = &param->table->key_info[param->real_keynr[best_idx]];
 
   AccessPath *path = new (param->return_mem_root) AccessPath;
   path->type = AccessPath::INDEX_RANGE_SCAN;
