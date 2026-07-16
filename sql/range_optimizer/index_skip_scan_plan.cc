@@ -260,6 +260,19 @@ AccessPath *get_best_skip_scan(THD *thd, RANGE_OPT_PARAM *param, SEL_TREE *tree,
       goto next_index;
     }
 
+    // A BITLSM_INDEX has no real secondary-key entries (D3): its reads are
+    // served by SABI bitmap pruning + PK re-fetch, not by iterating index
+    // tuples. A loose index skip scan walks the index keyspace directly, which
+    // is meaningless for a BitLSM index (and hangs the engine's read path), so
+    // never consider it here. Range access is exempted at the leading-key gate
+    // in check_quick_select(); skip scan is a separate access path and must be
+    // gated independently. (Surfaced by M4b: a costlier -- more realistic --
+    // BitLSM range cost can let a covering query prefer skip scan over range.)
+    if (cur_index_info->is_bitlsm_index()) {
+      cause = "bitlsm_index";
+      goto next_index;
+    }
+
     cur_part = cur_index_info->key_part;
     end_part = cur_part + actual_key_parts(cur_index_info);
 
