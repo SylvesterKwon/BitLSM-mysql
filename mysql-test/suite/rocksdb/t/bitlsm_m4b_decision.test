@@ -1,0 +1,53 @@
+--source include/have_rocksdb.inc
+
+# M4b: the range optimizer's BITLSM_INDEX cost is a dead-simple, SABI-API-free
+# selectivity estimate that VARIES with the pushed WHERE. M4a hardcoded the cost
+# (rows = table_rows/10, cost = rows*0.001) so BitLSM ALWAYS won; M4b instead
+# walks the SEL_TREE, classifies each constrained keypart (equality / IN-list /
+# range), multiplies a magic per-condition selectivity across keyparts
+# (independence), and prices the access as (bitmap prune + candidate PK
+# re-fetches). The result: BitLSM is auto-selected ONLY when the predicate is
+# selective enough; a non-selective predicate loses to a full table scan.
+#
+# The new bitlsm_index_cost_factor sysvar tunes the preference (larger => BitLSM
+# cheaper => more likely chosen). Correctness (result == full scan) is invariant
+# -- the estimate only changes the PLAN, never the row set (asserted via a
+# both-ways EXCEPT diff = 0).
+#
+# Real SABI selectivity + attribute correlation is a later phase (M5); the
+# interface (estimator output = candidate count) is kept for that swap.
+
+--echo # sysvar defaults (double; session, HINT_UPDATEABLE)
+SELECT @@session.bitlsm_index_cost_factor, @@session.bitlsm_eq_selectivity,
+       @@session.bitlsm_range_selectivity;
+
+CREATE TABLE t_read (
+  id BIGINT NOT NULL,
+  a INT, b INT, c INT,
+  d INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_m4b_cf',
+  INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+# 2000 rows. Controlled cardinality so a 3-way equality matches few rows while a
+# broad non-leading range matches ~a third. d is a payload NOT in bi, so probe
+# queries selecting it are non-covering and re-fetch by PK.
+--disable_query_log
+let $i = 0;
+while ($i < 2000) {
+  eval INSERT INTO t_read VALUES ($i, $i % 100, $i % 40, $i % 25, $i);
+  inc $i;
+}
+--enable_query_log
+SELECT COUNT(*) FROM t_read;
+
+--echo #
+--echo # ==== Phase 1: data in the memtable ====
+--source suite/rocksdb/include/bitlsm_m4b_decision_battery.inc
+
+--echo #
+--echo # ==== Phase 2: data flushed to an SST (SABI block present) ====
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+--source suite/rocksdb/include/bitlsm_m4b_decision_battery.inc
+
+DROP TABLE t_read;

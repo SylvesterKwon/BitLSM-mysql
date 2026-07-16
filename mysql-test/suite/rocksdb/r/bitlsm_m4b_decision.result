@@ -1,0 +1,93 @@
+# sysvar defaults (double; session, HINT_UPDATEABLE)
+SELECT @@session.bitlsm_index_cost_factor, @@session.bitlsm_eq_selectivity,
+@@session.bitlsm_range_selectivity;
+@@session.bitlsm_index_cost_factor	@@session.bitlsm_eq_selectivity	@@session.bitlsm_range_selectivity
+1.000000	0.100000	0.330000
+CREATE TABLE t_read (
+id BIGINT NOT NULL,
+a INT, b INT, c INT,
+d INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_m4b_cf',
+INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SELECT COUNT(*) FROM t_read;
+COUNT(*)
+2000
+#
+# ==== Phase 1: data in the memtable ====
+#
+# (S1) SELECTIVE conjunction b=7 AND c=7 (sel ~ eq*eq=0.01) -> bi.
+include/assert.inc [selective conjunction (b=7 AND c=7) auto-selects bi]
+include/assert.inc [S1 conjunction (b=7 AND c=7): chosen-plan row set identical to full scan]
+#
+# (S2) SELECTIVE single equality c=7 (sel ~ eq=0.1) -> bi.
+include/assert.inc [selective single equality (c=7) auto-selects bi]
+include/assert.inc [S2 single equality (c=7): chosen-plan row set identical to full scan]
+#
+# (N1) NON-SELECTIVE range c>=1 (sel ~ range=0.33) prices ABOVE a full
+#      scan -> NOT bi (type=ALL). Same read path as S2, less selective ->
+#      opposite plan. This is the decision boundary.
+include/assert.inc [non-selective range (c>=1) does NOT auto-select bi]
+include/assert.inc [N1 non-selective range (c>=1): chosen-plan row set identical to full scan]
+#
+# (N2) NON-SELECTIVE IN-list c=1 OR c=3 OR c=5 (dead-simple estimator
+#      scores 3 points at 3*eq=0.3, above the ~0.2 threshold -> NOT bi).
+#      Exercises the n-point IN-list classification. (The real match is
+#      ~12% of rows; a correlation-aware estimate is M5.)
+include/assert.inc [non-selective IN-list (c in 1,3,5) does NOT auto-select bi]
+include/assert.inc [N2 IN-list (c=1 OR c=3 OR c=5): chosen-plan row set identical to full scan]
+#
+# (F) COST-FACTOR STEERING (bitlsm_index_cost_factor) moves the boundary
+#     both ways, at fixed data + fixed predicate -- proving the knob.
+#
+# (F-down) crank DOWN: selective c=7 (bi by default) flips AWAY to ALL.
+SET SESSION bitlsm_index_cost_factor = 0.001;
+include/assert.inc [cost_factor=0.001 flips selective c=7 away from bi]
+SET SESSION bitlsm_index_cost_factor = DEFAULT;
+#
+# (F-up) crank UP: non-selective c>=1 (ALL by default) flips TO bi.
+SET SESSION bitlsm_index_cost_factor = 1000000;
+include/assert.inc [cost_factor=1e6 flips non-selective c>=1 to bi]
+# correctness invariant even when the knob forces bi onto c>=1:
+include/assert.inc [F-up c>=1 under cost_factor=1e6: chosen-plan row set identical to full scan]
+SET SESSION bitlsm_index_cost_factor = DEFAULT;
+#
+# ==== Phase 2: data flushed to an SST (SABI block present) ====
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+#
+# (S1) SELECTIVE conjunction b=7 AND c=7 (sel ~ eq*eq=0.01) -> bi.
+include/assert.inc [selective conjunction (b=7 AND c=7) auto-selects bi]
+include/assert.inc [S1 conjunction (b=7 AND c=7): chosen-plan row set identical to full scan]
+#
+# (S2) SELECTIVE single equality c=7 (sel ~ eq=0.1) -> bi.
+include/assert.inc [selective single equality (c=7) auto-selects bi]
+include/assert.inc [S2 single equality (c=7): chosen-plan row set identical to full scan]
+#
+# (N1) NON-SELECTIVE range c>=1 (sel ~ range=0.33) prices ABOVE a full
+#      scan -> NOT bi (type=ALL). Same read path as S2, less selective ->
+#      opposite plan. This is the decision boundary.
+include/assert.inc [non-selective range (c>=1) does NOT auto-select bi]
+include/assert.inc [N1 non-selective range (c>=1): chosen-plan row set identical to full scan]
+#
+# (N2) NON-SELECTIVE IN-list c=1 OR c=3 OR c=5 (dead-simple estimator
+#      scores 3 points at 3*eq=0.3, above the ~0.2 threshold -> NOT bi).
+#      Exercises the n-point IN-list classification. (The real match is
+#      ~12% of rows; a correlation-aware estimate is M5.)
+include/assert.inc [non-selective IN-list (c in 1,3,5) does NOT auto-select bi]
+include/assert.inc [N2 IN-list (c=1 OR c=3 OR c=5): chosen-plan row set identical to full scan]
+#
+# (F) COST-FACTOR STEERING (bitlsm_index_cost_factor) moves the boundary
+#     both ways, at fixed data + fixed predicate -- proving the knob.
+#
+# (F-down) crank DOWN: selective c=7 (bi by default) flips AWAY to ALL.
+SET SESSION bitlsm_index_cost_factor = 0.001;
+include/assert.inc [cost_factor=0.001 flips selective c=7 away from bi]
+SET SESSION bitlsm_index_cost_factor = DEFAULT;
+#
+# (F-up) crank UP: non-selective c>=1 (ALL by default) flips TO bi.
+SET SESSION bitlsm_index_cost_factor = 1000000;
+include/assert.inc [cost_factor=1e6 flips non-selective c>=1 to bi]
+# correctness invariant even when the knob forces bi onto c>=1:
+include/assert.inc [F-up c>=1 under cost_factor=1e6: chosen-plan row set identical to full scan]
+SET SESSION bitlsm_index_cost_factor = DEFAULT;
+DROP TABLE t_read;
