@@ -12055,6 +12055,19 @@ ulong ha_rocksdb::index_flags(bool &pk_can_be_decoded,
     base_flags |= HA_DO_INDEX_COND_PUSHDOWN;
   }
 
+  /*
+    A BITLSM_INDEX (D3) writes NO secondary-key entries; its reads are served by
+    SABI bitmap pruning + PK re-fetch, never index-only. Advertising
+    HA_KEYREAD_ONLY would let the optimizer plan a covering / index-only scan
+    (e.g. an unhinted COUNT(*), or a SELECT of only indexed columns), which
+    would read the empty SK keyspace and return WRONG results. Clear it so every
+    read fetches the full row through the engine's bitlsm read path.
+  */
+  if (inx != table_arg->primary_key && table_arg->key_info != nullptr &&
+      table_arg->key_info[inx].is_bitlsm_index()) {
+    base_flags &= ~HA_KEYREAD_ONLY;
+  }
+
   DBUG_RETURN(base_flags);
 }
 
