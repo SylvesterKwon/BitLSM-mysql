@@ -1,0 +1,70 @@
+--source include/have_rocksdb.inc
+
+# P0 correctness: a BITLSM_INDEX writes NO secondary-key entries (D3); its reads
+# are served by SABI bitmap pruning + PK re-fetch, never index-only. Before the
+# fix the engine advertised HA_KEYREAD_ONLY for the bitlsm index, so the
+# optimizer could plan a COVERING / index-only scan -- an unhinted COUNT(*), or
+# a SELECT of only indexed columns -- which reads the empty SK keyspace and
+# returns WRONG results (e.g. COUNT(*) WHERE a=10 returned 0/garbage instead of
+# 5). The fix clears HA_KEYREAD_ONLY for bitlsm indexes so every read fetches
+# the full row. This test pins covering reads + COUNT(*) to the full-scan answer.
+
+CREATE TABLE t_cov (
+  id BIGINT NOT NULL,
+  a INT, b DOUBLE, c VARBINARY(16),
+  PRIMARY KEY (id) COMMENT 'cfname=t_cov_cf',
+  INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+INSERT INTO t_cov VALUES
+  (1,10,1.5,'x'),(2,10,2.5,'y'),(3,20,3.5,'x'),(4,10,4.5,'z'),
+  (5,30,5.5,'x'),(6,10,6.5,'y'),(7,20,7.5,'x'),(8,10,8.5,'x');
+# a=10 -> ids {1,2,4,6,8} = 5 ; c='x' -> ids {1,3,5,7,8} = 5 ; total = 8.
+
+--echo # Force flush so reads come from an SST (where SABI block-skip engages).
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+
+--echo # ==== (1) unhinted COUNT(*) with a WHERE on bitlsm columns (the P0 shape) ====
+--echo # Must equal the full-scan count. Before the fix a covering index-only
+--echo # scan over the empty bitlsm keyspace returned the wrong number.
+SELECT COUNT(*) FROM t_cov WHERE a = 10;
+--let $c_auto = `SELECT COUNT(*) FROM t_cov WHERE a = 10`
+--let $c_full = `SELECT COUNT(*) FROM t_cov IGNORE INDEX(bi) WHERE a = 10`
+--let $assert_text = unhinted COUNT(*) WHERE a=10 == full scan (=5)
+--let $assert_cond = $c_auto = $c_full AND $c_auto = 5
+--source include/assert.inc
+
+--echo # Same query forced onto the bitlsm index.
+--let $c_force = `SELECT COUNT(*) FROM t_cov FORCE INDEX(bi) WHERE a = 10`
+--let $assert_text = FORCE INDEX(bi) COUNT(*) WHERE a=10 == 5
+--let $assert_cond = $c_force = 5
+--source include/assert.inc
+
+--echo # A non-leading predicate too (bitlsm auto-select path).
+--let $c_nl = `SELECT COUNT(*) FROM t_cov WHERE c = 'x'`
+--let $c_nl_full = `SELECT COUNT(*) FROM t_cov IGNORE INDEX(bi) WHERE c = 'x'`
+--let $assert_text = COUNT(*) WHERE c='x' == full scan (=5)
+--let $assert_cond = $c_nl = $c_nl_full AND $c_nl = 5
+--source include/assert.inc
+
+--echo # ==== (2) covering SELECT of only indexed columns (a,b,c), unhinted ====
+--echo # Row set must be byte-identical to the full scan.
+SELECT id, a, b, c FROM t_cov WHERE a = 10 ORDER BY id;
+--let $diff = `SELECT (SELECT COUNT(*) FROM (SELECT a,b,c FROM t_cov WHERE a=10 EXCEPT SELECT a,b,c FROM t_cov IGNORE INDEX(bi) WHERE a=10) x) + (SELECT COUNT(*) FROM (SELECT a,b,c FROM t_cov IGNORE INDEX(bi) WHERE a=10 EXCEPT SELECT a,b,c FROM t_cov WHERE a=10) y)`
+--let $assert_text = covering SELECT a,b,c WHERE a=10 identical to full scan
+--let $assert_cond = $diff = 0
+--source include/assert.inc
+
+--echo # ==== (3) plain COUNT(*) with no WHERE ====
+--let $c_all = `SELECT COUNT(*) FROM t_cov`
+--let $assert_text = COUNT(*) with no WHERE == 8
+--let $assert_cond = $c_all = 8
+--source include/assert.inc
+
+--echo # ==== (4) EXPLAIN: bitlsm is not planned as a covering index-only scan ====
+--echo # (Extra must NOT be a bare "Using index"; if bitlsm is used it fetches
+--echo #  rows -> "Using index condition"/"Using where", else a full scan.)
+--replace_column 9 # 10 #
+EXPLAIN SELECT COUNT(*) FROM t_cov WHERE a = 10;
+
+DROP TABLE t_cov;

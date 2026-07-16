@@ -1,0 +1,43 @@
+CREATE TABLE t_cov (
+id BIGINT NOT NULL,
+a INT, b DOUBLE, c VARBINARY(16),
+PRIMARY KEY (id) COMMENT 'cfname=t_cov_cf',
+INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+INSERT INTO t_cov VALUES
+(1,10,1.5,'x'),(2,10,2.5,'y'),(3,20,3.5,'x'),(4,10,4.5,'z'),
+(5,30,5.5,'x'),(6,10,6.5,'y'),(7,20,7.5,'x'),(8,10,8.5,'x');
+# Force flush so reads come from an SST (where SABI block-skip engages).
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+# ==== (1) unhinted COUNT(*) with a WHERE on bitlsm columns (the P0 shape) ====
+# Must equal the full-scan count. Before the fix a covering index-only
+# scan over the empty bitlsm keyspace returned the wrong number.
+SELECT COUNT(*) FROM t_cov WHERE a = 10;
+COUNT(*)
+5
+include/assert.inc [unhinted COUNT(*) WHERE a=10 == full scan (=5)]
+# Same query forced onto the bitlsm index.
+include/assert.inc [FORCE INDEX(bi) COUNT(*) WHERE a=10 == 5]
+# A non-leading predicate too (bitlsm auto-select path).
+include/assert.inc [COUNT(*) WHERE c='x' == full scan (=5)]
+# ==== (2) covering SELECT of only indexed columns (a,b,c), unhinted ====
+# Row set must be byte-identical to the full scan.
+SELECT id, a, b, c FROM t_cov WHERE a = 10 ORDER BY id;
+id	a	b	c
+1	10	1.5	x
+2	10	2.5	y
+4	10	4.5	z
+6	10	6.5	y
+8	10	8.5	x
+include/assert.inc [covering SELECT a,b,c WHERE a=10 identical to full scan]
+# ==== (3) plain COUNT(*) with no WHERE ====
+include/assert.inc [COUNT(*) with no WHERE == 8]
+# ==== (4) EXPLAIN: bitlsm is not planned as a covering index-only scan ====
+# (Extra must NOT be a bare "Using index"; if bitlsm is used it fetches
+#  rows -> "Using index condition"/"Using where", else a full scan.)
+EXPLAIN SELECT COUNT(*) FROM t_cov WHERE a = 10;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	t_cov	NULL	ref	bi	bi	5	#	#	100.00	NULL
+Warnings:
+Note	1003	/* select#1 */ select count(0) AS `COUNT(*)` from `test`.`t_cov` where (`test`.`t_cov`.`a` = 10)
+DROP TABLE t_cov;
