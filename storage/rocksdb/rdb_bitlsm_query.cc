@@ -221,6 +221,45 @@ static bool make_in_terms(Item_func_in *in, const Ctx &ctx, OrClause *clause) {
   return true;
 }
 
+// A positive `field BETWEEN lo AND hi` is the conjunction `field >= lo AND
+// field <= hi`: TWO independent clause_groups. Handled at the conjunction level
+// (not in collect_disjunction, which builds a single OR clause) because it
+// contributes two groups. ORDERED attrs only -- an UNORDERED/STR attr has no
+// representable range. Both bounds are extracted BEFORE either group is pushed,
+// so a partial (potentially non-weakening) translation is never emitted.
+// Returns false (caller drops the whole conjunct -> safe weakening) on NOT
+// BETWEEN or any unrepresentable shape.
+static bool make_between_groups(Item_func *f, const Ctx &ctx, BitLSMQuery *q) {
+  if (static_cast<Item_func_opt_neg *>(f)->negated) return false;
+  if (f->argument_count() != 3) return false;
+
+  AttrMeta meta{};
+  if (index_field_of(f->arguments()[0], ctx, &meta) == nullptr) return false;
+  if (meta.kind == ValKind::SKIP || meta.kind == ValKind::STR) return false;
+
+  Item *lo = f->arguments()[1];
+  Item *hi = f->arguments()[2];
+  if (!lo->const_item() || !hi->const_item()) return false;
+
+  QueryCondition c_lo{};
+  c_lo.attr_idx = meta.attr_idx;
+  c_lo.op = CompareOp::GREATER_EQUAL;
+  if (!extract_value(lo, meta.kind, &c_lo.value)) return false;
+
+  QueryCondition c_hi{};
+  c_hi.attr_idx = meta.attr_idx;
+  c_hi.op = CompareOp::LESS_EQUAL;
+  if (!extract_value(hi, meta.kind, &c_hi.value)) return false;
+
+  OrClause g_lo;
+  g_lo.push_back(std::move(c_lo));
+  OrClause g_hi;
+  g_hi.push_back(std::move(c_hi));
+  q->clause_groups.push_back(std::move(g_lo));
+  q->clause_groups.push_back(std::move(g_hi));
+  return true;
+}
+
 // Append the OR-terms of a purely disjunctive, fully representable item to
 // *clause. A single comparison is a degenerate 1-term disjunction; IN expands
 // to n terms; OR is the union of its operands' terms (all-or-nothing). Any
@@ -272,6 +311,15 @@ static void collect_conjunction(Item *it, const Ctx &ctx, BitLSMQuery *q) {
       return;
     }
     // A top-level OR falls through to collect_disjunction below.
+  }
+  // `field BETWEEN lo AND hi` expands to two clause_groups (>= lo, <= hi).
+  // collect_disjunction can't represent it (a conjunction is not a single OR
+  // term), so handle it here; an unrepresentable BETWEEN is dropped (a dropped
+  // conjunct only weakens -> safe).
+  if (it->type() == Item::FUNC_ITEM &&
+      static_cast<Item_func *>(it)->functype() == Item_func::BETWEEN) {
+    make_between_groups(static_cast<Item_func *>(it), ctx, q);
+    return;
   }
   OrClause clause;
   if (collect_disjunction(it, ctx, &clause) && !clause.empty()) {

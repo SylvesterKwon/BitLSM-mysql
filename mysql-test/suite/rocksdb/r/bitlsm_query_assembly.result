@@ -77,4 +77,31 @@ SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a IS NOT NULL AND c = 'ga
 SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a IS NOT NULL AND (a + b) > 3;
 # WHERE a IS NOT NULL AND (a + b) > 3
 #   assembled: []
+#
+# (10) BETWEEN on the leading INT column decomposes into TWO clause_groups
+# (>= lo AND <= hi). This is the fix for the leading-attribute prune gap:
+# a BETWEEN is Item_func_between (not a binary comparison), so before the
+# decomposition it was dropped whole -> no prune on that attribute. The
+# two-sided range is logically identical to `a >= lo AND a <= hi`.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a BETWEEN 2 AND 10;
+# WHERE a BETWEEN 2 AND 10
+#   assembled: [a0>=2 AND a0<=10]
+#
+# (11) BETWEEN alongside a non-leading equality: the two BETWEEN groups
+# join the other conjuncts as independent clause_groups.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a BETWEEN 2 AND 10 AND c = 'x';
+# WHERE a BETWEEN 2 AND 10 AND c = 'x'
+#   assembled: [a2='x' AND a0>=2 AND a0<=10]
+#
+# (12) NOT BETWEEN: the negated form is not decomposed here; it is dropped
+# (a dropped conjunct only weakens -> safe), the survivor conjunct stays.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND a NOT BETWEEN 2 AND 10;
+# WHERE a >= 0 AND a NOT BETWEEN 2 AND 10
+#   assembled: [a0>=0]
+#
+# (13) BETWEEN on an UNORDERED (VARBINARY) attr has no representable range
+# -> dropped; the leading ordered conjunct survives.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND c BETWEEN 'a' AND 'z';
+# WHERE a >= 0 AND c BETWEEN 'a' AND 'z'
+#   assembled: [a0>=0]
 DROP TABLE t_asm;

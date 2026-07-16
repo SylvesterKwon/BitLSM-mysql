@@ -124,4 +124,35 @@ INSERT INTO t_asm VALUES
 --let $expected =
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
+--echo #
+--echo # (10) BETWEEN on the leading INT column decomposes into TWO clause_groups
+--echo # (>= lo AND <= hi). This is the fix for the leading-attribute prune gap:
+--echo # a BETWEEN is Item_func_between (not a binary comparison), so before the
+--echo # decomposition it was dropped whole -> no prune on that attribute. The
+--echo # two-sided range is logically identical to `a >= lo AND a <= hi`.
+--let $w = a BETWEEN 2 AND 10
+--let $expected = a0>=2 AND a0<=10
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (11) BETWEEN alongside a non-leading equality: the two BETWEEN groups
+--echo # join the other conjuncts as independent clause_groups.
+--let $w = a BETWEEN 2 AND 10 AND c = 'x'
+--let $expected = a2='x' AND a0>=2 AND a0<=10
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (12) NOT BETWEEN: the negated form is not decomposed here; it is dropped
+--echo # (a dropped conjunct only weakens -> safe), the survivor conjunct stays.
+--let $w = a >= 0 AND a NOT BETWEEN 2 AND 10
+--let $expected = a0>=0
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (13) BETWEEN on an UNORDERED (VARBINARY) attr has no representable range
+--echo # -> dropped; the leading ordered conjunct survives.
+--let $w = a >= 0 AND c BETWEEN 'a' AND 'z'
+--let $expected = a0>=0
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
 DROP TABLE t_asm;
