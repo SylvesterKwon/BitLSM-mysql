@@ -45,8 +45,11 @@ INSERT INTO t_read VALUES
 --echo # The optimizer must actually route FORCE INDEX(bi) into the bitlsm read
 --echo # path (otherwise the differential checks below would pass trivially via a
 --echo # table scan on both sides). EXPLAIN shows key=bi, and because d is not in
---echo # the index the WHERE is pushed as an index condition (ICP).
---replace_column 10 # 11 #
+--echo # the index the WHERE is pushed as an index condition (ICP). key_len is masked:
+# BitLSM routes reads through the synthetic whole-index range (key_len=0) so the
+# leading predicate stays a residual condition pushed via ICP (that is what makes
+# the leading attribute prune the SABI bitmap); the exact key_len is incidental.
+--replace_column 8 # 10 # 11 #
 EXPLAIN SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= 0 AND b < 100 AND c = 'gamma';
 # Machine-enforced routing guards (range access and exact/ref access).
 --let $bi_range_key = query_get_value(EXPLAIN SELECT id FROM t_read FORCE INDEX(bi) WHERE a >= 10, key, 1)

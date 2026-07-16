@@ -64,7 +64,11 @@ SELECT id, a, b, c FROM t_cov WHERE a = 10 ORDER BY id;
 --echo # ==== (4) EXPLAIN: bitlsm is not planned as a covering index-only scan ====
 --echo # (Extra must NOT be a bare "Using index"; if bitlsm is used it fetches
 --echo #  rows -> "Using index condition"/"Using where", else a full scan.)
---replace_column 9 # 10 #
+--echo # type/key_len are masked: whether the leading equality is served as a ref
+--echo # access or a whole-index range (BitLSM always uses the synthetic
+--echo # whole-index path when it is cost-cheaper) is incidental -- the asserted
+--echo # invariant is only that Extra is not a bare "Using index".
+--replace_column 5 # 8 # 9 # 10 #
 EXPLAIN SELECT COUNT(*) FROM t_cov WHERE a = 10;
 
 DROP TABLE t_cov;

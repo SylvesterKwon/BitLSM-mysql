@@ -696,9 +696,17 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
   // FOR UPDATE is also SQLCOM_SELECT and remains an untested edge (spike scope).
   const bool is_bitlsm = thd->lex->sql_command == SQLCOM_SELECT &&
                          param->table->key_info[keynr].is_bitlsm_index();
-  const bool bitlsm_synthetic =
-      is_bitlsm &&
-      (tree->type != SEL_ROOT::Type::KEY_RANGE || tree->root->part != 0);
+  // BitLSM ALWAYS uses the synthetic whole-index path, even for a leading-column
+  // RANGE. On the normal path a leading range is consumed as the access bound
+  // and never reaches SABI pruning; forcing whole-index leaves it as a residual
+  // index condition -> pushed via ICP -> the SABI query -> the bitmap prunes on
+  // that attribute (verified: a<K drops candidates to the leading-attr bin).
+  // NOTE: a leading *equality* is served by a ref access path outside this
+  // function, so it is still consumed as the ref key and NOT pushed via ICP --
+  // that gap is unaffected by this flag (see m_bitlsm_ref_key post-filter, which
+  // keeps it correct but unpruned). No execution regression: every BitLSM read
+  // scans the whole CF at execution regardless; this only adds pruning.
+  const bool bitlsm_synthetic = is_bitlsm;
 
   if (!is_bitlsm &&
       (tree->type != SEL_ROOT::Type::KEY_RANGE || tree->root->part != 0))
@@ -1207,11 +1215,12 @@ AccessPath *get_key_scans_params(THD *thd, RANGE_OPT_PARAM *param,
   // max=+inf). At execution this drives read_range_first(nullptr,...) ->
   // index_first -> index_read_intern, where the is_bitlsm_index() branch
   // ignores the (cosmetic) bounds and serves the read from the SABI bitmap +
-  // PK re-fetch. A *leading* BitLSM tree keeps the normal path unchanged.
-  const bool bitlsm_whole_index =
-      used_key->is_bitlsm_index() &&
-      (key_to_read->type != SEL_ROOT::Type::KEY_RANGE ||
-       key_to_read->root->part != 0);
+  // PK re-fetch. ALWAYS whole-index for BitLSM (even a leading tree): matches the
+  // always-synthetic cost path in check_quick_select, so a leading-column RANGE
+  // is left as a residual condition pushed via ICP into the SABI prune instead
+  // of being consumed as an access bound (which left it unpruned). A leading
+  // equality still goes through ref access (elsewhere) and is not affected here.
+  const bool bitlsm_whole_index = used_key->is_bitlsm_index();
   if (bitlsm_whole_index) {
     QUICK_RANGE *whole = new (param->return_mem_root) QUICK_RANGE();  // full
     if (whole == nullptr || ranges.push_back(whole)) {
