@@ -1,6 +1,6 @@
 [submodule "rocksdb"]
 	path = rocksdb
-	url = /home/dohyun/Repositories/BitLSM
+	url = https://github.com/SylvesterKwon/BitLSM.git
 	ignore = dirty
 [submodule "boost"]
 	path = boost
