@@ -12280,23 +12280,13 @@ int ha_rocksdb::index_read_intern(uchar *const buf, const uchar *const key,
     //   (b) this txn's own UNCOMMITTED PK writes (write batch), which the
     //       committed-data iterator cannot see.
     // Each candidate is then authoritatively re-fetched (rdb_tx_multi_get, which
-    // merges write batch + snapshot) and re-verified in
-    // index_next_with_direction_intern() by the SAME per-row filters M3b-1 used:
-    //   (1) an exact-key (ref) equality filter, needed because a ref access
-    //       consumes the equality via the index key and the server does not
-    //       re-check it; and
-    //   (2) the pushed ICP condition.
-    // Pruning changes only WHICH rows are fetched, never how they are verified,
-    // so results stay IDENTICAL to a full scan (differential-verified).
+    // merges write batch + snapshot) and re-verified by the pushed ICP condition
+    // in index_next_with_direction_intern(). Pruning changes only WHICH rows are
+    // fetched, never how they are verified, so results stay IDENTICAL to a full
+    // scan (differential-verified). (BitLSM is excluded from ref access -- see
+    // find_best_ref in sql_planner.cc -- so a leading equality reaches SABI as an
+    // ICP residual too; there is no separate exact-key/ref filter to apply.)
     m_full_key_lookup = false;
-    m_bitlsm_ref_key.clear();
-    if (key != nullptr && find_flag == HA_READ_KEY_EXACT) {
-      const uint ref_len = kd.pack_index_tuple(table, m_pack_buffer,
-                                               m_sk_packed_tuple, key,
-                                               keypart_map);
-      m_bitlsm_ref_key.assign(reinterpret_cast<const char *>(m_sk_packed_tuple),
-                              ref_len);
-    }
 
     // Translate the pushed WHERE into a bit_lsm query. The query is a
     // conservative weakening (untranslatable parts are dropped -> no pruning,
@@ -13210,21 +13200,6 @@ int ha_rocksdb::index_next_with_direction_intern(uchar *const buf,
       rc = convert_record_from_storage_format(&pk_slice, &value_slice, buf);
       if (rc != HA_EXIT_SUCCESS) {
         break;
-      }
-
-      // Exact-key (ref) filter: reproduce the equality the server consumed via
-      // the index key. Pack this row's bitlsm SK and require its prefix to
-      // equal the ref key (mem-comparable keys are prefix-consistent).
-      if (!m_bitlsm_ref_key.empty()) {
-        const uint sk_len =
-            kd.pack_record(table, m_pack_buffer, buf, m_sk_packed_tuple,
-                           nullptr /* unpack_info */,
-                           false /* store_row_debug_checksums */);
-        if (sk_len < m_bitlsm_ref_key.size() ||
-            memcmp(m_sk_packed_tuple, m_bitlsm_ref_key.data(),
-                   m_bitlsm_ref_key.size()) != 0) {
-          continue;
-        }
       }
 
       if (pushed_idx_cond && pushed_idx_cond_keyno == active_index) {

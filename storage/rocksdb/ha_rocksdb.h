@@ -304,15 +304,6 @@ class ha_rocksdb : public my_core::handler, public blob_buffer {
   bool m_full_key_lookup = false;
 
   /*
-    M3b-1: for a BITLSM_INDEX read served by a full PK scan, this holds the
-    packed secondary-key of an exact (ref) lookup, so index_next can filter each
-    scanned row's key prefix against it. Empty when the current bitlsm read is a
-    range/full scan (the pushed ICP condition handles those). See
-    index_read_intern()/index_next_with_direction_intern().
-  */
-  std::string m_bitlsm_ref_key;
-
-  /*
     M3b-3: candidate primary keys for a BITLSM_INDEX read, replacing M3b-1's PK
     full scan. Built in index_read_intern() as the union of (a) SABI bitmap-
     pruned committed rows and (b) the current transaction's own uncommitted PK
