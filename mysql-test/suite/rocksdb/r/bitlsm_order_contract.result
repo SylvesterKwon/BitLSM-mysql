@@ -1,0 +1,88 @@
+CREATE TABLE t_oc (
+id BIGINT NOT NULL,
+y INT NOT NULL,
+b VARBINARY(16) NOT NULL,
+r VARBINARY(16) NOT NULL,
+v INT NOT NULL,
+PRIMARY KEY (id) COMMENT 'cfname=t_oc_cf',
+INDEX bi (y, b, r) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+INSERT INTO t_oc VALUES
+(1,1997,'B1','E',10),(2,1992,'B1','E',20),(3,1997,'B1','E',30),
+(4,1992,'B1','E',40),(5,1995,'B1','E',50),(6,1997,'B1','E',60),
+(7,1992,'B2','E',70),(8,1995,'B1','W',80),(9,1992,'B1','E',90),
+(10,1995,'B1','E',100),(11,1997,'B2','W',110),(12,1992,'B1','E',120);
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+# (1) GROUP BY on leading keypart with later keyparts equality-bound —
+#     the shape that fragmented pre-C6. bi must equal the full scan.
+SELECT SUM(v), y, b FROM t_oc FORCE INDEX (bi)
+WHERE b='B1' AND r='E' GROUP BY y, b ORDER BY y, b;
+SUM(v)	y	b
+270	1992	B1
+150	1995	B1
+100	1997	B1
+SELECT SUM(v), y, b FROM t_oc IGNORE INDEX (bi)
+WHERE b='B1' AND r='E' GROUP BY y, b ORDER BY y, b;
+SUM(v)	y	b
+270	1992	B1
+150	1995	B1
+100	1997	B1
+# (2) Plan shape: the bi plan must materialize/sort (no ordered-index
+#     shortcut) while still using bi for pruning.
+EXPLAIN SELECT SUM(v), y, b FROM t_oc FORCE INDEX (bi)
+WHERE b='B1' AND r='E' GROUP BY y, b ORDER BY y, b;
+id	select_type	table	partitions	type	possible_keys	key	key_len	ref	rows	filtered	Extra
+1	SIMPLE	t_oc	NULL	range	bi	bi	0	NULL	#	#	Using index condition; Using temporary; Using filesort
+Warnings:
+Note	1003	/* select#1 */ select sum(`test`.`t_oc`.`v`) AS `SUM(v)`,`test`.`t_oc`.`y` AS `y`,`test`.`t_oc`.`b` AS `b` from `test`.`t_oc` FORCE INDEX (`bi`) where ((`test`.`t_oc`.`r` = 'E') and (`test`.`t_oc`.`b` = 'B1')) group by `test`.`t_oc`.`y` order by `test`.`t_oc`.`y`
+# (3) ORDER BY on the leading keypart — same contract, ordering path.
+SELECT y, v FROM t_oc FORCE INDEX (bi)
+WHERE b='B1' AND r='E' ORDER BY y, v;
+y	v
+1992	20
+1992	40
+1992	90
+1992	120
+1995	50
+1995	100
+1997	10
+1997	30
+1997	60
+SELECT y, v FROM t_oc IGNORE INDEX (bi)
+WHERE b='B1' AND r='E' ORDER BY y, v;
+y	v
+1992	20
+1992	40
+1992	90
+1992	120
+1995	50
+1995	100
+1997	10
+1997	30
+1997	60
+# (4) DESC ordering (HA_READ_PREV is equally unsupported).
+SELECT y, v FROM t_oc FORCE INDEX (bi)
+WHERE b='B1' AND r='E' ORDER BY y DESC, v DESC;
+y	v
+1997	60
+1997	30
+1997	10
+1995	100
+1995	50
+1992	120
+1992	90
+1992	40
+1992	20
+SELECT y, v FROM t_oc IGNORE INDEX (bi)
+WHERE b='B1' AND r='E' ORDER BY y DESC, v DESC;
+y	v
+1997	60
+1997	30
+1997	10
+1995	100
+1995	50
+1992	120
+1992	90
+1992	40
+1992	20
+DROP TABLE t_oc;
