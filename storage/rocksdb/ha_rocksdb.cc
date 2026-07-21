@@ -12118,10 +12118,18 @@ ulong ha_rocksdb::index_flags(bool &pk_can_be_decoded,
     (e.g. an unhinted COUNT(*), or a SELECT of only indexed columns), which
     would read the empty SK keyspace and return WRONG results. Clear it so every
     read fetches the full row through the engine's bitlsm read path.
+
+    Likewise the candidate iterator returns rows in PK/SST order, NOT in bi
+    keypart order. Advertising HA_READ_ORDER lets the optimizer skip
+    sort/temp for ORDER BY / GROUP BY it deems satisfied by index order
+    (e.g. GROUP BY on the leading keypart with later keyparts bound by
+    equality) and stream-aggregate an unordered input -> silently wrong,
+    fragmented results (C6). Reverse iteration is equally unsupported.
+    Clear both so every order-dependent plan materializes/sorts.
   */
   if (inx != table_arg->primary_key && table_arg->key_info != nullptr &&
       table_arg->key_info[inx].is_bitlsm_index()) {
-    base_flags &= ~HA_KEYREAD_ONLY;
+    base_flags &= ~(HA_KEYREAD_ONLY | HA_READ_ORDER | HA_READ_PREV);
   }
 
   DBUG_RETURN(base_flags);
