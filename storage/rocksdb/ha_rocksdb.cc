@@ -97,6 +97,7 @@
 #include "./ha_rockspart.h"
 #include "./logger.h"
 #include "./nosql_access.h"
+#include "./rdb_bitlsm.h"
 #include "./rdb_bitlsm_query.h"
 #include "./rdb_bitlsm_read.h"
 #include "./rdb_bulk_load.h"
@@ -301,6 +302,10 @@ static int rocksdb_delete_column_family(THD *const /* thd */,
 
   auto &cf_manager = rdb_get_cf_manager();
   int ret = 0;
+
+  // M5: the estimator worker references this CF's ColumnFamilyData -- join it
+  // before the handle can die. No-op for CFs without an estimator.
+  Rdb_bitlsm_registry::instance().estimator_destroy(cf_name);
 
   {
     auto local_dict_manager = dict_manager.get_dict_manager_selector_non_const(
@@ -1493,6 +1498,17 @@ static MYSQL_SYSVAR_BOOL(enable_udt_in_mem, rocksdb_enable_udt_in_mem,
                          "Enabled user define timestamp in memtable feature to "
                          "support HLC snapshot reads in MyRocks",
                          nullptr, nullptr, rocksdb_enable_udt_in_mem);
+
+// M5: attach the BitLSM cardinality estimator (per-CF stats refresh worker)
+// to every bitlsm-bound column family at table open. Read-side only; feeds
+// planning-time selectivity once the optimizer swap (M5 step 4) lands.
+static bool rocksdb_bitlsm_estimator = true;
+static MYSQL_SYSVAR_BOOL(bitlsm_estimator, rocksdb_bitlsm_estimator,
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Attach the BitLSM cardinality estimator to each "
+                         "bitlsm-bound column family at table open (planning "
+                         "statistics; M5)",
+                         nullptr, nullptr, true);
 
 static MYSQL_THDVAR_STR(tmpdir, PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_MEMALLOC,
                         "Directory for temporary files during DDL operations.",
@@ -3054,6 +3070,7 @@ static struct SYS_VAR *rocksdb_system_variables[] = {
     MYSQL_SYSVAR(skip_bulk_load_notify_ddl),
     MYSQL_SYSVAR(enable_remove_orphaned_dropped_cfs),
     MYSQL_SYSVAR(enable_udt_in_mem),
+    MYSQL_SYSVAR(bitlsm_estimator),
     MYSQL_SYSVAR(tmpdir),
     MYSQL_SYSVAR(merge_combine_read_size),
     MYSQL_SYSVAR(merge_tmp_file_removal_delay_ms),
@@ -9411,6 +9428,12 @@ static int rocksdb_init_internal(void *const p) {
     DBUG_RETURN(HA_EXIT_FAILURE);
   }
 
+  // M5: RocksDB fixes the listener list at Open, before any bitlsm CF can be
+  // bound -- register unconditionally; events on non-bitlsm CFs are a hash
+  // miss + no-op.
+  main_opts.listeners.push_back(
+      std::make_shared<myrocks::Rdb_bitlsm_stats_listener>());
+
   // NO_LINT_DEBUG
   LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG,
                   "RocksDB: Opening TransactionDB...");
@@ -9669,6 +9692,11 @@ static int rocksdb_init_internal(void *const p) {
 // (experimentation).
 static int rocksdb_shutdown(bool minimalShutdown) {
   int error = 0;
+
+  // M5: join every estimator refresh worker BEFORE any teardown -- the
+  // workers reference ColumnFamilyData. Later flush completions then hit an
+  // empty registry (no-op). Idempotent, so unconditional is safe.
+  Rdb_bitlsm_registry::instance().estimator_shutdown();
 
   if (!minimalShutdown) {
     // signal the drop index thread to stop
@@ -19742,6 +19770,10 @@ bool ha_rocksdb::can_use_bloom_filter(THD *thd, const Rdb_key_def &kd,
 
 /* For modules that need access to the global data structures */
 rocksdb::TransactionDB *rdb_get_rocksdb_db() { return rdb; }
+
+// M5: sysvar gate for estimator_attach (read at table open in
+// setup_bitlsm_index).
+bool rdb_bitlsm_estimator_enabled() { return rocksdb_bitlsm_estimator; }
 
 Rdb_cf_manager &rdb_get_cf_manager() { return cf_manager; }
 

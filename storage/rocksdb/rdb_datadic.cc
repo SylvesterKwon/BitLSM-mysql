@@ -3984,6 +3984,16 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
     return HA_ERR_UNSUPPORTED;
   }
 
+  // (4) M5: attach the cardinality estimator to the bound CF (idempotent
+  // across reopen -- a running worker is kept). Non-blocking: the ctor spawns
+  // the refresh worker and primes the initial build asynchronously. `schema`
+  // was copied into the SABIFactory above, so moving it out here is safe.
+  if (rdb_bitlsm_estimator_enabled()) {
+    Rdb_bitlsm_registry::instance().estimator_attach(
+        pk_cf_name, rdb_get_rocksdb_db()->GetBaseDB(), &pk_def->get_cf(),
+        std::move(schema), bit_lsm::BitLSMOptions());
+  }
+
   return HA_EXIT_SUCCESS;
 }
 

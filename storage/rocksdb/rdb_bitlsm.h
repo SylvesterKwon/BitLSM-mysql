@@ -9,8 +9,11 @@
 #include <vector>
 
 /* BitLSM headers (compiled into rocksdb_se from the BitLSM submodule). */
-#include "bit_lsm_encoding.h"  // bit_lsm::AttrExtractor, EncodedAttr, SABISchema
-#include "sabi.h"              // bit_lsm::SABIFactory
+#include "bit_lsm_encoding.h"   // bit_lsm::AttrExtractor, EncodedAttr, SABISchema
+#include "bit_lsm_estimator.h"  // bit_lsm::CardinalityEstimator (M5)
+#include "bit_lsm_option.h"     // bit_lsm::BitLSMOptions
+#include "rocksdb/listener.h"   // rocksdb::EventListener (stats refresh)
+#include "sabi.h"               // bit_lsm::SABIFactory
 
 /* Real per-row decoder + its bind-time plan (M3a-4). Kept in a separate,
    RocksDB-header-free unit so the hot path stays lightweight and unit-testable
@@ -35,14 +38,52 @@ class Rdb_bitlsm_registry {
   // Returns nullptr if cf_name is not bound (non-bitlsm or not yet opened).
   std::shared_ptr<bit_lsm::SABIFactory> get(const std::string &cf_name) const;
 
+  // M5 cardinality estimator (planning-time selectivity; lives on the bound
+  // PK data CF, same place the SABI blobs do). Attach is idempotent across
+  // table reopen: an already-running estimator is kept, never restarted.
+  // Called from setup_bitlsm_index right after bind(), sysvar-gated.
+  void estimator_attach(const std::string &cf_name, rocksdb::DB *base_db,
+                        rocksdb::ColumnFamilyHandle *cfh,
+                        bit_lsm::SABISchema schema,
+                        const bit_lsm::BitLSMOptions &options);
+  // nullptr when the CF has no estimator (unbound, sysvar off, or destroyed).
+  // The pointer stays valid until estimator_destroy/estimator_shutdown -- both
+  // run only while no planning can be in flight (manual CF drop, plugin
+  // deinit), so callers may use it without extra pinning.
+  bit_lsm::CardinalityEstimator *estimator_get(const std::string &cf_name) const;
+  // Flush/compaction completed on cf_name -> wake its refresh worker (no-op
+  // for CFs without an estimator).
+  void estimator_notify(const std::string &cf_name);
+  // Manual CF drop (rocksdb_delete_cf): join the worker BEFORE the CF handle
+  // dies -- the worker references the ColumnFamilyData.
+  void estimator_destroy(const std::string &cf_name);
+  // Plugin deinit: join every worker before the DB closes.
+  void estimator_shutdown();
+
  private:
   Rdb_bitlsm_registry() = default;
   struct Entry {
     std::vector<bit_lsm::AttrRole> roles;
     std::shared_ptr<bit_lsm::SABIFactory> factory;
+    // M5: refresh worker + stats cache; empty until estimator_attach.
+    std::unique_ptr<bit_lsm::CardinalityEstimator> estimator;
   };
   mutable std::mutex m_mutex;
   std::unordered_map<std::string, Entry> m_map;
+};
+
+// DB-wide flush/compaction listener registered unconditionally at
+// rocksdb_init (RocksDB fixes the listener list at DB::Open, before any
+// bitlsm CF is bound). Events fan out to the estimator of the event's CF via
+// the registry -- a hash lookup + no-op for the overwhelmingly common
+// non-bitlsm CFs. BitLSM's own single-target StatsRefreshListener is not used:
+// the embedded server may host several bitlsm CFs.
+class Rdb_bitlsm_stats_listener : public rocksdb::EventListener {
+ public:
+  void OnFlushCompleted(rocksdb::DB *,
+                        const rocksdb::FlushJobInfo &info) override;
+  void OnCompactionCompleted(rocksdb::DB *,
+                             const rocksdb::CompactionJobInfo &info) override;
 };
 
 // Per-CF UDI factory installed on every data CF's BlockBasedTableOptions. Knows

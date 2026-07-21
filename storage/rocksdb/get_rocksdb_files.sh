@@ -51,6 +51,7 @@ for f in \
   src/include/bit_lsm_merging_iterator.cpp \
   src/include/bit_lsm_level_iterator.cpp \
   src/include/bit_lsm_memtable_iterator.cpp \
+  src/include/bit_lsm_estimator.cpp \
   third_party/folly-tdigest/src/TDigest.cpp \
   third_party/folly-tdigest/src/DoubleRadixSort.cpp
 do

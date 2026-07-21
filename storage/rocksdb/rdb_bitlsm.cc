@@ -1,6 +1,12 @@
 /* Copyright (c) Meta Platforms, Inc. and affiliates. */
 #include "./rdb_bitlsm.h"
 
+/* rocksdb-internal headers, needed only for the estimator_attach casts (the
+   same DBImpl / ColumnFamilyHandleImpl casts BitLSMIterator and the standalone
+   BitLSM ctor already exercise). Contained to this TU. */
+#include "db/column_family.h"
+#include "db/db_impl/db_impl.h"
+
 namespace myrocks {
 
 Rdb_bitlsm_registry &Rdb_bitlsm_registry::instance() {
@@ -13,12 +19,81 @@ bool Rdb_bitlsm_registry::bind(const std::string &cf_name,
                                std::shared_ptr<bit_lsm::SABIFactory> factory) {
   std::lock_guard<std::mutex> lk(m_mutex);
   auto it = m_map.find(cf_name);
-  if (it != m_map.end() && it->second.roles != roles) {
-    // D5 violation: CF already hosts a different bitlsm schema.
-    return false;
+  if (it != m_map.end()) {
+    if (it->second.roles != roles) {
+      // D5 violation: CF already hosts a different bitlsm schema.
+      return false;
+    }
+    // Same-schema rebind (table reopen): refresh the factory but keep the
+    // running estimator -- replacing the Entry would join and restart its
+    // worker on every reopen.
+    it->second.factory = std::move(factory);
+    return true;
   }
-  m_map[cf_name] = Entry{std::move(roles), std::move(factory)};
+  m_map.emplace(cf_name,
+                Entry{std::move(roles), std::move(factory), nullptr});
   return true;
+}
+
+void Rdb_bitlsm_registry::estimator_attach(
+    const std::string &cf_name, rocksdb::DB *base_db,
+    rocksdb::ColumnFamilyHandle *cfh, bit_lsm::SABISchema schema,
+    const bit_lsm::BitLSMOptions &options) {
+  std::lock_guard<std::mutex> lk(m_mutex);
+  auto it = m_map.find(cf_name);
+  if (it == m_map.end()) return;     // bind() first (caller order)
+  if (it->second.estimator) return;  // reopen: keep the running worker
+  it->second.estimator = std::make_unique<bit_lsm::CardinalityEstimator>(
+      static_cast<rocksdb::DBImpl *>(base_db),
+      static_cast<rocksdb::ColumnFamilyHandleImpl *>(cfh)->cfd(),
+      std::move(schema), options);
+}
+
+bit_lsm::CardinalityEstimator *Rdb_bitlsm_registry::estimator_get(
+    const std::string &cf_name) const {
+  std::lock_guard<std::mutex> lk(m_mutex);
+  auto it = m_map.find(cf_name);
+  return it == m_map.end() ? nullptr : it->second.estimator.get();
+}
+
+void Rdb_bitlsm_registry::estimator_notify(const std::string &cf_name) {
+  std::lock_guard<std::mutex> lk(m_mutex);
+  auto it = m_map.find(cf_name);
+  if (it != m_map.end() && it->second.estimator) {
+    it->second.estimator->NotifyChange();
+  }
+}
+
+void Rdb_bitlsm_registry::estimator_destroy(const std::string &cf_name) {
+  std::unique_ptr<bit_lsm::CardinalityEstimator> dead;
+  {
+    std::lock_guard<std::mutex> lk(m_mutex);
+    auto it = m_map.find(cf_name);
+    if (it != m_map.end()) dead = std::move(it->second.estimator);
+  }
+  // ~CardinalityEstimator joins the worker; run outside the registry lock so
+  // a concurrent flush-completion notify cannot deadlock against the join.
+}
+
+void Rdb_bitlsm_registry::estimator_shutdown() {
+  std::vector<std::unique_ptr<bit_lsm::CardinalityEstimator>> dead;
+  {
+    std::lock_guard<std::mutex> lk(m_mutex);
+    for (auto &kv : m_map) {
+      if (kv.second.estimator) dead.push_back(std::move(kv.second.estimator));
+    }
+  }
+  // Workers join here, outside the lock (same reasoning as estimator_destroy).
+}
+
+void Rdb_bitlsm_stats_listener::OnFlushCompleted(
+    rocksdb::DB *, const rocksdb::FlushJobInfo &info) {
+  Rdb_bitlsm_registry::instance().estimator_notify(info.cf_name);
+}
+
+void Rdb_bitlsm_stats_listener::OnCompactionCompleted(
+    rocksdb::DB *, const rocksdb::CompactionJobInfo &info) {
+  Rdb_bitlsm_registry::instance().estimator_notify(info.cf_name);
 }
 
 std::shared_ptr<bit_lsm::SABIFactory> Rdb_bitlsm_registry::get(
