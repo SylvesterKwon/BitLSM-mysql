@@ -1,0 +1,67 @@
+--source include/have_rocksdb.inc
+
+# M5: once statistics exist, the BITLSM_INDEX plan decision is driven by the
+# engine's cardinality estimator (live-SST stats served through
+# handler::bitlsm_estimate_selectivity) instead of the M4b sysvar constants.
+# Deterministic: stats are forced current with the
+# rocksdb_bitlsm_estimator_refresh trigger, never racing the async worker.
+# The M4b FALLBACK path is pinned separately by bitlsm_m4a_autoselect /
+# bitlsm_m4b_decision, which run with --rocksdb-bitlsm-estimator=0.
+
+SELECT @@global.rocksdb_bitlsm_estimator;
+
+CREATE TABLE t_est (
+  id BIGINT NOT NULL,
+  a INT, b INT, c VARBINARY(16),
+  d INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_est_cf',
+  INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+# 2000 rows. a: 1000 distinct (equality ~0.1%), b: 4 distinct (b<=1 = 50%),
+# c: 20 distinct strings v0..v19. d is a payload NOT in bi (non-covering).
+--disable_query_log
+let $i = 0;
+while ($i < 2000) {
+  eval INSERT INTO t_est VALUES ($i, $i % 1000, $i % 4, CONCAT('v', $i % 20), $i);
+  inc $i;
+}
+--enable_query_log
+SELECT COUNT(*) FROM t_est;
+
+--echo #
+--echo # ==== Phase 1: memtable only -> no stats yet (D-E3), decisions are the
+--echo # ==== M4b sysvar fallback, verbatim. Magic prices b<=1 AND c BETWEEN as
+--echo # ==== 0.33*0.33 = 11% and picks bi -- the q2_2-shaped mis-selection.
+--let $k = query_get_value(EXPLAIN SELECT d FROM t_est WHERE b <= 1 AND c BETWEEN 'v1' AND 'v5', key, 1)
+--let $assert_text = memtable-only: fallback magic routes range+string-range to bi
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+SET GLOBAL rocksdb_bitlsm_estimator_refresh = 1;
+
+--echo #
+--echo # ==== Phase 2: engine stats live.
+--echo # (a) selective equality (2/2000) still routes to bi
+--let $k = query_get_value(EXPLAIN SELECT d FROM t_est WHERE a = 503, key, 1)
+--let $assert_text = estimator: selective equality routes to bi
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+
+--echo # (b) same query as phase 1: the string range is DROPPED by the bitmap
+--echo #     translation (prunes no candidates) and b<=1 really matches 50%,
+--echo #     so the fetch cost can no longer be talked down -> full scan wins.
+--let $k = query_get_value(EXPLAIN SELECT d FROM t_est WHERE b <= 1 AND c BETWEEN 'v1' AND 'v5', key, 1)
+--let $assert_text = estimator: dropped string range no longer shrinks fetch cost
+--let $assert_cond = "$k" != "bi"
+--source include/assert.inc
+
+--echo # (c) plan parity: the bi-served row set equals the full scan's
+--let $n_bi = query_get_value(SELECT COUNT(*) AS n FROM t_est WHERE a = 503, n, 1)
+--let $n_fs = query_get_value(SELECT COUNT(*) AS n FROM t_est IGNORE INDEX (bi) WHERE a = 503, n, 1)
+--let $assert_text = bi-served count equals full-scan count
+--let $assert_cond = $n_bi = $n_fs
+--source include/assert.inc
+
+DROP TABLE t_est;

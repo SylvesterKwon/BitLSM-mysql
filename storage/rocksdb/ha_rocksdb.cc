@@ -1510,6 +1510,33 @@ static MYSQL_SYSVAR_BOOL(bitlsm_estimator, rocksdb_bitlsm_estimator,
                          "statistics; M5)",
                          nullptr, nullptr, true);
 
+// M5: trigger sysvar (force_flush_memtable_now pattern) -- synchronously
+// refresh every estimator's stats from the current live SST set, so MTR
+// tests and benchmark harnesses see deterministic estimates instead of
+// racing the async refresh worker.
+static int rocksdb_bitlsm_estimator_refresh(
+    THD *const thd MY_ATTRIBUTE((__unused__)),
+    struct SYS_VAR *const var MY_ATTRIBUTE((__unused__)),
+    void *const var_ptr MY_ATTRIBUTE((__unused__)),
+    struct st_mysql_value *const value) {
+  bool parsed_value = false;
+  if (mysql_value_to_bool(value, &parsed_value) != 0) {
+    return 1;
+  } else if (!parsed_value) {
+    // Setting to OFF is a no-op and this supports mtr tests
+    return HA_EXIT_SUCCESS;
+  }
+  Rdb_bitlsm_registry::instance().estimator_refresh_all();
+  return HA_EXIT_SUCCESS;
+}
+static bool rocksdb_bitlsm_estimator_refresh_var = false;
+static MYSQL_SYSVAR_BOOL(
+    bitlsm_estimator_refresh, rocksdb_bitlsm_estimator_refresh_var,
+    PLUGIN_VAR_RQCMDARG,
+    "Trigger: synchronously refresh every BitLSM estimator's statistics "
+    "from the current live SST set",
+    rocksdb_bitlsm_estimator_refresh, rocksdb_rw_sysvar_update_noop, false);
+
 static MYSQL_THDVAR_STR(tmpdir, PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_MEMALLOC,
                         "Directory for temporary files during DDL operations.",
                         nullptr, nullptr, "");
@@ -3071,6 +3098,7 @@ static struct SYS_VAR *rocksdb_system_variables[] = {
     MYSQL_SYSVAR(enable_remove_orphaned_dropped_cfs),
     MYSQL_SYSVAR(enable_udt_in_mem),
     MYSQL_SYSVAR(bitlsm_estimator),
+    MYSQL_SYSVAR(bitlsm_estimator_refresh),
     MYSQL_SYSVAR(tmpdir),
     MYSQL_SYSVAR(merge_combine_read_size),
     MYSQL_SYSVAR(merge_tmp_file_removal_delay_ms),
@@ -16599,6 +16627,60 @@ ha_rows ha_rocksdb::records_in_range(uint inx, key_range *const min_key,
   }
 
   DBUG_RETURN(ret);
+}
+
+// M5 (BitLSM): planning-time cardinality estimate for a BITLSM_INDEX. The
+// input is translated with the SAME code the read path uses, so predicates
+// the translation drops (string ranges, NOT BETWEEN, ...) do not shrink the
+// estimate -- they cannot shrink the candidate set either.
+bool ha_rocksdb::bitlsm_estimate_selectivity(uint inx, Item *cond,
+                                             double *selectivity,
+                                             ulonglong *physical_rows,
+                                             key_part_map *covered_parts,
+                                             key_part_map *fallback_parts) {
+  DBUG_ENTER_FUNC();
+  if (cond == nullptr || table == nullptr || m_tbl_def == nullptr)
+    DBUG_RETURN(false);
+  const KEY &key_info = table->key_info[inx];
+  if (!key_info.is_bitlsm_index()) DBUG_RETURN(false);
+
+  // The estimator lives on the PK data CF binding (where the SABI blobs do).
+  const std::shared_ptr<Rdb_key_def> &pk_def = m_tbl_def->get_pk_def();
+  if (!pk_def) DBUG_RETURN(false);
+  bit_lsm::CardinalityEstimator *est =
+      Rdb_bitlsm_registry::instance().estimator_get(
+          pk_def->get_cf().GetName());
+  if (est == nullptr) DBUG_RETURN(false);  // sysvar off / not attached
+
+  bit_lsm::BitLSMQuery bq;
+  bit_lsm::BitLSMOptions bopts;
+  if (!rdb_bitlsm_assemble_query(key_info, cond, &bq, &bopts))
+    DBUG_RETURN(false);
+  const bit_lsm::SABIQuery sq = bit_lsm::EncodeQuery(bq, bopts);
+
+  const bit_lsm::EstimateResult res = est->Estimate(sq);
+  // Pre-first-flush / empty stats: nothing to estimate from; let the caller
+  // keep its full fallback path (D-E3 documented limit).
+  if (res.physical_rows == 0) DBUG_RETURN(false);
+
+  key_part_map covered = 0;
+  for (const auto &clause : sq.clause_groups) {
+    for (const auto &c : clause) {
+      if (c.attr_idx < key_info.user_defined_key_parts)
+        covered |= (key_part_map{1} << c.attr_idx);
+    }
+  }
+  key_part_map fb = 0;
+  for (const uint32_t attr : res.fallback_attrs) {
+    if (attr < key_info.user_defined_key_parts)
+      fb |= (key_part_map{1} << attr);
+  }
+
+  *selectivity = res.selectivity;
+  *physical_rows = res.physical_rows;
+  *covered_parts = covered;
+  *fallback_parts = fb;
+  DBUG_RETURN(true);
 }
 
 /*

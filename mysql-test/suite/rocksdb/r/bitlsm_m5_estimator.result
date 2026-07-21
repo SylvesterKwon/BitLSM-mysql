@@ -1,0 +1,31 @@
+SELECT @@global.rocksdb_bitlsm_estimator;
+@@global.rocksdb_bitlsm_estimator
+1
+CREATE TABLE t_est (
+id BIGINT NOT NULL,
+a INT, b INT, c VARBINARY(16),
+d INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_est_cf',
+INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SELECT COUNT(*) FROM t_est;
+COUNT(*)
+2000
+#
+# ==== Phase 1: memtable only -> no stats yet (D-E3), decisions are the
+# ==== M4b sysvar fallback, verbatim. Magic prices b<=1 AND c BETWEEN as
+# ==== 0.33*0.33 = 11% and picks bi -- the q2_2-shaped mis-selection.
+include/assert.inc [memtable-only: fallback magic routes range+string-range to bi]
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+SET GLOBAL rocksdb_bitlsm_estimator_refresh = 1;
+#
+# ==== Phase 2: engine stats live.
+# (a) selective equality (2/2000) still routes to bi
+include/assert.inc [estimator: selective equality routes to bi]
+# (b) same query as phase 1: the string range is DROPPED by the bitmap
+#     translation (prunes no candidates) and b<=1 really matches 50%,
+#     so the fetch cost can no longer be talked down -> full scan wins.
+include/assert.inc [estimator: dropped string range no longer shrinks fetch cost]
+# (c) plan parity: the bi-served row set equals the full scan's
+include/assert.inc [bi-served count equals full-scan count]
+DROP TABLE t_est;

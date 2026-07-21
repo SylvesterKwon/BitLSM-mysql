@@ -59,6 +59,11 @@ class Rdb_bitlsm_registry {
   void estimator_destroy(const std::string &cf_name);
   // Plugin deinit: join every worker before the DB closes.
   void estimator_shutdown();
+  // Synchronously run one refresh pass on every estimator (blocks through
+  // the worker's cooldown). Trigger sysvar rocksdb_bitlsm_estimator_refresh:
+  // deterministic stats for MTR tests and benchmark harnesses. Callers must
+  // not race estimator_destroy/estimator_shutdown (admin-op scope).
+  void estimator_refresh_all();
 
  private:
   Rdb_bitlsm_registry() = default;

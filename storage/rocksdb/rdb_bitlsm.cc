@@ -86,6 +86,20 @@ void Rdb_bitlsm_registry::estimator_shutdown() {
   // Workers join here, outside the lock (same reasoning as estimator_destroy).
 }
 
+void Rdb_bitlsm_registry::estimator_refresh_all() {
+  // Collect raw pointers under the lock, run the blocking refreshes outside
+  // it: TEST_Refresh waits on the worker, and a concurrent flush completion
+  // takes the registry lock in estimator_notify.
+  std::vector<bit_lsm::CardinalityEstimator *> targets;
+  {
+    std::lock_guard<std::mutex> lk(m_mutex);
+    for (auto &kv : m_map) {
+      if (kv.second.estimator) targets.push_back(kv.second.estimator.get());
+    }
+  }
+  for (auto *est : targets) est->TEST_Refresh();
+}
+
 void Rdb_bitlsm_stats_listener::OnFlushCompleted(
     rocksdb::DB *, const rocksdb::FlushJobInfo &info) {
   Rdb_bitlsm_registry::instance().estimator_notify(info.cf_name);

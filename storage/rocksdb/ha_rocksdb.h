@@ -973,6 +973,14 @@ class ha_rocksdb : public my_core::handler, public blob_buffer {
                            key_range *const max_key) override
       MY_ATTRIBUTE((__warn_unused_result__));
 
+  // M5 (BitLSM): planning-time cardinality estimate for a BITLSM_INDEX.
+  // Runs the SAME translation as the read path (rdb_bitlsm_assemble_query +
+  // EncodeQuery) against the registry-attached estimator of the PK data CF.
+  bool bitlsm_estimate_selectivity(uint inx, Item *cond, double *selectivity,
+                                   ulonglong *physical_rows,
+                                   key_part_map *covered_parts,
+                                   key_part_map *fallback_parts) override;
+
   ulonglong records_size_in_range(uint inx, key_range *const min_key,
                                   key_range *const max_key) override
       MY_ATTRIBUTE((__warn_unused_result__));

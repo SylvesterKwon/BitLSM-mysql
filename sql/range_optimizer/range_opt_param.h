@@ -67,6 +67,18 @@ class RANGE_OPT_PARAM {
   */
   uint *real_keynr = nullptr;
 
+  /*
+    M5 (BitLSM): the original condition range analysis ran on, so the BitLSM
+    branch of check_quick_select can hand it to the engine's cardinality
+    estimator (handler::bitlsm_estimate_selectivity). The estimate must be
+    derived from the SAME condition the read path will later assemble its
+    bitmap query from -- predicates the translation drops (e.g. string
+    ranges) then correctly do not shrink the estimate. Set only by
+    test_quick_select; nullptr elsewhere (group-min-max / skip-scan callers)
+    degrades to the sysvar fallback estimator.
+  */
+  Item *bitlsm_cond = nullptr;
+
   /**
     Whether index statistics or index dives should be used when
     estimating the number of rows in an equality range. If true, index

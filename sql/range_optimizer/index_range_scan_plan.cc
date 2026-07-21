@@ -603,12 +603,26 @@ bool check_for_unique_range(RANGE_SEQ_IF *seq, void *seq_init_param,
 // interval, or anything we cannot classify -> range_sel, the conservative /
 // less-selective choice). Returns a selectivity in (0, 1].
 //
-// Intentionally rough: real SABI selectivity + attribute correlation is a later
-// phase (M5). The output feeds candidate_count = table_rows * selectivity, i.e.
-// the number of PK re-fetches the BitLSM read path will perform.
-static double bitlsm_estimate_selectivity(const SEL_ROOT *tree, double eq_sel,
-                                          double range_sel) {
-  double selectivity = 1.0;
+// M5: per-keypart FALLBACK factors composing with the engine estimate. The
+// walk and eq/IN/range classification are M4b's; what changed is that each
+// constrained keypart now multiplies into one, both, or neither of TWO
+// selectivities:
+//   *rows_sel -- the plan's OUTPUT-row slot. Every predicate on an indexed
+//     column filters output (ICP re-verifies), so every keypart the engine
+//     did not estimate contributes here.
+//   *cost_sel -- the fetch-COST slot (candidate prunes). Only predicates
+//     that reached the engine's bitmap query can prune candidates; a keypart
+//     the translation DROPPED (string range etc.) must contribute 1.0 here --
+//     pricing it as a prune is exactly the H3 q2_2 mis-selection.
+// With no engine estimate (engine_ok=false) both slots get every factor,
+// which is verbatim M4b behavior.
+static void bitlsm_fallback_selectivity(const SEL_ROOT *tree, double eq_sel,
+                                        double range_sel, bool engine_ok,
+                                        key_part_map engine_covered,
+                                        key_part_map engine_fallback,
+                                        double *rows_sel, double *cost_sel) {
+  *rows_sel = 1.0;
+  *cost_sel = 1.0;
   for (const SEL_ROOT *level = tree; level != nullptr;) {
     // Only KEY_RANGE levels carry real interval constraints. A MAYBE_KEY / empty
     // level is an unknown constraint -> treat the rest as unconstrained, stop.
@@ -635,16 +649,37 @@ static double bitlsm_estimate_selectivity(const SEL_ROOT *tree, double eq_sel,
       // Pure equality (point_count == 1) or IN-list (n points).
       kp_sel = std::min(1.0, point_count * eq_sel);
     }
-    selectivity *= kp_sel;
+
+    if (!engine_ok) {
+      *rows_sel *= kp_sel;
+      *cost_sel *= kp_sel;
+    } else {
+      const key_part_map bit = key_part_map{1} << first->part;
+      if (bit & engine_fallback) {
+        // In the bitmap query but the estimator could not answer (no stats /
+        // NDV-truncated value): it prunes, magnitude unknown -> magic both.
+        *rows_sel *= kp_sel;
+        *cost_sel *= kp_sel;
+      } else if (bit & engine_covered) {
+        // Estimated by the engine: its factor is inside the engine joint
+        // selectivity already -- multiply neither.
+      } else {
+        // Constrained in the WHERE but dropped by translation: filters
+        // output rows, prunes nothing.
+        *rows_sel *= kp_sel;
+      }
+    }
 
     // Descend to the next AND-ed keypart via the first interval's next_key_part.
     // Rough: sibling intervals may carry different subtrees; the dead-simple
-    // estimator does not model that.
+    // walk does not model that.
     level = first->next_key_part;
   }
-  if (selectivity <= 0.0) selectivity = eq_sel;  // guard: never collapse to 0
-  if (selectivity > 1.0) selectivity = 1.0;
-  return selectivity;
+  // Guard: never collapse to 0 (mirrors M4b).
+  if (*rows_sel <= 0.0) *rows_sel = eq_sel;
+  if (*cost_sel <= 0.0) *cost_sel = eq_sel;
+  if (*rows_sel > 1.0) *rows_sel = 1.0;
+  if (*cost_sel > 1.0) *cost_sel = 1.0;
 }
 
 ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
@@ -726,26 +761,53 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
     return HA_POS_ERROR;  // Don't use tree
 
   if (bitlsm_synthetic) {
-    // M4b: replace the M4a hardcoded cost with a dead-simple, SABI-API-free
-    // selectivity estimate that VARIES with the predicate, so BitLSM is chosen
-    // only when the pushed WHERE is selective enough to beat a full scan. Real
-    // SABI selectivity + attribute correlation is a later phase (M5); the
-    // interface (output = candidate count) is kept so M5 can swap in here.
+    // M5: engine-served estimate (real live-SST stats via the handler hook),
+    // composed with per-keypart sysvar fallback for whatever the engine did
+    // not answer. With no estimator (sysvar off, empty CF, no cond) this
+    // degrades verbatim to the M4b magic estimator.
     ha_rows table_rows = file->stats.records;
     if (table_rows == 0) table_rows = 1;
 
-    // (1) Selectivity from the SEL_TREE. Magic per-condition selectivities,
-    // multiplied across constrained keyparts (independence). Tunable sysvars.
+    // (1a) Engine estimate: joint selectivity over the predicates that
+    // reached the bitmap query, plus the engine's physical row count (the
+    // fetch-cost basis; the row basis stays stats.records -- two different
+    // "total rows" worlds, see the M5 spec).
+    double engine_sel = 1.0;
+    ulonglong engine_phys = 0;
+    key_part_map engine_covered = 0, engine_fb = 0;
+    const bool engine_ok =
+        param->bitlsm_cond != nullptr &&
+        file->bitlsm_estimate_selectivity(keynr, param->bitlsm_cond,
+                                          &engine_sel, &engine_phys,
+                                          &engine_covered, &engine_fb);
+
+    // (1b) Sysvar fallback factors for keyparts outside the engine estimate,
+    // split by slot (output rows vs fetch cost -- translation-dropped
+    // predicates filter rows but prune nothing).
     const double eq_sel = thd->variables.bitlsm_eq_selectivity;
     const double range_sel = thd->variables.bitlsm_range_selectivity;
-    const double total_selectivity =
-        bitlsm_estimate_selectivity(tree, eq_sel, range_sel);
+    double fb_rows_sel, fb_cost_sel;
+    bitlsm_fallback_selectivity(tree, eq_sel, range_sel, engine_ok,
+                                engine_covered, engine_fb, &fb_rows_sel,
+                                &fb_cost_sel);
+    const double rows_selectivity =
+        std::min(1.0, engine_sel * fb_rows_sel);
+    const double cost_selectivity =
+        std::min(1.0, engine_sel * fb_cost_sel);
 
-    // candidate_count = rows the BitLSM read path re-fetches by PK. This is the
-    // estimator's output and the unit both rows and cost are derived from.
+    // candidate_count = the plan's output-row estimate (row slot, anchored to
+    // the server's logical row count). fetch_count = expected PK re-fetches
+    // (cost slot); with an engine estimate it is anchored to the ENGINE's
+    // physical row count -- the read path fetches shadowed versions too.
     const ha_rows candidate_count = std::max<ha_rows>(
         1, static_cast<ha_rows>(static_cast<double>(table_rows) *
-                                total_selectivity));
+                                rows_selectivity));
+    const ha_rows fetch_count =
+        engine_ok ? std::max<ha_rows>(
+                        1, static_cast<ha_rows>(
+                               static_cast<double>(engine_phys) *
+                               cost_selectivity))
+                  : candidate_count;
     rows = candidate_count;
 
     // Force the default MRR impl so execution goes read_range_first ->
@@ -757,7 +819,7 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
     *is_imerge_scan = false;
     if (unique_range) *unique_range = false;
 
-    // (2) Cost that GROWS with candidate_count: bitmap prune overhead + one
+    // (2) Cost that GROWS with fetch_count: bitmap prune overhead + one
     // random PK re-fetch (tx multi_get, row-at-a-time) per candidate. Each
     // candidate is priced as a RANDOM point lookup, which is meaningfully
     // costlier than reading one row in a sequential table scan. We derive that
@@ -784,7 +846,7 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
     const double prune_overhead = cost_model->row_evaluate_cost(1.0);
     double cost_cpu =
         prune_overhead +
-        static_cast<double>(candidate_count) * per_fetch_cost;
+        static_cast<double>(fetch_count) * per_fetch_cost;
     double cost_factor = thd->variables.bitlsm_index_cost_factor;
     if (cost_factor <= 0.0) cost_factor = 1.0;  // guard (range enforces > 0)
     cost_cpu /= cost_factor;

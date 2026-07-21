@@ -312,6 +312,33 @@ static void collect_conjunction(Item *it, const Ctx &ctx, BitLSMQuery *q) {
     }
     // A top-level OR falls through to collect_disjunction below.
   }
+  // A multiple-equality node (Item_equal, built by optimize_cond). PLANNING-
+  // time conditions carry these; the execution-time ICP tree has plain
+  // field=const again because substitute_for_best_equal_field runs after
+  // range analysis. Semantics: every member field equals the shared constant
+  // = an AND of equalities, so translating any subset is a weakening.
+  // Without a constant (pure column-to-column chain) nothing is
+  // representable.
+  if (it->type() == Item::FUNC_ITEM &&
+      static_cast<Item_func *>(it)->functype() == Item_func::MULT_EQUAL_FUNC) {
+    Item_equal *ie = static_cast<Item_equal *>(it);
+    Item *cst = ie->const_arg();
+    if (cst != nullptr && cst->const_item()) {
+      for (Item_field &fld : ie->get_fields()) {
+        AttrMeta meta{};
+        if (index_field_of(&fld, ctx, &meta) == nullptr) continue;
+        if (meta.kind == ValKind::SKIP) continue;
+        QueryCondition qc{};
+        if (!extract_value(cst, meta.kind, &qc.value)) continue;
+        qc.attr_idx = meta.attr_idx;
+        qc.op = CompareOp::EQUAL;
+        OrClause oc;
+        oc.push_back(std::move(qc));
+        q->clause_groups.push_back(std::move(oc));
+      }
+    }
+    return;
+  }
   // `field BETWEEN lo AND hi` expands to two clause_groups (>= lo, <= hi).
   // collect_disjunction can't represent it (a conjunction is not a single OR
   // term), so handle it here; an unrepresentable BETWEEN is dropped (a dropped
