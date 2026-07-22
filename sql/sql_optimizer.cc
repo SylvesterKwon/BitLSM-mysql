@@ -6051,6 +6051,44 @@ bool JOIN::estimate_rowcount() {
     add_loose_index_scan_and_skip_scan_keys(this, tab);
 
     /*
+      C8 (BitLSM): a BITLSM_INDEX answers arbitrary attribute-subset
+      predicates, so it must reach range analysis whenever ANY of its
+      columns is constrained. Stock const_keys marking is leading-keypart
+      only (add_key_field uses field->key_start), and until now non-leading
+      bitlsm predicates rode in through two ACCIDENTAL side doors: the
+      skip-scan key collection (which intersects part_of_key over every
+      WHERE field, so one non-index column empties it) and the GROUP
+      BY/loose-scan collection (absent for plain SELECTs). A bare SELECT
+      mixing indexed and non-indexed predicates therefore never ran range
+      analysis and silently lost the index, FORCE INDEX included. Mark the
+      front door deliberately: union (not intersect) of the WHERE fields'
+      bitlsm-key memberships. Downstream stays unchanged -- the bitlsm
+      branch of check_quick_select is already gate-exempt and DML-guarded.
+    */
+    if (where_cond != nullptr) {
+      bool has_bitlsm_key = false;
+      for (uint k = 0; k < tab->table()->s->keys && !has_bitlsm_key; ++k)
+        has_bitlsm_key = tab->table()->key_info[k].is_bitlsm_index();
+      if (has_bitlsm_key) {
+        mem_root_deque<Item_field *> where_fields(thd->mem_root);
+        where_cond->walk(&Item::collect_item_field_processor,
+                         enum_walk::POSTFIX, (uchar *)&where_fields);
+        Key_map bitlsm_keys;
+        for (Item_field *f : where_fields) {
+          if (f->used_tables() != tab->table_ref->map()) continue;
+          Key_map pk = f->field->part_of_key;
+          pk.intersect(tab->table()->keys_in_use_for_query);
+          for (uint k = 0; k < tab->table()->s->keys; ++k) {
+            if (pk.is_set(k) && tab->table()->key_info[k].is_bitlsm_index())
+              bitlsm_keys.set_bit(k);
+          }
+        }
+        tab->const_keys.merge(bitlsm_keys);
+        tab->keys().merge(bitlsm_keys);
+      }
+    }
+
+    /*
       Perform range analysis if there are keys it could use (1).
       Don't do range analysis if on the inner side of an outer join (2).
       Do range analysis if on the inner side of a semi-join (3).

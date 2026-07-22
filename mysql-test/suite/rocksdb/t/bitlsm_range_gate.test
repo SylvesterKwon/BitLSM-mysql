@@ -1,0 +1,70 @@
+--source include/have_rocksdb.inc
+
+# C8: range analysis is gated on const_keys/skip_scan_keys, and stock
+# const_keys marking is leading-keypart only. Non-leading BITLSM predicates
+# used to reach range analysis only through two accidental side doors:
+# the skip-scan key collection (an INTERSECT over every WHERE field's
+# part_of_key, emptied by one non-index column) and the GROUP BY loose-scan
+# collection (absent for plain SELECTs). A bare SELECT mixing indexed and
+# non-indexed predicates therefore never ran range analysis and silently
+# lost the index -- FORCE INDEX included. estimate_rowcount now marks
+# const_keys for every BITLSM index with at least one WHERE-referenced
+# column (union, immune to non-index fields).
+
+CREATE TABLE t_gate (
+  id BIGINT NOT NULL,
+  a INT, b INT, c VARBINARY(16),
+  d INT, note VARCHAR(32),
+  PRIMARY KEY (id) COMMENT 'cfname=t_gate_cf',
+  INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+# 2000 rows; a: 1000 distinct (eq = 2 rows), note: NOT in bi.
+--disable_query_log
+let $i = 0;
+while ($i < 2000) {
+  eval INSERT INTO t_gate VALUES ($i, $i % 1000, $i % 4, CONCAT('v', $i % 20), $i, CONCAT('n', $i));
+  inc $i;
+}
+--enable_query_log
+SELECT COUNT(*) FROM t_gate;
+
+--echo # ==== Phase 1: memtable only (M4b sysvar fallback drives the cost) ====
+--echo # (a) bare SELECT, selective indexed eq + NON-index predicate -> bi
+--let $k = query_get_value(EXPLAIN SELECT d FROM t_gate WHERE a = 503 AND note = 'n503', key, 1)
+--let $assert_text = gate/fallback: bare mixed-predicate SELECT reaches bi
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+SET GLOBAL rocksdb_bitlsm_estimator_refresh = 1;
+
+--echo # ==== Phase 2: engine stats live ====
+--echo # (a) bare SELECT, selective indexed eq + NON-index predicate -> bi
+--let $k = query_get_value(EXPLAIN SELECT d FROM t_gate WHERE a = 503 AND note = 'n503', key, 1)
+--let $assert_text = gate: bare mixed-predicate SELECT reaches bi
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+
+--echo # (b) FORCE INDEX on the same shape is honored (used to fall back to
+--echo #     a full scan because no quick was ever built)
+--let $k = query_get_value(EXPLAIN SELECT d FROM t_gate FORCE INDEX (bi) WHERE a = 503 AND note = 'zzz', key, 1)
+--let $assert_text = gate: FORCE INDEX (bi) with a mixed WHERE builds the bi quick
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+
+--echo # (c) GROUP BY on a NON-index column with a bi-column WHERE (the
+--echo #     loose-scan door also closes here without the fix)
+--let $k = query_get_value(EXPLAIN SELECT COUNT(*) FROM t_gate WHERE a = 503 GROUP BY note, key, 1)
+--let $assert_text = gate: non-index GROUP BY with bi WHERE reaches bi
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+
+--echo # (d) plan parity: same rows either way
+--let $n_bi = query_get_value(SELECT COUNT(*) AS n FROM t_gate WHERE a = 503 AND note = 'n503', n, 1)
+--let $n_fs = query_get_value(SELECT COUNT(*) AS n FROM t_gate IGNORE INDEX (bi) WHERE a = 503 AND note = 'n503', n, 1)
+--let $assert_text = bi-served count equals full-scan count
+--let $assert_cond = $n_bi = $n_fs
+--source include/assert.inc
+
+DROP TABLE t_gate;

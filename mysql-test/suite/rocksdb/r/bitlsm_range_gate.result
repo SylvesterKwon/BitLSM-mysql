@@ -1,0 +1,27 @@
+CREATE TABLE t_gate (
+id BIGINT NOT NULL,
+a INT, b INT, c VARBINARY(16),
+d INT, note VARCHAR(32),
+PRIMARY KEY (id) COMMENT 'cfname=t_gate_cf',
+INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SELECT COUNT(*) FROM t_gate;
+COUNT(*)
+2000
+# ==== Phase 1: memtable only (M4b sysvar fallback drives the cost) ====
+# (a) bare SELECT, selective indexed eq + NON-index predicate -> bi
+include/assert.inc [gate/fallback: bare mixed-predicate SELECT reaches bi]
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+SET GLOBAL rocksdb_bitlsm_estimator_refresh = 1;
+# ==== Phase 2: engine stats live ====
+# (a) bare SELECT, selective indexed eq + NON-index predicate -> bi
+include/assert.inc [gate: bare mixed-predicate SELECT reaches bi]
+# (b) FORCE INDEX on the same shape is honored (used to fall back to
+#     a full scan because no quick was ever built)
+include/assert.inc [gate: FORCE INDEX (bi) with a mixed WHERE builds the bi quick]
+# (c) GROUP BY on a NON-index column with a bi-column WHERE (the
+#     loose-scan door also closes here without the fix)
+include/assert.inc [gate: non-index GROUP BY with bi WHERE reaches bi]
+# (d) plan parity: same rows either way
+include/assert.inc [bi-served count equals full-scan count]
+DROP TABLE t_gate;
