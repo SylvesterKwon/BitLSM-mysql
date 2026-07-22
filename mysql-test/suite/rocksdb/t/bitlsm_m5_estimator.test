@@ -57,7 +57,21 @@ SET GLOBAL rocksdb_bitlsm_estimator_refresh = 1;
 --let $assert_cond = "$k" != "bi"
 --source include/assert.inc
 
---echo # (c) plan parity: the bi-served row set equals the full scan's
+--echo # (c) OR-of-equalities: optimize_cond wraps each OR arm's equality in a
+--echo #     multiple-equality (Item_equal) at PLANNING time; both translator
+--echo #     walks must unwrap it or the whole OR is dropped (all-or-nothing)
+--echo #     and the estimate silently degrades to the sysvar magic. Covers
+--echo #     ORDERED and UNORDERED arms (SSB q3_3/q3_4 shape).
+--let $k = query_get_value(EXPLAIN SELECT d FROM t_est WHERE a = 503 OR a = 777, key, 1)
+--let $assert_text = estimator: OR of two selective ORDERED equalities routes to bi
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+--let $k = query_get_value(EXPLAIN SELECT d FROM t_est WHERE c = 'v3' OR c = 'v7', key, 1)
+--let $assert_text = estimator: OR of two UNORDERED equalities routes to bi
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+
+--echo # (d) plan parity: the bi-served row set equals the full scan's
 --let $n_bi = query_get_value(SELECT COUNT(*) AS n FROM t_est WHERE a = 503, n, 1)
 --let $n_fs = query_get_value(SELECT COUNT(*) AS n FROM t_est IGNORE INDEX (bi) WHERE a = 503, n, 1)
 --let $assert_text = bi-served count equals full-scan count

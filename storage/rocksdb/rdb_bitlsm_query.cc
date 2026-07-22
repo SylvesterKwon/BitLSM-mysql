@@ -291,6 +291,31 @@ static bool collect_disjunction(Item *it, const Ctx &ctx, OrClause *clause) {
       }
       case Item_func::IN_FUNC:
         return make_in_terms(static_cast<Item_func_in *>(f), ctx, clause);
+      case Item_func::MULT_EQUAL_FUNC: {
+        // A multiple-equality inside an OR arm (planning-time shape: see
+        // collect_conjunction -- optimize_cond rewrites equalities in every
+        // arm too, and the execution-time ICP tree has them substituted
+        // back). Arm semantics: every member field equals the shared
+        // constant. Emitting any member as an OR term only WIDENS the union
+        // (each term is a superset of the arm), so the weakening invariant
+        // holds even when some members are skipped.
+        Item_equal *ie = static_cast<Item_equal *>(f);
+        Item *cst = ie->const_arg();
+        if (cst == nullptr || !cst->const_item()) return false;
+        bool any = false;
+        for (Item_field &fld : ie->get_fields()) {
+          AttrMeta meta{};
+          if (index_field_of(&fld, ctx, &meta) == nullptr) continue;
+          if (meta.kind == ValKind::SKIP) continue;
+          QueryCondition qc{};
+          if (!extract_value(cst, meta.kind, &qc.value)) continue;
+          qc.attr_idx = meta.attr_idx;
+          qc.op = CompareOp::EQUAL;
+          clause->push_back(std::move(qc));
+          any = true;
+        }
+        return any;  // no representable member -> drop the whole clause
+      }
       default:
         return false;
     }

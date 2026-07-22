@@ -26,6 +26,13 @@ include/assert.inc [estimator: selective equality routes to bi]
 #     translation (prunes no candidates) and b<=1 really matches 50%,
 #     so the fetch cost can no longer be talked down -> full scan wins.
 include/assert.inc [estimator: dropped string range no longer shrinks fetch cost]
-# (c) plan parity: the bi-served row set equals the full scan's
+# (c) OR-of-equalities: optimize_cond wraps each OR arm's equality in a
+#     multiple-equality (Item_equal) at PLANNING time; both translator
+#     walks must unwrap it or the whole OR is dropped (all-or-nothing)
+#     and the estimate silently degrades to the sysvar magic. Covers
+#     ORDERED and UNORDERED arms (SSB q3_3/q3_4 shape).
+include/assert.inc [estimator: OR of two selective ORDERED equalities routes to bi]
+include/assert.inc [estimator: OR of two UNORDERED equalities routes to bi]
+# (d) plan parity: the bi-served row set equals the full scan's
 include/assert.inc [bi-served count equals full-scan count]
 DROP TABLE t_est;
