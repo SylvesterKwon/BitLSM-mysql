@@ -845,10 +845,17 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
         cost_model->row_evaluate_cost(static_cast<double>(table_rows));
     const double scan_cost_per_row =
         full_scan_cost / static_cast<double>(table_rows);
-    // A random PK point re-fetch ~ this many sequential rows. With the default
-    // eq/range selectivities (0.1 / 0.33) the auto-select threshold lands near
-    // selectivity ~ 1/factor ~ 0.2: single-equality predicates win, broad
-    // ranges lose. TODO(M5): replace with a real SABI-derived per-fetch cost.
+    // A random PK point re-fetch ~ this many sequential rows. CALIBRATED
+    // (2026-07-23, release, bitlsm_a2_cf_sweep harness: 1M rows, S=1/10/50
+    // SSTs, 24-point regression time = G_S + c_f*candidates + c_m*matches,
+    // residuals <= 1.3%): c_f = 4.79 / 4.82 / 6.47 sequential-row
+    // equivalents at S = 1 / 10 / 50 -- the historical 5.0 is the shallow
+    // -tree measurement, kept as the central value. Known upward pressure:
+    // deep L0 (each Get consults more files) and cache-miss regimes; the
+    // sysvar below stays the per-deployment escape hatch. The candidate
+    // -generation intercept measured ~0 at this scale (stays folded into
+    // prune_overhead); the per-MATCH term cancels against the full scan's
+    // own row work and is deliberately not modeled.
     const double kBitlsmRandomFetchFactor = 5.0;
     const double per_fetch_cost = kBitlsmRandomFetchFactor * scan_cost_per_row;
     const double prune_overhead = cost_model->row_evaluate_cost(1.0);
