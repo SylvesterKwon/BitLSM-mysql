@@ -16641,11 +16641,10 @@ ha_rows ha_rocksdb::records_in_range(uint inx, key_range *const min_key,
 // input is translated with the SAME code the read path uses, so predicates
 // the translation drops (string ranges, NOT BETWEEN, ...) do not shrink the
 // estimate -- they cannot shrink the candidate set either.
-bool ha_rocksdb::bitlsm_estimate_selectivity(uint inx, Item *cond,
-                                             double *selectivity,
-                                             ulonglong *physical_rows,
-                                             key_part_map *covered_parts,
-                                             key_part_map *fallback_parts) {
+bool ha_rocksdb::bitlsm_estimate_selectivity(
+    uint inx, Item *cond, double *selectivity, ulonglong *physical_rows,
+    key_part_map *covered_parts, key_part_map *fallback_parts,
+    double *candidate_selectivity, ulonglong *memtable_entries) {
   DBUG_ENTER_FUNC();
   if (cond == nullptr || table == nullptr || m_tbl_def == nullptr)
     DBUG_RETURN(false);
@@ -16688,6 +16687,8 @@ bool ha_rocksdb::bitlsm_estimate_selectivity(uint inx, Item *cond,
   *physical_rows = res.physical_rows;
   *covered_parts = covered;
   *fallback_parts = fb;
+  *candidate_selectivity = res.candidate_selectivity;
+  *memtable_entries = res.memtable_entries;
   DBUG_RETURN(true);
 }
 

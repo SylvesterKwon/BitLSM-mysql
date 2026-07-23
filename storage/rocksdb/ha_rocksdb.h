@@ -979,7 +979,9 @@ class ha_rocksdb : public my_core::handler, public blob_buffer {
   bool bitlsm_estimate_selectivity(uint inx, Item *cond, double *selectivity,
                                    ulonglong *physical_rows,
                                    key_part_map *covered_parts,
-                                   key_part_map *fallback_parts) override;
+                                   key_part_map *fallback_parts,
+                                   double *candidate_selectivity,
+                                   ulonglong *memtable_entries) override;
 
   ulonglong records_size_in_range(uint inx, key_range *const min_key,
                                   key_range *const max_key) override

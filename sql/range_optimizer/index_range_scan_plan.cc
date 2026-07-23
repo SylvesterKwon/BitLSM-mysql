@@ -768,18 +768,21 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
     ha_rows table_rows = file->stats.records;
     if (table_rows == 0) table_rows = 1;
 
-    // (1a) Engine estimate: joint selectivity over the predicates that
-    // reached the bitmap query, plus the engine's physical row count (the
-    // fetch-cost basis; the row basis stays stats.records -- two different
-    // "total rows" worlds, see the M5 spec).
-    double engine_sel = 1.0;
-    ulonglong engine_phys = 0;
+    // (1a) Engine estimate: joint MATCH selectivity (row slot), its
+    // bin-rounded CANDIDATE counterpart (cost slot -- the read path fetches
+    // whole prune bins, not matching rows), the engine's physical row count
+    // (the fetch-cost basis; the row basis stays stats.records -- two
+    // different "total rows" worlds, see the M5 spec), and the unflushed
+    // entry count (no prune structure before flush: all of it is fetched).
+    double engine_sel = 1.0, engine_cand_sel = 1.0;
+    ulonglong engine_phys = 0, engine_mem = 0;
     key_part_map engine_covered = 0, engine_fb = 0;
     const bool engine_ok =
         param->bitlsm_cond != nullptr &&
         file->bitlsm_estimate_selectivity(keynr, param->bitlsm_cond,
                                           &engine_sel, &engine_phys,
-                                          &engine_covered, &engine_fb);
+                                          &engine_covered, &engine_fb,
+                                          &engine_cand_sel, &engine_mem);
 
     // (1b) Sysvar fallback factors for keyparts outside the engine estimate,
     // split by slot (output rows vs fetch cost -- translation-dropped
@@ -792,13 +795,17 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
                                 &fb_cost_sel);
     const double rows_selectivity =
         std::min(1.0, engine_sel * fb_rows_sel);
+    // Cost slot composes the CANDIDATE fraction (bin-rounded, >= match) with
+    // the same sysvar fallback factors -- an unanswered keypart approximates
+    // both its match and its candidate contribution.
     const double cost_selectivity =
-        std::min(1.0, engine_sel * fb_cost_sel);
+        std::min(1.0, engine_cand_sel * fb_cost_sel);
 
     // candidate_count = the plan's output-row estimate (row slot, anchored to
     // the server's logical row count). fetch_count = expected PK re-fetches
-    // (cost slot); with an engine estimate it is anchored to the ENGINE's
-    // physical row count -- the read path fetches shadowed versions too.
+    // (cost slot); with an engine estimate it is the CANDIDATE mass over the
+    // ENGINE's physical row count (the read path fetches whole prune bins,
+    // plus shadowed versions), plus every unflushed memtable entry.
     const ha_rows candidate_count = std::max<ha_rows>(
         1, static_cast<ha_rows>(static_cast<double>(table_rows) *
                                 rows_selectivity));
@@ -806,7 +813,8 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
         engine_ok ? std::max<ha_rows>(
                         1, static_cast<ha_rows>(
                                static_cast<double>(engine_phys) *
-                               cost_selectivity))
+                                   cost_selectivity +
+                               static_cast<double>(engine_mem)))
                   : candidate_count;
     rows = candidate_count;
 

@@ -5739,6 +5739,17 @@ class handler {
                                 not answer (no stats / NDV-truncated value);
                                 their factor in *selectivity is 1.0 -- the
                                 caller applies its own per-keypart fallback.
+    @param[out] candidate_selectivity  fraction of physical rows the read
+                                path is expected to FETCH: the match fraction
+                                rounded out to the engine's prune-bin
+                                boundaries (an equality candidates a whole
+                                bin even when one row matches). Feeds ONLY
+                                the fetch-cost slot; always >= *selectivity.
+    @param[out] memtable_entries  unflushed engine entries at estimate time.
+                                They carry no prune structure, so the read
+                                path fetches every one of them regardless of
+                                the predicate -- the caller ADDS this to the
+                                fetch count.
 
     @return true when the engine served the estimate; false = no estimator
             (caller keeps its full fallback path).
@@ -5748,7 +5759,9 @@ class handler {
       double *selectivity [[maybe_unused]],
       ulonglong *physical_rows [[maybe_unused]],
       key_part_map *covered_parts [[maybe_unused]],
-      key_part_map *fallback_parts [[maybe_unused]]) {
+      key_part_map *fallback_parts [[maybe_unused]],
+      double *candidate_selectivity [[maybe_unused]],
+      ulonglong *memtable_entries [[maybe_unused]]) {
     return false;
   }
 
