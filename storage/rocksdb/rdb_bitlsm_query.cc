@@ -87,10 +87,11 @@ static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
       // `width` decodes nothing on this path: the SABI schema persists only
       // roles (rdb_datadic.cc), and MyRocks drives the iterator in
       // ResultMode::Candidate, which leaves CompiledQuery inert and skips
-      // per-row Eval (bit_lsm_iterator.cpp). It exists solely so
-      // BitLSMQuery::Validate demands a uint64_t comparand -- matching the
-      // extractor's U64ToOkey(read_le(..., 3)). AttrSpec widths are 1/2/4/8,
-      // so DATE's 3 is not expressible here and does not need to be.
+      // per-row Eval (bit_lsm_iterator.cpp). BitLSMQuery::Validate only
+      // branches on is_signed/is_float (both false here, matching the
+      // extractor's unsigned, non-float U64ToOkey(read_le(..., 3))); it never
+      // reads width. `width` is filler -- AttrSpec widths are 1/2/4/8, so
+      // DATE's 3 is not expressible here and does not need to be.
       *spec = AttrSpec(ORDERED, 4, /*is_signed=*/false, /*is_float=*/false,
                        nullable);
       *kind = ValKind::DATE;
@@ -188,6 +189,13 @@ static bool extract_value(
       // `okey < packed(2020-01-01)` and prune that row away -- a
       // STRENGTHENING, which loses rows. Omit instead.
       if (non_zero_time(ltime)) return false;
+      // Zero month/day, e.g. '2020-06-00'. Item::get_date() reaches
+      // str_to_datetime_with_warn(), which does NOT apply MODE_NO_ZERO_IN_DATE,
+      // so it parses; the comparator's get_mysql_time_from_str() DOES apply it,
+      // fails, and get_datetime_value() then silently compares against packed
+      // 0 -- weaker than any real date. Emitting a comparand here would prune
+      // rows the server counts as matching, i.e. NARROW. Omit instead.
+      if (ltime.month == 0 || ltime.day == 0) return false;
       // Pack through the SAME function Field_newdate::store_internal uses
       // (sql/field.cc), so these are byte-for-byte the bytes the extractor
       // reads back. Writing the formula out by hand here would silently

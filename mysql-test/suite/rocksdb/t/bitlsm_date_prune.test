@@ -63,4 +63,37 @@ SELECT VARIABLE_VALUE INTO @m1 FROM performance_schema.global_status
 --let $assert_cond = $cand < 10000
 --source include/assert.inc
 
+--echo #
+--echo # Zero-in-date comparand (BETWEEN lower bound): the shape actually reaches
+--echo # a silent comparator, verified in sql/item_cmpfunc.cc. A bare `d > '...'`
+--echo # against a real DATE column resolves via Arg_comparator::set_cmp_func,
+--echo # which eagerly converts a constant bound through get_date_from_const()
+--echo # and raises ER_WRONG_VALUE (a HARD error) if that fails -- so that shape
+--echo # cannot silently narrow, it just refuses to run. BETWEEN's bounds are
+--echo # wired through Arg_comparator::set_datetime_cmp_func() instead (see
+--echo # Item_func_between::resolve_type), which skips that eager conversion
+--echo # entirely and leaves get_datetime_value() as the per-row value-getter --
+--echo # and get_datetime_value() DOES silently swallow a parse failure and
+--echo # return 0, exactly as described for get_datetime_value at
+--echo # sql/item_cmpfunc.cc:1541-1544. So `d BETWEEN '2020-06-00' AND hi` has
+--echo # its lower bound silently voided by the server (0 <= any real date is
+--echo # always true), while the translator packs '2020-06-00' into a real okey
+--echo # and prunes on it -- a genuine narrowing.
+#
+# This suite's my.cnf pins sql_mode to NO_ENGINE_SUBSTITUTION, which strips out
+# MySQL's own default NO_ZERO_IN_DATE. Without it the comparator parses
+# '2020-06-00' the same permissive way the translator does and the two sides
+# agree by coincidence -- turn NO_ZERO_IN_DATE back on for this one query so
+# the comparator actually takes the divergent (silently-compare-against-0)
+# path the bug depends on. The translator's own parse (Item::get_date via
+# str_to_datetime_with_warn) never consults this flag, so it is unaffected.
+SET @old_sql_mode = @@SESSION.sql_mode;
+SET SESSION sql_mode = 'NO_ZERO_IN_DATE';
+--let $forced = `SELECT COUNT(*) FROM t_dp FORCE INDEX(bi) WHERE d BETWEEN '2020-06-00' AND '2020-12-31'`
+--let $full = `SELECT COUNT(*) FROM t_dp IGNORE INDEX(bi) WHERE d BETWEEN '2020-06-00' AND '2020-12-31'`
+SET SESSION sql_mode = @old_sql_mode;
+--let $assert_text = zero-in-date BETWEEN lower bound does not prune matching rows ($forced vs $full)
+--let $assert_cond = $forced = $full
+--source include/assert.inc
+
 DROP TABLE t_dp;
