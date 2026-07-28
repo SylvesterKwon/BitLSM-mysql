@@ -58,3 +58,19 @@ b INT AS (a+1) VIRTUAL,
 INDEX bi (b) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 ERROR HY000: Incorrect arguments to BITLSM_INDEX cannot index a virtual generated column
+# Reject: DATETIME -- accepted by the server-layer type check today but
+# rejected by the engine at table open (bitlsm_derive_enc has no encoding
+# for it), which surfaced as HA_ERR_UNSUPPORTED instead of a DDL error.
+CREATE TABLE t_dtime (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_dtime_cf',
+ts DATETIME,
+INDEX bi (ts) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+ERROR HY000: Incorrect arguments to BITLSM_INDEX column type is not supported
+# Reject: TIMESTAMP, same reason.
+CREATE TABLE t_tstamp (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_tstamp_cf',
+ts TIMESTAMP NULL,
+INDEX bi (ts) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+ERROR HY000: Incorrect arguments to BITLSM_INDEX column type is not supported
