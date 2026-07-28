@@ -20,6 +20,7 @@ INSERT INTO t_asm VALUES
 # query would go stale -- these guards catch that regression.
 include/assert.inc [range shape (a >= 10) routes to the bitlsm index]
 include/assert.inc [IS-NOT-NULL + non-leading-eq shape routes to the bitlsm index]
+include/assert.inc [row-constructor IN shape routes to the bitlsm index]
 #
 # (1) Single comparison on a signed INT column (attr a0).
 SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 10;
@@ -118,4 +119,31 @@ SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE dt = '2020-06-15';
 SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE dt >= '2020-06-15';
 # WHERE dt >= '2020-06-15'
 #   assembled: [a3>=1034447]
+#
+# (16) Row-constructor IN distributes per column: one clause_group each.
+# (a,c) IN ((1,'x'),(10,'gamma')) is the DNF (a=1 AND c='x') OR (a=10 AND
+# c='gamma'), which CNF cannot express -- the per-column form is a safe
+# weakening of it. Group order follows column order.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE (a, c) IN ((1, 'x'), (10, 'gamma'));
+# WHERE (a, c) IN ((1, 'x'), (10, 'gamma'))
+#   assembled: [(a0=1 OR a0=10) AND (a2='x' OR a2='gamma')]
+#
+# (17-note) A row constructor mixing indexed and NON-indexed columns --
+# e.g. (a, d) where d is not in bi -- never reaches the translator at
+# all: uses_index_fields_only() requires every element of the row to be
+# an index field, so make_cond_for_index() drops the whole predicate and
+# nothing is pushed via ICP. It therefore prunes nothing, and there is no
+# assembled string to assert. Correctness for that shape is covered by
+# bitlsm_index_read's Q10. Supporting it would require pushing conditions
+# that reference non-index columns, which is a separate design question
+# (the bitlsm read path re-verifies against a fully re-fetched row, not an
+# index tuple).
+#
+# (17) A row-constructor IN inside an OR arm is not representable -- the
+# per-column form needs several AND-ed groups and an OR arm can only
+# contribute terms to ONE clause. The whole OR is dropped (dropping a
+# disjunct would strengthen); the guarding AND conjunct survives.
+SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND ((a, c) IN ((1, 'x'), (10, 'gamma')) OR b = 2.5);
+# WHERE a >= 0 AND ((a, c) IN ((1, 'x'), (10, 'gamma')) OR b = 2.5)
+#   assembled: [a0>=0]
 DROP TABLE t_asm;

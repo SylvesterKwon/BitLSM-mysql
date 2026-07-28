@@ -11,6 +11,7 @@
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"  // Item_cond, Item_func_in
 #include "sql/item_func.h"
+#include "sql/item_row.h"  // Item_row (row-constructor IN predicand)
 #include "sql/key.h"
 #include "sql/sql_list.h"
 
@@ -299,6 +300,80 @@ static bool make_between_groups(Item_func *f, const Ctx &ctx, BitLSMQuery *q) {
   return true;
 }
 
+// Translate a positive row-constructor IN -- `(c0, c1, ...) IN ((v00, v01,
+// ...), (v10, v11, ...), ...)` -- by DISTRIBUTING it per column:
+//
+//   (a,b) IN ((1,2),(3,4))
+//     == (a=1 AND b=2) OR (a=3 AND b=4)   -- DNF; CNF cannot express it
+//     <= (a=1 OR a=3) AND (b=2 OR b=4)    -- per column: a safe weakening
+//
+// Each column contributes ONE clause_group of EQUALs, so this lives at the
+// conjunction level (like make_between_groups) rather than in
+// collect_disjunction, which builds a single OR clause. The extra combinations
+// the distributed form admits (a=1 AND b=4) cost fetches and are dropped by the
+// ICP re-verify -- never a correctness problem.
+//
+// Unlike BETWEEN's two bounds, per-column clauses are INDEPENDENT: a column
+// whose values do not all translate is dropped ALONE and the remaining groups
+// are still a superset of the original condition. Returns false (nothing
+// emitted) only when the SHAPE is unusable.
+static bool make_row_in_groups(Item_func_in *in, const Ctx &ctx,
+                               BitLSMQuery *q) {
+  if (in->negated) return false;  // NOT IN is not a disjunction of EQUALs
+  const uint n = in->argument_count();
+  if (n < 2) return false;
+  Item_row *const pred =
+      static_cast<Item_row *>(in->arguments()[0]->real_item());
+  const uint cols = pred->cols();
+  if (cols == 0) return false;
+
+  // Every RHS element must be a row of the same arity; otherwise values cannot
+  // be lined up with columns at all.
+  for (uint i = 1; i < n; i++) {
+    Item *const e = in->arguments()[i]->real_item();
+    if (e->type() != Item::ROW_ITEM) return false;
+    if (static_cast<Item_row *>(e)->cols() != cols) return false;
+  }
+
+  bool any = false;
+  for (uint j = 0; j < cols; j++) {
+    AttrMeta meta{};
+    // NOTE: the out-of-index case does not actually arrive here -- a row
+    // constructor mixing indexed and non-indexed columns is rejected earlier by
+    // uses_index_fields_only() and never pushed. Kept for safety; the reachable
+    // partial-failure path is a value that fails to extract.
+    if (index_field_of(pred->element_index(j), ctx, &meta) == nullptr) continue;
+    if (meta.kind == ValKind::SKIP) continue;
+
+    // Build the column's clause COMPLETELY before publishing it: a
+    // half-translated OR clause would be a strengthening of this column's
+    // constraint, which loses rows.
+    OrClause clause;
+    bool ok = true;
+    for (uint i = 1; i < n; i++) {
+      Item *const v =
+          static_cast<Item_row *>(in->arguments()[i]->real_item())
+              ->element_index(j);
+      if (!v->const_item()) {
+        ok = false;
+        break;
+      }
+      QueryCondition c{};
+      c.attr_idx = meta.attr_idx;
+      c.op = CompareOp::EQUAL;
+      if (!extract_value(v, meta.kind, &c.value)) {
+        ok = false;
+        break;
+      }
+      clause.push_back(std::move(c));
+    }
+    if (!ok || clause.empty()) continue;  // drop THIS column only
+    q->clause_groups.push_back(std::move(clause));
+    any = true;
+  }
+  return any;
+}
+
 // Append the OR-terms of a purely disjunctive, fully representable item to
 // *clause. A single comparison is a degenerate 1-term disjunction; IN expands
 // to n terms; OR is the union of its operands' terms (all-or-nothing). Any
@@ -402,6 +477,18 @@ static void collect_conjunction(Item *it, const Ctx &ctx, BitLSMQuery *q) {
       }
     }
     return;
+  }
+  // A row-constructor IN -- `(a,b) IN ((1,2),(3,4))` -- distributes into one
+  // clause_group per column (see make_row_in_groups), so like BETWEEN it
+  // cannot go through collect_disjunction. A SCALAR IN keeps falling through
+  // to collect_disjunction, which turns it into a single OR clause.
+  if (it->type() == Item::FUNC_ITEM &&
+      static_cast<Item_func *>(it)->functype() == Item_func::IN_FUNC) {
+    Item_func_in *const in = static_cast<Item_func_in *>(it);
+    if (in->arguments()[0]->real_item()->type() == Item::ROW_ITEM) {
+      make_row_in_groups(in, ctx, q);
+      return;
+    }
   }
   // `field BETWEEN lo AND hi` expands to two clause_groups (>= lo, <= hi).
   // collect_disjunction can't represent it (a conjunction is not a single OR

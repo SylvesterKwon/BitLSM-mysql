@@ -51,9 +51,12 @@
 --let $w = (a, c) IN ((10, 'gamma'), (25, 'delta'))
 --source suite/rocksdb/include/bitlsm_index_read_check.inc
 
-# (h) row-constructor IN where one column is NOT in the index: that column is
-# skipped and only the indexed column contributes a clause. Dropping a column
-# still leaves a superset of the original condition.
+# (h) row-constructor IN mixing an indexed and a NON-indexed column. This one
+# prunes NOTHING: uses_index_fields_only() requires every element of the row
+# constructor to be an index field, so the whole predicate is dropped before
+# ICP and the translator never sees it. The case earns its place anyway -- it
+# pins down that the unpruned path still returns exactly the full-scan rows,
+# and it will notice if that ever changes.
 --let $qtitle = Q10 row IN with a non-indexed column
 --let $w = (a, d) IN ((10, 300), (25, 500))
 --source suite/rocksdb/include/bitlsm_index_read_check.inc
