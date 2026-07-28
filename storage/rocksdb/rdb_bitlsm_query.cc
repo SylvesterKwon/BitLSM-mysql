@@ -14,6 +14,10 @@
 #include "sql/key.h"
 #include "sql/sql_list.h"
 
+/* my_date_to_binary / non_zero_time / TIME_FUZZY_DATE: the DATE comparand is
+ * packed exactly the way Field_newdate stores the column. */
+#include "my_time.h"
+
 namespace myrocks {
 
 namespace {
@@ -28,9 +32,11 @@ using bit_lsm::QueryCondition;
 // Which variant alternative an attribute's comparand must use. Mirrors the
 // role/encoding derivation in rdb_datadic.cc::bitlsm_derive_enc so the query's
 // comparand type can never disagree with how rows were binned. SKIP marks an
-// attribute the query translator does not (yet) know how to encode a literal
-// for (e.g. DATE): conditions on it are conservatively omitted.
-enum class ValKind { SKIP, I64, U64, DBL, STR };
+// attribute the query translator does not know how to encode a literal for:
+// conditions on it are conservatively omitted. After DATE support landed no
+// type reachable through a valid BITLSM_INDEX maps to SKIP -- it is kept as a
+// defensive default.
+enum class ValKind { SKIP, I64, U64, DBL, STR, DATE };
 
 // Per-attribute translation metadata, keyed by the table field index.
 struct AttrMeta {
@@ -75,6 +81,18 @@ static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
       *spec = AttrSpec(UNORDERED, 0, /*is_signed=*/false, /*is_float=*/false,
                        nullable);
       *kind = ValKind::STR;
+      return;
+    case MYSQL_TYPE_NEWDATE:  // DATE (Field_newdate: 3 bytes, LE packed)
+      // `width` decodes nothing on this path: the SABI schema persists only
+      // roles (rdb_datadic.cc), and MyRocks drives the iterator in
+      // ResultMode::Candidate, which leaves CompiledQuery inert and skips
+      // per-row Eval (bit_lsm_iterator.cpp). It exists solely so
+      // BitLSMQuery::Validate demands a uint64_t comparand -- matching the
+      // extractor's U64ToOkey(read_le(..., 3)). AttrSpec widths are 1/2/4/8,
+      // so DATE's 3 is not expressible here and does not need to be.
+      *spec = AttrSpec(ORDERED, 4, /*is_signed=*/false, /*is_float=*/false,
+                       nullable);
+      *kind = ValKind::DATE;
       return;
     default:
       *spec = AttrSpec(ORDERED, 8, /*is_signed=*/true, /*is_float=*/false,
@@ -157,6 +175,27 @@ static bool extract_value(
       String *s = it->val_str(&buf);
       if (s == nullptr || it->null_value) return false;
       *out = std::string(s->ptr(), s->length());
+      return true;
+    }
+    case ValKind::DATE: {
+      MYSQL_TIME ltime;
+      if (it->get_date(&ltime, TIME_FUZZY_DATE)) return false;
+      if (it->null_value) return false;
+      // A comparand carrying a time part is compared as DATETIME: the DATE
+      // column widens to midnight, so `d < '2020-01-01 10:00:00'` MATCHES
+      // d = 2020-01-01. Truncating to the date part would emit
+      // `okey < packed(2020-01-01)` and prune that row away -- a
+      // STRENGTHENING, which loses rows. Omit instead.
+      if (non_zero_time(ltime)) return false;
+      // Pack through the SAME function Field_newdate::store_internal uses
+      // (sql/field.cc), so these are byte-for-byte the bytes the extractor
+      // reads back. Writing the formula out by hand here would silently
+      // diverge if MySQL ever changed the layout.
+      uchar buf[3];
+      my_date_to_binary(&ltime, buf);
+      *out = static_cast<uint64_t>(buf[0]) |
+             (static_cast<uint64_t>(buf[1]) << 8) |
+             (static_cast<uint64_t>(buf[2]) << 16);
       return true;
     }
     case ValKind::SKIP:

@@ -1,0 +1,17 @@
+CREATE TABLE t_dp (
+id BIGINT NOT NULL,
+d DATE,
+payload INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_dp_cf',
+INDEX bi (d) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO t_dp
+WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM s WHERE n<19999)
+SELECT n, DATE_ADD('2000-01-01', INTERVAL n DAY), n FROM s;
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+#
+# A one-year window out of ~55 years of dates. The candidate count is the
+# multiget delta; with DATE translated it must fall far below 20000.
+include/assert.inc [a selective DATE range prunes the candidate set (3999 of 20000)]
+DROP TABLE t_dp;

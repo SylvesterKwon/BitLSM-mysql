@@ -1,0 +1,66 @@
+--source include/have_rocksdb.inc
+
+# DATE pruning signal (release-safe regression guard).
+#
+# bitlsm_date_read.test proves the DATE-pruned row set is CORRECT. It cannot
+# prove pruning happened at all: with the DATE condition omitted the candidate
+# set is every row and ICP still filters the answer down to the right one, so
+# that test passes just as well with no DATE translation whatsoever. The
+# query-assembly golden test does catch a silently dropped translation, but it
+# needs have_debug and is skipped in release builds.
+#
+# So measure the candidate set directly: rocksdb_number_multiget_keys_read
+# counts the authoritative PK re-fetches, i.e. exactly one per candidate. A
+# selective DATE predicate must drive it well below the table size.
+#
+# Needs neither have_debug nor a golden string -- it runs everywhere the engine
+# actually prunes.
+
+# Under UDT the read path skips the bitmap entirely and full-scans the PK
+# (ha_rocksdb.cc, rocksdb_enable_udt_in_mem branch), so there is no pruning to
+# measure. Correctness in that combination is covered by bitlsm_date_read.
+--let $udt = `SELECT @@rocksdb_enable_udt_in_mem`
+if ($udt) {
+--skip BitLSM DATE pruning runs under non-UDT combinations only
+}
+
+# 20000 rows so the SABI bins can actually discriminate; rho=0.1 on a handful
+# of rows puts everything in one bin and prunes nothing even when correct.
+CREATE TABLE t_dp (
+  id BIGINT NOT NULL,
+  d DATE,
+  payload INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_dp_cf',
+  INDEX bi (d) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO t_dp
+WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM s WHERE n<19999)
+SELECT n, DATE_ADD('2000-01-01', INTERVAL n DAY), n FROM s;
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+
+--echo #
+--echo # A one-year window out of ~55 years of dates. The candidate count is the
+--echo # multiget delta; with DATE translated it must fall far below 20000.
+--disable_query_log
+--disable_result_log
+SELECT VARIABLE_VALUE INTO @m0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='rocksdb_number_multiget_keys_read';
+SELECT SUM(payload) INTO @s FROM t_dp FORCE INDEX(bi)
+  WHERE d >= '2010-01-01' AND d < '2011-01-01';
+SELECT VARIABLE_VALUE INTO @m1 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='rocksdb_number_multiget_keys_read';
+--let $cand = `SELECT @m1-@m0`
+--enable_result_log
+--enable_query_log
+
+# Deliberately loose: this asserts PRUNING HAPPENED, not a specific bin count.
+# Bin boundaries move with rho, row count and SST layout, so a tight bound
+# would be a maintenance trap. Half the table is far beyond noise for a
+# one-in-fifty-five-years window, and still fails loudly at zero pruning
+# (candidates == 20000).
+--let $assert_text = a selective DATE range prunes the candidate set ($cand of 20000)
+--let $assert_cond = $cand < 10000
+--source include/assert.inc
+
+DROP TABLE t_dp;
