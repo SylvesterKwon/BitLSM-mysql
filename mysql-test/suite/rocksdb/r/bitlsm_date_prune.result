@@ -13,7 +13,7 @@ SET GLOBAL rocksdb_force_flush_memtable_now = 1;
 #
 # A one-year window out of ~55 years of dates. The candidate count is the
 # multiget delta; with DATE translated it must fall far below 20000.
-include/assert.inc [a selective DATE range prunes the candidate set (3999 of 20000)]
+include/assert.inc [a selective DATE range prunes the candidate set (624 of 20000)]
 #
 # Zero-in-date comparand (BETWEEN lower bound): the shape actually reaches
 # a silent comparator, verified in sql/item_cmpfunc.cc. A bare `d > '...'`

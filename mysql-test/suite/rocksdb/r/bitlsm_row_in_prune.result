@@ -20,5 +20,5 @@ SET GLOBAL rocksdb_force_flush_memtable_now = 1;
 # (50,75) and (150,25), which is why the exact match count is 2 but the
 # candidate count can be a little more than that -- ICP drops the
 # cross pairs before they reach the result.)
-include/assert.inc [a selective row-constructor IN prunes the candidate set (800 of 20000)]
+include/assert.inc [a selective row-constructor IN prunes the candidate set (8 of 20000)]
 DROP TABLE t_rip;
