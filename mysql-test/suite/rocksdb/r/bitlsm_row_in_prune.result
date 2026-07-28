@@ -1,0 +1,24 @@
+CREATE TABLE t_rip (
+id BIGINT NOT NULL,
+x INT,
+y INT,
+payload INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_rip_cf',
+INDEX bi (x, y) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO t_rip
+WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM s WHERE n<19999)
+SELECT n, n DIV 100, n MOD 100, n FROM s;
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+#
+# (x, y) IN ((50, 25), (150, 75)) distributes per column into
+# (x IN (50,150)) AND (y IN (25,75)) -- two of 200 x-values and two of
+# 100 y-values, each column independently selective. The candidate count
+# is the multiget delta; with row-IN translated it must fall far below
+# 20000. (The distributed AND also admits the two "cross" pairs
+# (50,75) and (150,25), which is why the exact match count is 2 but the
+# candidate count can be a little more than that -- ICP drops the
+# cross pairs before they reach the result.)
+include/assert.inc [a selective row-constructor IN prunes the candidate set (800 of 20000)]
+DROP TABLE t_rip;

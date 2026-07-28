@@ -11,8 +11,13 @@
 #include "sql/item.h"
 #include "sql/item_cmpfunc.h"  // Item_cond, Item_func_in
 #include "sql/item_func.h"
+#include "sql/item_row.h"  // Item_row (row-constructor IN predicand)
 #include "sql/key.h"
 #include "sql/sql_list.h"
+
+/* my_date_to_binary / non_zero_time / TIME_FUZZY_DATE: the DATE comparand is
+ * packed exactly the way Field_newdate stores the column. */
+#include "my_time.h"
 
 namespace myrocks {
 
@@ -28,9 +33,11 @@ using bit_lsm::QueryCondition;
 // Which variant alternative an attribute's comparand must use. Mirrors the
 // role/encoding derivation in rdb_datadic.cc::bitlsm_derive_enc so the query's
 // comparand type can never disagree with how rows were binned. SKIP marks an
-// attribute the query translator does not (yet) know how to encode a literal
-// for (e.g. DATE): conditions on it are conservatively omitted.
-enum class ValKind { SKIP, I64, U64, DBL, STR };
+// attribute the query translator does not know how to encode a literal for:
+// conditions on it are conservatively omitted. After DATE support landed no
+// type reachable through a valid BITLSM_INDEX maps to SKIP -- it is kept as a
+// defensive default.
+enum class ValKind { SKIP, I64, U64, DBL, STR, DATE };
 
 // Per-attribute translation metadata, keyed by the table field index.
 struct AttrMeta {
@@ -39,9 +46,9 @@ struct AttrMeta {
 };
 
 // Map a Field to (AttrSpec, ValKind). All types here are the ones the extractor
-// accepts (the table would not exist otherwise); DATE and anything unexpected
-// still get a placeholder AttrSpec so attr_idx alignment is preserved, but are
-// marked SKIP so no condition is emitted for them.
+// accepts (the table would not exist otherwise). Anything unexpected still gets
+// a placeholder AttrSpec so attr_idx alignment is preserved, but is marked SKIP
+// so no condition is emitted for it.
 static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
   using bit_lsm::ORDERED;
   using bit_lsm::UNORDERED;
@@ -75,6 +82,19 @@ static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
       *spec = AttrSpec(UNORDERED, 0, /*is_signed=*/false, /*is_float=*/false,
                        nullable);
       *kind = ValKind::STR;
+      return;
+    case MYSQL_TYPE_NEWDATE:  // DATE (Field_newdate: 3 bytes, LE packed)
+      // `width` decodes nothing on this path: the SABI schema persists only
+      // roles (rdb_datadic.cc), and MyRocks drives the iterator in
+      // ResultMode::Candidate, which leaves CompiledQuery inert and skips
+      // per-row Eval (bit_lsm_iterator.cpp). BitLSMQuery::Validate only
+      // branches on is_signed/is_float (both false here, matching the
+      // extractor's unsigned, non-float U64ToOkey(read_le(..., 3))); it never
+      // reads width. `width` is filler -- AttrSpec widths are 1/2/4/8, so
+      // DATE's 3 is not expressible here and does not need to be.
+      *spec = AttrSpec(ORDERED, 4, /*is_signed=*/false, /*is_float=*/false,
+                       nullable);
+      *kind = ValKind::DATE;
       return;
     default:
       *spec = AttrSpec(ORDERED, 8, /*is_signed=*/true, /*is_float=*/false,
@@ -157,6 +177,34 @@ static bool extract_value(
       String *s = it->val_str(&buf);
       if (s == nullptr || it->null_value) return false;
       *out = std::string(s->ptr(), s->length());
+      return true;
+    }
+    case ValKind::DATE: {
+      MYSQL_TIME ltime;
+      if (it->get_date(&ltime, TIME_FUZZY_DATE)) return false;
+      if (it->null_value) return false;
+      // A comparand carrying a time part is compared as DATETIME: the DATE
+      // column widens to midnight, so `d < '2020-01-01 10:00:00'` MATCHES
+      // d = 2020-01-01. Truncating to the date part would emit
+      // `okey < packed(2020-01-01)` and prune that row away -- a
+      // STRENGTHENING, which loses rows. Omit instead.
+      if (non_zero_time(ltime)) return false;
+      // Zero month/day, e.g. '2020-06-00'. Item::get_date() reaches
+      // str_to_datetime_with_warn(), which does NOT apply MODE_NO_ZERO_IN_DATE,
+      // so it parses; the comparator's get_mysql_time_from_str() DOES apply it,
+      // fails, and get_datetime_value() then silently compares against packed
+      // 0 -- weaker than any real date. Emitting a comparand here would prune
+      // rows the server counts as matching, i.e. NARROW. Omit instead.
+      if (ltime.month == 0 || ltime.day == 0) return false;
+      // Pack through the SAME function Field_newdate::store_internal uses
+      // (sql/field.cc), so these are byte-for-byte the bytes the extractor
+      // reads back. Writing the formula out by hand here would silently
+      // diverge if MySQL ever changed the layout.
+      uchar buf[3];
+      my_date_to_binary(&ltime, buf);
+      *out = static_cast<uint64_t>(buf[0]) |
+             (static_cast<uint64_t>(buf[1]) << 8) |
+             (static_cast<uint64_t>(buf[2]) << 16);
       return true;
     }
     case ValKind::SKIP:
@@ -258,6 +306,80 @@ static bool make_between_groups(Item_func *f, const Ctx &ctx, BitLSMQuery *q) {
   q->clause_groups.push_back(std::move(g_lo));
   q->clause_groups.push_back(std::move(g_hi));
   return true;
+}
+
+// Translate a positive row-constructor IN -- `(c0, c1, ...) IN ((v00, v01,
+// ...), (v10, v11, ...), ...)` -- by DISTRIBUTING it per column:
+//
+//   (a,b) IN ((1,2),(3,4))
+//     == (a=1 AND b=2) OR (a=3 AND b=4)   -- DNF; CNF cannot express it
+//     <= (a=1 OR a=3) AND (b=2 OR b=4)    -- per column: a safe weakening
+//
+// Each column contributes ONE clause_group of EQUALs, so this lives at the
+// conjunction level (like make_between_groups) rather than in
+// collect_disjunction, which builds a single OR clause. The extra combinations
+// the distributed form admits (a=1 AND b=4) cost fetches and are dropped by the
+// ICP re-verify -- never a correctness problem.
+//
+// Unlike BETWEEN's two bounds, per-column clauses are INDEPENDENT: a column
+// whose values do not all translate is dropped ALONE and the remaining groups
+// are still a superset of the original condition. Returns false (nothing
+// emitted) only when the SHAPE is unusable.
+static bool make_row_in_groups(Item_func_in *in, const Ctx &ctx,
+                               BitLSMQuery *q) {
+  if (in->negated) return false;  // NOT IN is not a disjunction of EQUALs
+  const uint n = in->argument_count();
+  if (n < 2) return false;
+  Item_row *const pred =
+      static_cast<Item_row *>(in->arguments()[0]->real_item());
+  const uint cols = pred->cols();
+  if (cols == 0) return false;
+
+  // Every RHS element must be a row of the same arity; otherwise values cannot
+  // be lined up with columns at all.
+  for (uint i = 1; i < n; i++) {
+    Item *const e = in->arguments()[i]->real_item();
+    if (e->type() != Item::ROW_ITEM) return false;
+    if (static_cast<Item_row *>(e)->cols() != cols) return false;
+  }
+
+  bool any = false;
+  for (uint j = 0; j < cols; j++) {
+    AttrMeta meta{};
+    // NOTE: the out-of-index case does not actually arrive here -- a row
+    // constructor mixing indexed and non-indexed columns is rejected earlier by
+    // uses_index_fields_only() and never pushed. Kept for safety; the reachable
+    // partial-failure path is a value that fails to extract.
+    if (index_field_of(pred->element_index(j), ctx, &meta) == nullptr) continue;
+    if (meta.kind == ValKind::SKIP) continue;
+
+    // Build the column's clause COMPLETELY before publishing it: a
+    // half-translated OR clause would be a strengthening of this column's
+    // constraint, which loses rows.
+    OrClause clause;
+    bool ok = true;
+    for (uint i = 1; i < n; i++) {
+      Item *const v =
+          static_cast<Item_row *>(in->arguments()[i]->real_item())
+              ->element_index(j);
+      if (!v->const_item()) {
+        ok = false;
+        break;
+      }
+      QueryCondition c{};
+      c.attr_idx = meta.attr_idx;
+      c.op = CompareOp::EQUAL;
+      if (!extract_value(v, meta.kind, &c.value)) {
+        ok = false;
+        break;
+      }
+      clause.push_back(std::move(c));
+    }
+    if (!ok || clause.empty()) continue;  // drop THIS column only
+    q->clause_groups.push_back(std::move(clause));
+    any = true;
+  }
+  return any;
 }
 
 // Append the OR-terms of a purely disjunctive, fully representable item to
@@ -363,6 +485,18 @@ static void collect_conjunction(Item *it, const Ctx &ctx, BitLSMQuery *q) {
       }
     }
     return;
+  }
+  // A row-constructor IN -- `(a,b) IN ((1,2),(3,4))` -- distributes into one
+  // clause_group per column (see make_row_in_groups), so like BETWEEN it
+  // cannot go through collect_disjunction. A SCALAR IN keeps falling through
+  // to collect_disjunction, which turns it into a single OR clause.
+  if (it->type() == Item::FUNC_ITEM &&
+      static_cast<Item_func *>(it)->functype() == Item_func::IN_FUNC) {
+    Item_func_in *const in = static_cast<Item_func_in *>(it);
+    if (in->arguments()[0]->real_item()->type() == Item::ROW_ITEM) {
+      make_row_in_groups(in, ctx, q);
+      return;
+    }
   }
   // `field BETWEEN lo AND hi` expands to two clause_groups (>= lo, <= hi).
   // collect_disjunction can't represent it (a conjunction is not a single OR

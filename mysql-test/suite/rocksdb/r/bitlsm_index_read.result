@@ -94,6 +94,32 @@ SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE c = 'x' ORDER BY id;
 id	a	b	c	d
 6	100	100	x	600
 include/assert.inc [Q8 VARBINARY equality (c = 'x'): FORCE INDEX(bi) row set identical to full scan]
+# Q9 row IN over two indexed columns
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE (a, c) IN ((10, 'gamma'), (25, 'delta')) ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+5	25	99.9	delta	500
+7	10	NULL	gamma	700
+include/assert.inc [Q9 row IN over two indexed columns: FORCE INDEX(bi) row set identical to full scan]
+# Q10 row IN with a non-indexed column
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE (a, d) IN ((10, 300), (25, 500)) ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+5	25	99.9	delta	500
+include/assert.inc [Q10 row IN with a non-indexed column: FORCE INDEX(bi) row set identical to full scan]
+# Q11 row IN with no matching pair
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE (a, c) IN ((10, 'delta'), (25, 'gamma')) ORDER BY id;
+id	a	b	c	d
+include/assert.inc [Q11 row IN with no matching pair: FORCE INDEX(bi) row set identical to full scan]
+# Q12 row NOT IN (must translate to nothing, stay correct)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE (a, c) NOT IN ((10, 'gamma'), (25, 'delta')) ORDER BY id;
+id	a	b	c	d
+1	-50	-1.5	alpha	100
+2	0	0	beta	200
+6	100	100	x	600
+10	50	50	zeta	NULL
+include/assert.inc [Q12 row NOT IN (must translate to nothing, stay correct): FORCE INDEX(bi) row set identical to full scan]
 #
 # ==== Phase 2: data flushed to an SST (SABI block present) ====
 SET GLOBAL rocksdb_force_flush_memtable_now = 1;
@@ -159,6 +185,32 @@ SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE c = 'x' ORDER BY id;
 id	a	b	c	d
 6	100	100	x	600
 include/assert.inc [Q8 VARBINARY equality (c = 'x'): FORCE INDEX(bi) row set identical to full scan]
+# Q9 row IN over two indexed columns
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE (a, c) IN ((10, 'gamma'), (25, 'delta')) ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+4	10	2.5	gamma	400
+5	25	99.9	delta	500
+7	10	NULL	gamma	700
+include/assert.inc [Q9 row IN over two indexed columns: FORCE INDEX(bi) row set identical to full scan]
+# Q10 row IN with a non-indexed column
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE (a, d) IN ((10, 300), (25, 500)) ORDER BY id;
+id	a	b	c	d
+3	10	2.5	gamma	300
+5	25	99.9	delta	500
+include/assert.inc [Q10 row IN with a non-indexed column: FORCE INDEX(bi) row set identical to full scan]
+# Q11 row IN with no matching pair
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE (a, c) IN ((10, 'delta'), (25, 'gamma')) ORDER BY id;
+id	a	b	c	d
+include/assert.inc [Q11 row IN with no matching pair: FORCE INDEX(bi) row set identical to full scan]
+# Q12 row NOT IN (must translate to nothing, stay correct)
+SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE (a, c) NOT IN ((10, 'gamma'), (25, 'delta')) ORDER BY id;
+id	a	b	c	d
+1	-50	-1.5	alpha	100
+2	0	0	beta	200
+6	100	100	x	600
+10	50	50	zeta	NULL
+include/assert.inc [Q12 row NOT IN (must translate to nothing, stay correct): FORCE INDEX(bi) row set identical to full scan]
 #
 # ==== Phase 3: own uncommitted writes (option B: write-batch union) ====
 # The committed base is now in an SST, so source (a) is the bitmap-pruned

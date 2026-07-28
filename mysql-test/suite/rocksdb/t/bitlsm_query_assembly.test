@@ -25,22 +25,24 @@
 CREATE TABLE t_asm (
   id BIGINT NOT NULL,
   a INT, b DOUBLE, c VARBINARY(16),
+  dt DATE,
   d INT,
   PRIMARY KEY (id) COMMENT 'cfname=t_asm_cf',
-  INDEX bi (a, b, c) BITLSM_INDEX
+  INDEX bi (a, b, c, dt) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 
 # d is a payload column NOT in bi, so selecting it makes bi non-covering and the
 # WHERE is pushed through Index Condition Pushdown -- the point the translator
 # reads. attr mapping: a -> a0 (signed int64), b -> a1 (double), c -> a2
-# (unordered binary string).
+# (unordered binary string), dt -> a3 (unsigned int64 holding the 3-byte
+# Field_newdate packing).
 INSERT INTO t_asm VALUES
-  (1, -50, -1.5, 'alpha', 100),
-  (2,   1,  0.0, 'x',     200),
-  (3,   2,  2.5, 'gamma', 300),
-  (4,  10,  4.0, 'x',     400),
-  (5,  25, 99.9, 'delta', 500),
-  (6, 100, 2.5,  'gamma', 600);
+  (1, -50, -1.5, 'alpha', '2020-01-01', 100),
+  (2,   1,  0.0, 'x',     '2020-06-15', 200),
+  (3,   2,  2.5, 'gamma', '2024-02-29', 300),
+  (4,  10,  4.0, 'x',     '2020-06-15', 400),
+  (5,  25, 99.9, 'delta', '1000-01-01', 500),
+  (6, 100, 2.5,  'gamma', '9999-12-31', 600);
 
 --echo #
 --echo # Routing guards: the shapes exercised below must reach the bitlsm read
@@ -53,6 +55,10 @@ INSERT INTO t_asm VALUES
 --source include/assert.inc
 --let $k = query_get_value(EXPLAIN SELECT id FROM t_asm FORCE INDEX(bi) WHERE a IS NOT NULL AND b = 2.5, key, 1)
 --let $assert_text = IS-NOT-NULL + non-leading-eq shape routes to the bitlsm index
+--let $assert_cond = "$k" = "bi"
+--source include/assert.inc
+--let $k = query_get_value(`EXPLAIN SELECT id FROM t_asm FORCE INDEX(bi) WHERE (a, c) IN ((1, 'x'), (10, 'gamma'))`, key, 1)
+--let $assert_text = row-constructor IN shape routes to the bitlsm index
 --let $assert_cond = "$k" = "bi"
 --source include/assert.inc
 
@@ -152,6 +158,51 @@ INSERT INTO t_asm VALUES
 --echo # (13) BETWEEN on an UNORDERED (VARBINARY) attr has no representable range
 --echo # -> dropped; the leading ordered conjunct survives.
 --let $w = a >= 0 AND c BETWEEN 'a' AND 'z'
+--let $expected = a0>=0
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (14) DATE equality -> a3=<packed>. The comparand is the 3-byte
+--echo # Field_newdate packing (day + month*32 + year*512) read little-endian:
+--echo # 2020-06-15 -> 15 + 192 + 1034240 = 1034447.
+--let $w = dt = '2020-06-15'
+--let $expected = a3=1034447
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (15) DATE is an ORDERED attr (the packing is monotone in date order),
+--echo # so range operators are representable too.
+--let $w = dt >= '2020-06-15'
+--let $expected = a3>=1034447
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (16) Row-constructor IN distributes per column: one clause_group each.
+--echo # (a,c) IN ((1,'x'),(10,'gamma')) is the DNF (a=1 AND c='x') OR (a=10 AND
+--echo # c='gamma'), which CNF cannot express -- the per-column form is a safe
+--echo # weakening of it. Group order follows column order.
+--let $w = (a, c) IN ((1, 'x'), (10, 'gamma'))
+--let $expected = (a0=1 OR a0=10) AND (a2='x' OR a2='gamma')
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (16-note) A row constructor mixing indexed and NON-indexed columns --
+--echo # e.g. (a, d) where d is not in bi -- never reaches the translator at
+--echo # all: uses_index_fields_only() requires every element of the row to be
+--echo # an index field, so make_cond_for_index() drops the whole predicate and
+--echo # nothing is pushed via ICP. It therefore prunes nothing, and there is no
+--echo # assembled string to assert. Correctness for that shape is covered by
+--echo # bitlsm_index_read's Q10. Supporting it would require pushing conditions
+--echo # that reference non-index columns, which is a separate design question
+--echo # (the bitlsm read path re-verifies against a fully re-fetched row, not an
+--echo # index tuple).
+
+--echo #
+--echo # (17) A row-constructor IN inside an OR arm is not representable -- the
+--echo # per-column form needs several AND-ed groups and an OR arm can only
+--echo # contribute terms to ONE clause. The whole OR is dropped (dropping a
+--echo # disjunct would strengthen); the guarding AND conjunct survives.
+--let $w = a >= 0 AND ((a, c) IN ((1, 'x'), (10, 'gamma')) OR b = 2.5)
 --let $expected = a0>=0
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 

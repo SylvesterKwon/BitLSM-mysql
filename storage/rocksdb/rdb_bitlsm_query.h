@@ -23,9 +23,12 @@ namespace myrocks {
 //     otherwise the whole OR is omitted (dropping a disjunct would strengthen).
 //   - `field <cmp> const` on an index column -> one QueryCondition.
 //   - `field IN (c1, c2, ...)` -> an OR-clause of EQUAL conditions.
+//   - `(c0, c1, ...) IN ((v00, ...), (v10, ...), ...)` (row constructor) ->
+//     one clause_group of EQUALs PER COLUMN. That is a weakening of the DNF
+//     the row form denotes, which CNF cannot express exactly.
 //   - UNORDERED (binary string) attrs: only EQUAL is representable.
 //   - functions, column-to-column, IS NULL, NOT IN, arithmetic, subqueries,
-//     unsupported attr types (e.g. DATE): omitted.
+//     attr types the extractor cannot bin: omitted.
 //
 // `*out_options` is (re)built from the index Field types so the comparand
 // variant type matches each attribute (signed int -> int64, unsigned -> uint64,

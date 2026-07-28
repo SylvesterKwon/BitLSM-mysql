@@ -58,3 +58,21 @@ CREATE TABLE t_vg (
   b INT AS (a+1) VIRTUAL,
   INDEX bi (b) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
+
+--echo # Reject: DATETIME -- accepted by the server-layer type check today but
+--echo # rejected by the engine at table open (bitlsm_derive_enc has no encoding
+--echo # for it), which surfaced as HA_ERR_UNSUPPORTED instead of a DDL error.
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_dtime (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_dtime_cf',
+  ts DATETIME,
+  INDEX bi (ts) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+--echo # Reject: TIMESTAMP, same reason.
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_tstamp (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_tstamp_cf',
+  ts TIMESTAMP NULL,
+  INDEX bi (ts) BITLSM_INDEX
+) ENGINE=ROCKSDB;

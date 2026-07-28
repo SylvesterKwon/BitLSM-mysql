@@ -6742,6 +6742,37 @@ bool uses_index_fields_only(Item *item, TABLE *tbl, uint keyno,
     case Item::REF_ITEM:
       return uses_index_fields_only(item->real_item(), tbl, keyno,
                                     other_tbls_ok);
+    case Item::ROW_ITEM: {
+      /*
+        C9 (BitLSM): a row constructor -- the `(a, b)` in
+        `(a,b) IN ((1,2),(3,4))` -- is index-only exactly when every element
+        is. Stock code has no case for it, so it falls through to the "play it
+        safe" default, make_cond_for_index() drops the whole predicate, and it
+        is never pushed as an index condition.
+
+        For a BITLSM_INDEX that is the difference between pruning and a full
+        candidate scan. The bitlsm translator reads the PUSHED condition, so a
+        predicate that never reaches ICP can never prune -- even though the
+        range optimizer happily costs and picks the index for this shape, which
+        is what makes the gap silent: the plan looks right and the scan is
+        unpruned.
+
+        Gated on the index actually being a BITLSM_INDEX so that no other
+        engine's plans change: for every other index this keeps returning false
+        exactly as before. Same containment C4 (sql_planner.cc) and C8 (above)
+        use.
+      */
+      if (tbl == nullptr || tbl->key_info == nullptr || keyno >= tbl->s->keys ||
+          !tbl->key_info[keyno].is_bitlsm_index())
+        return false;
+      Item_row *const row = down_cast<Item_row *>(item);
+      for (uint i = 0; i < row->cols(); i++) {
+        if (!uses_index_fields_only(row->element_index(i), tbl, keyno,
+                                    other_tbls_ok))
+          return false;
+      }
+      return true;
+    }
     default:
       return false; /* Play it safe, don't push unknown non-const items */
   }

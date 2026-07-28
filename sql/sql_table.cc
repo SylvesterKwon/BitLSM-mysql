@@ -7257,10 +7257,16 @@ static bool prepare_preexisting_foreign_key(
 /**
   set vector index info to key_info
 */
-// §3.5 attribute type support for BITLSM_INDEX. ORDERED: integer/float/temporal
+// §3.5 attribute type support for BITLSM_INDEX. ORDERED: integer/float/DATE
 // (<=8B, order-preserving okey); UNORDERED equality on raw bytes => binary
 // collation strings only. Everything else (DECIMAL/BLOB/TEXT/JSON/ENUM/SET/
 // non-binary string) is rejected.
+//
+// DATETIME/TIMESTAMP are NOT here even though they are <=8B temporals: the
+// engine-side extractor (rdb_datadic.cc::bitlsm_derive_enc) has no encoding for
+// them, so accepting them at DDL only defers the failure to table open, where
+// it surfaces as HA_ERR_UNSUPPORTED. Keep this list equal to what the extractor
+// actually supports.
 static bool bitlsm_type_supported(const Create_field *cf) {
   switch (cf->sql_type) {
     case MYSQL_TYPE_TINY:
@@ -7272,10 +7278,6 @@ static bool bitlsm_type_supported(const Create_field *cf) {
     case MYSQL_TYPE_DOUBLE:
     case MYSQL_TYPE_DATE:
     case MYSQL_TYPE_NEWDATE:
-    case MYSQL_TYPE_DATETIME:
-    case MYSQL_TYPE_DATETIME2:
-    case MYSQL_TYPE_TIMESTAMP:
-    case MYSQL_TYPE_TIMESTAMP2:
       return true;
     case MYSQL_TYPE_STRING:
     case MYSQL_TYPE_VARCHAR:
