@@ -3724,12 +3724,13 @@ uint Rdb_key_def::setup_vector_index(const TABLE &tbl,
 // picks ORDERED vs UNORDERED binning) and the extract-time encoding can never
 // disagree (a mismatch would mis-bin rows).
 //
-// M3a-4 SCOPE: only the encodings below are implemented. M3a-1 DDL also accepts
-// DATETIME/DATETIME2/TIMESTAMP/TIMESTAMP2, but their packed->monotone-okey
-// conversion is not written yet, so they are rejected here (the `false` return)
-// rather than silently mis-extracted. TIME/TIME2/YEAR/BLOB are already refused
-// by the DDL gate and reach here only defensively. Extend both this switch and
-// Rdb_bitlsm_extractor when adding a type.
+// M3a-4 SCOPE: only the encodings below are implemented. DATE/NEWDATE packs
+// into a 3-byte order-monotone okey (Enc::DATE3, below). DATETIME/DATETIME2/
+// TIMESTAMP/TIMESTAMP2 are refused by the DDL gate in
+// sql_table.cc::bitlsm_type_supported and only reach here defensively, same as
+// TIME/TIME2/YEAR/BLOB -- none of them have a packed->monotone-okey conversion
+// written. Extend both this switch and Rdb_bitlsm_extractor when adding a
+// type.
 static bool bitlsm_derive_enc(const Field *field,
                               Rdb_bitlsm_attr_plan::Enc *enc,
                               bit_lsm::AttrRole *role) {

@@ -186,7 +186,7 @@ INSERT INTO t_asm VALUES
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
 --echo #
---echo # (17-note) A row constructor mixing indexed and NON-indexed columns --
+--echo # (16-note) A row constructor mixing indexed and NON-indexed columns --
 --echo # e.g. (a, d) where d is not in bi -- never reaches the translator at
 --echo # all: uses_index_fields_only() requires every element of the row to be
 --echo # an index field, so make_cond_for_index() drops the whole predicate and

@@ -128,7 +128,7 @@ SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE (a, c) IN ((1, 'x'), (10,
 # WHERE (a, c) IN ((1, 'x'), (10, 'gamma'))
 #   assembled: [(a0=1 OR a0=10) AND (a2='x' OR a2='gamma')]
 #
-# (17-note) A row constructor mixing indexed and NON-indexed columns --
+# (16-note) A row constructor mixing indexed and NON-indexed columns --
 # e.g. (a, d) where d is not in bi -- never reaches the translator at
 # all: uses_index_fields_only() requires every element of the row to be
 # an index field, so make_cond_for_index() drops the whole predicate and
