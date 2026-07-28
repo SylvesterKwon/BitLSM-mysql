@@ -3865,7 +3865,7 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
     attr_of_field.emplace(field->field_index(),
                           std::make_pair(static_cast<uint32_t>(i), enc));
   }
-  schema.rho = 0.1;  // default bitmap budget; tunable later
+  schema.rho = 0.01;  // default bitmap budget; tunable later
 
   // The extractor classifies preceding value fields via the PK's pack info
   // (can_unpack / has_unpack_info). setup() runs PK-first in alloc_key_buffers,
