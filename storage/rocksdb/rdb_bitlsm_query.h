@@ -25,7 +25,7 @@ namespace myrocks {
 //   - `field IN (c1, c2, ...)` -> an OR-clause of EQUAL conditions.
 //   - UNORDERED (binary string) attrs: only EQUAL is representable.
 //   - functions, column-to-column, IS NULL, NOT IN, arithmetic, subqueries,
-//     unsupported attr types (e.g. DATE): omitted.
+//     attr types the extractor cannot bin: omitted.
 //
 // `*out_options` is (re)built from the index Field types so the comparand
 // variant type matches each attribute (signed int -> int64, unsigned -> uint64,

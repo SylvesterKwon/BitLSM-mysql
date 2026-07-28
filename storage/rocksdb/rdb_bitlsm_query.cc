@@ -45,9 +45,9 @@ struct AttrMeta {
 };
 
 // Map a Field to (AttrSpec, ValKind). All types here are the ones the extractor
-// accepts (the table would not exist otherwise); DATE and anything unexpected
-// still get a placeholder AttrSpec so attr_idx alignment is preserved, but are
-// marked SKIP so no condition is emitted for them.
+// accepts (the table would not exist otherwise). Anything unexpected still gets
+// a placeholder AttrSpec so attr_idx alignment is preserved, but is marked SKIP
+// so no condition is emitted for it.
 static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
   using bit_lsm::ORDERED;
   using bit_lsm::UNORDERED;
