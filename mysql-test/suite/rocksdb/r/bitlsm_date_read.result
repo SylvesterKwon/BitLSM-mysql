@@ -1,0 +1,174 @@
+CREATE TABLE t_date (
+id BIGINT NOT NULL,
+a INT,
+d DATE,
+payload INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_date_cf',
+INDEX bi (a, d) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+INSERT INTO t_date VALUES
+(1,  1, '1000-01-01', 100),
+(2,  2, '1999-12-31', 200),
+(3,  3, '2000-01-01', 300),
+(4,  4, '2000-02-29', 400),
+(5,  5, '2020-01-31', 500),
+(6,  6, '2020-02-01', 600),
+(7,  7, '2020-06-15', 700),
+(8,  8, '2024-02-29', 800),
+(9,  9, '9999-12-31', 900),
+(10, 10, NULL,       1000);
+#
+# Routing guard: a DATE predicate must actually reach the bitlsm read
+# path, otherwise every differential check below passes trivially by
+# comparing a table scan against a table scan.
+include/assert.inc [DATE range shape routes to the bitlsm index]
+#
+# ==== Phase 1: data in the memtable ====
+# D1 leap-day equality (d = '2024-02-29')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d = '2024-02-29' ORDER BY id;
+id	a	d	payload
+8	8	2024-02-29	800
+include/assert.inc [D1 leap-day equality (d = '2024-02-29'): FORCE INDEX(bi) row set identical to full scan]
+# D2 year-boundary range (d >= '1999-12-31' AND d < '2000-01-02')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d >= '1999-12-31' AND d < '2000-01-02' ORDER BY id;
+id	a	d	payload
+2	2	1999-12-31	200
+3	3	2000-01-01	300
+include/assert.inc [D2 year-boundary range (d >= '1999-12-31' AND d < '2000-01-02'): FORCE INDEX(bi) row set identical to full scan]
+# D3 BETWEEN over a month end (d BETWEEN '2020-01-31' AND '2020-02-01')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d BETWEEN '2020-01-31' AND '2020-02-01' ORDER BY id;
+id	a	d	payload
+5	5	2020-01-31	500
+6	6	2020-02-01	600
+include/assert.inc [D3 BETWEEN over a month end (d BETWEEN '2020-01-31' AND '2020-02-01'): FORCE INDEX(bi) row set identical to full scan]
+# D4 DATE IN-list (three dates)
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d IN ('2000-02-29', '2020-06-15', '9999-12-31') ORDER BY id;
+id	a	d	payload
+4	4	2000-02-29	400
+7	7	2020-06-15	700
+9	9	9999-12-31	900
+include/assert.inc [D4 DATE IN-list (three dates): FORCE INDEX(bi) row set identical to full scan]
+# D5 domain bounds (d <= '1000-01-01' OR d >= '9999-12-31')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d <= '1000-01-01' OR d >= '9999-12-31' ORDER BY id;
+id	a	d	payload
+1	1	1000-01-01	100
+9	9	9999-12-31	900
+include/assert.inc [D5 domain bounds (d <= '1000-01-01' OR d >= '9999-12-31'): FORCE INDEX(bi) row set identical to full scan]
+# D6 NULL exclusion (d >= '1000-01-01')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d >= '1000-01-01' ORDER BY id;
+id	a	d	payload
+1	1	1000-01-01	100
+2	2	1999-12-31	200
+3	3	2000-01-01	300
+4	4	2000-02-29	400
+5	5	2020-01-31	500
+6	6	2020-02-01	600
+7	7	2020-06-15	700
+8	8	2024-02-29	800
+9	9	9999-12-31	900
+include/assert.inc [D6 NULL exclusion (d >= '1000-01-01'): FORCE INDEX(bi) row set identical to full scan]
+# D7 IS NULL on d
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d IS NULL ORDER BY id;
+id	a	d	payload
+10	10	NULL	1000
+include/assert.inc [D7 IS NULL on d: FORCE INDEX(bi) row set identical to full scan]
+# D8 time-part comparand must not lose rows (d < '2020-06-15 10:30:00')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d < '2020-06-15 10:30:00' ORDER BY id;
+id	a	d	payload
+1	1	1000-01-01	100
+2	2	1999-12-31	200
+3	3	2000-01-01	300
+4	4	2000-02-29	400
+5	5	2020-01-31	500
+6	6	2020-02-01	600
+7	7	2020-06-15	700
+include/assert.inc [D8 time-part comparand must not lose rows (d < '2020-06-15 10:30:00'): FORCE INDEX(bi) row set identical to full scan]
+# D9 INT + DATE conjunction (a >= 5 AND d < '2024-01-01')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE a >= 5 AND d < '2024-01-01' ORDER BY id;
+id	a	d	payload
+5	5	2020-01-31	500
+6	6	2020-02-01	600
+7	7	2020-06-15	700
+include/assert.inc [D9 INT + DATE conjunction (a >= 5 AND d < '2024-01-01'): FORCE INDEX(bi) row set identical to full scan]
+# D10 row IN over (a,d)
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE (a, d) IN ((7, '2020-06-15'), (8, '2024-02-29')) ORDER BY id;
+id	a	d	payload
+7	7	2020-06-15	700
+8	8	2024-02-29	800
+include/assert.inc [D10 row IN over (a,d): FORCE INDEX(bi) row set identical to full scan]
+#
+# ==== Phase 2: data flushed to an SST (SABI block present) ====
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+# D1 leap-day equality (d = '2024-02-29')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d = '2024-02-29' ORDER BY id;
+id	a	d	payload
+8	8	2024-02-29	800
+include/assert.inc [D1 leap-day equality (d = '2024-02-29'): FORCE INDEX(bi) row set identical to full scan]
+# D2 year-boundary range (d >= '1999-12-31' AND d < '2000-01-02')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d >= '1999-12-31' AND d < '2000-01-02' ORDER BY id;
+id	a	d	payload
+2	2	1999-12-31	200
+3	3	2000-01-01	300
+include/assert.inc [D2 year-boundary range (d >= '1999-12-31' AND d < '2000-01-02'): FORCE INDEX(bi) row set identical to full scan]
+# D3 BETWEEN over a month end (d BETWEEN '2020-01-31' AND '2020-02-01')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d BETWEEN '2020-01-31' AND '2020-02-01' ORDER BY id;
+id	a	d	payload
+5	5	2020-01-31	500
+6	6	2020-02-01	600
+include/assert.inc [D3 BETWEEN over a month end (d BETWEEN '2020-01-31' AND '2020-02-01'): FORCE INDEX(bi) row set identical to full scan]
+# D4 DATE IN-list (three dates)
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d IN ('2000-02-29', '2020-06-15', '9999-12-31') ORDER BY id;
+id	a	d	payload
+4	4	2000-02-29	400
+7	7	2020-06-15	700
+9	9	9999-12-31	900
+include/assert.inc [D4 DATE IN-list (three dates): FORCE INDEX(bi) row set identical to full scan]
+# D5 domain bounds (d <= '1000-01-01' OR d >= '9999-12-31')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d <= '1000-01-01' OR d >= '9999-12-31' ORDER BY id;
+id	a	d	payload
+1	1	1000-01-01	100
+9	9	9999-12-31	900
+include/assert.inc [D5 domain bounds (d <= '1000-01-01' OR d >= '9999-12-31'): FORCE INDEX(bi) row set identical to full scan]
+# D6 NULL exclusion (d >= '1000-01-01')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d >= '1000-01-01' ORDER BY id;
+id	a	d	payload
+1	1	1000-01-01	100
+2	2	1999-12-31	200
+3	3	2000-01-01	300
+4	4	2000-02-29	400
+5	5	2020-01-31	500
+6	6	2020-02-01	600
+7	7	2020-06-15	700
+8	8	2024-02-29	800
+9	9	9999-12-31	900
+include/assert.inc [D6 NULL exclusion (d >= '1000-01-01'): FORCE INDEX(bi) row set identical to full scan]
+# D7 IS NULL on d
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d IS NULL ORDER BY id;
+id	a	d	payload
+10	10	NULL	1000
+include/assert.inc [D7 IS NULL on d: FORCE INDEX(bi) row set identical to full scan]
+# D8 time-part comparand must not lose rows (d < '2020-06-15 10:30:00')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE d < '2020-06-15 10:30:00' ORDER BY id;
+id	a	d	payload
+1	1	1000-01-01	100
+2	2	1999-12-31	200
+3	3	2000-01-01	300
+4	4	2000-02-29	400
+5	5	2020-01-31	500
+6	6	2020-02-01	600
+7	7	2020-06-15	700
+include/assert.inc [D8 time-part comparand must not lose rows (d < '2020-06-15 10:30:00'): FORCE INDEX(bi) row set identical to full scan]
+# D9 INT + DATE conjunction (a >= 5 AND d < '2024-01-01')
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE a >= 5 AND d < '2024-01-01' ORDER BY id;
+id	a	d	payload
+5	5	2020-01-31	500
+6	6	2020-02-01	600
+7	7	2020-06-15	700
+include/assert.inc [D9 INT + DATE conjunction (a >= 5 AND d < '2024-01-01'): FORCE INDEX(bi) row set identical to full scan]
+# D10 row IN over (a,d)
+SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE (a, d) IN ((7, '2020-06-15'), (8, '2024-02-29')) ORDER BY id;
+id	a	d	payload
+7	7	2020-06-15	700
+8	8	2024-02-29	800
+include/assert.inc [D10 row IN over (a,d): FORCE INDEX(bi) row set identical to full scan]
+DROP TABLE t_date;
