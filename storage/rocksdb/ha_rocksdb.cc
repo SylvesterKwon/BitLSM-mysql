@@ -1515,8 +1515,7 @@ static MYSQL_SYSVAR_BOOL(bitlsm_estimator, rocksdb_bitlsm_estimator,
 // tests and benchmark harnesses see deterministic estimates instead of
 // racing the async refresh worker.
 static int rocksdb_bitlsm_estimator_refresh(
-    THD *const thd MY_ATTRIBUTE((__unused__)),
-    struct SYS_VAR *const var MY_ATTRIBUTE((__unused__)),
+    THD *const thd, struct SYS_VAR *const var MY_ATTRIBUTE((__unused__)),
     void *const var_ptr MY_ATTRIBUTE((__unused__)),
     struct st_mysql_value *const value) {
   bool parsed_value = false;
@@ -1526,7 +1525,19 @@ static int rocksdb_bitlsm_estimator_refresh(
     // Setting to OFF is a no-op and this supports mtr tests
     return HA_EXIT_SUCCESS;
   }
-  Rdb_bitlsm_registry::instance().estimator_refresh_all();
+  const size_t refreshed =
+      Rdb_bitlsm_registry::instance().estimator_refresh_all();
+  if (refreshed == 0) {
+    // Estimators attach lazily at first table open, so a refresh on a
+    // freshly booted server used to no-op silently -- a repeated
+    // measurement-protocol trap. Surface it: open the bitlsm tables (any
+    // statement that instantiates the handler, e.g. LOCK TABLES ... READ)
+    // and set the trigger again.
+    push_warning_printf(thd, Sql_condition::SL_WARNING, ER_WRONG_ARGUMENTS,
+                        "rocksdb_bitlsm_estimator_refresh: no estimators "
+                        "bound (bitlsm tables not opened yet); nothing was "
+                        "refreshed");
+  }
   return HA_EXIT_SUCCESS;
 }
 static bool rocksdb_bitlsm_estimator_refresh_var = false;

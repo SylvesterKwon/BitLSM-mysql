@@ -86,7 +86,7 @@ void Rdb_bitlsm_registry::estimator_shutdown() {
   // Workers join here, outside the lock (same reasoning as estimator_destroy).
 }
 
-void Rdb_bitlsm_registry::estimator_refresh_all() {
+size_t Rdb_bitlsm_registry::estimator_refresh_all() {
   // Collect raw pointers under the lock, run the blocking refreshes outside
   // it: TEST_Refresh waits on the worker, and a concurrent flush completion
   // takes the registry lock in estimator_notify.
@@ -98,6 +98,7 @@ void Rdb_bitlsm_registry::estimator_refresh_all() {
     }
   }
   for (auto *est : targets) est->TEST_Refresh();
+  return targets.size();
 }
 
 void Rdb_bitlsm_stats_listener::OnFlushCompleted(

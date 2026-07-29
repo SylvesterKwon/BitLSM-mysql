@@ -62,8 +62,11 @@ class Rdb_bitlsm_registry {
   // Synchronously run one refresh pass on every estimator (blocks through
   // the worker's cooldown). Trigger sysvar rocksdb_bitlsm_estimator_refresh:
   // deterministic stats for MTR tests and benchmark harnesses. Callers must
-  // not race estimator_destroy/estimator_shutdown (admin-op scope).
-  void estimator_refresh_all();
+  // not race estimator_destroy/estimator_shutdown (admin-op scope). Returns
+  // the number of estimators refreshed -- 0 means nothing was bound yet
+  // (estimators attach lazily at first table open), which callers should
+  // surface rather than swallow.
+  size_t estimator_refresh_all();
 
  private:
   Rdb_bitlsm_registry() = default;
