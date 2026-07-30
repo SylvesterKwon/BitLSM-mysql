@@ -10532,8 +10532,11 @@ static Sys_var_double Sys_bitlsm_index_cost_factor(
 static Sys_var_double Sys_bitlsm_eq_selectivity(
     "bitlsm_eq_selectivity",
     "Assumed per-keypart selectivity of an equality (keypart = const) "
-    "predicate in the dead-simple BitLSM candidate-count estimator. "
-    "Default: 0.1",
+    "predicate in the fallback BitLSM candidate-count estimator, used when "
+    "the engine cannot supply real statistics. The default matches the "
+    "server's own no-statistics filtering guess, COND_FILTER_EQUALITY in "
+    "sql/item.h (itself the 1/10 equality heuristic of System R, Selinger et "
+    "al., SIGMOD 1979). Default: 0.1",
     HINT_UPDATEABLE SESSION_VAR(bitlsm_eq_selectivity), CMD_LINE(OPT_ARG),
     VALID_RANGE(0.0001, 1.0), DEFAULT(0.1), NO_MUTEX_GUARD, NOT_IN_BINLOG,
     ON_CHECK(nullptr), ON_UPDATE(nullptr));
@@ -10541,8 +10544,11 @@ static Sys_var_double Sys_bitlsm_eq_selectivity(
 static Sys_var_double Sys_bitlsm_range_selectivity(
     "bitlsm_range_selectivity",
     "Assumed per-keypart selectivity of a range (<, >, BETWEEN, open "
-    "interval) predicate in the dead-simple BitLSM candidate-count estimator. "
-    "Default: 0.33",
+    "interval) predicate in the fallback BitLSM candidate-count estimator, "
+    "used when the engine cannot supply real statistics. The default matches "
+    "the server's own no-statistics filtering guess for inequalities, "
+    "COND_FILTER_INEQUALITY = 0.3333f in sql/item.h (itself the 1/3 range "
+    "heuristic of System R, Selinger et al., SIGMOD 1979). Default: 0.33",
     HINT_UPDATEABLE SESSION_VAR(bitlsm_range_selectivity), CMD_LINE(OPT_ARG),
     VALID_RANGE(0.0001, 1.0), DEFAULT(0.33), NO_MUTEX_GUARD, NOT_IN_BINLOG,
     ON_CHECK(nullptr), ON_UPDATE(nullptr));
