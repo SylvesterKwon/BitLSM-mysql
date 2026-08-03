@@ -1,0 +1,56 @@
+--source include/have_rocksdb.inc
+
+# The SABI blocks in a CF's SSTs must survive a compaction that runs while no
+# client has opened the table -- i.e. the build binding must come from the data
+# dictionary at DB open, not from Rdb_key_def::setup at first table open.
+# Before that fix the compaction below rewrote every SST without its SABI
+# block, and the planner silently fell back to its magic selectivity constants.
+#
+# No golden row counts here on purpose: the estimates are captured while the
+# table is open and bound, then re-measured after the blind compaction. The
+# invariant is that they do not move.
+
+# udt-in-mem serves bitlsm reads with a PK scan, but the estimates asserted
+# below come from the planner, not the read path, so the test runs everywhere.
+
+CREATE TABLE t_sabi (
+  id BIGINT NOT NULL,
+  a INT, b INT,
+  d INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_sabi_cf',
+  INDEX bi (a, b) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO t_sabi
+WITH RECURSIVE s(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM s WHERE n<19999)
+SELECT n, n%1000, n%4, n FROM s;
+
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+SET GLOBAL rocksdb_compact_cf = 't_sabi_cf';
+SET GLOBAL rocksdb_bitlsm_estimator_refresh = 1;
+
+# Baseline estimates, taken while the table is open and bound.
+--let $eq_before = query_get_value(EXPLAIN SELECT d FROM t_sabi FORCE INDEX(bi) WHERE a = 503, rows, 1)
+--let $range_before = query_get_value(EXPLAIN SELECT d FROM t_sabi FORCE INDEX(bi) WHERE a < 100, rows, 1)
+
+--source include/restart_mysqld.inc
+
+--echo # Compact the data CF WITHOUT opening t_sabi first.
+SET GLOBAL rocksdb_compact_cf = 't_sabi_cf';
+
+--echo # Now open the table and re-measure.
+SELECT COUNT(*) FROM t_sabi;
+SET GLOBAL rocksdb_bitlsm_estimator_refresh = 1;
+--let $eq_after = query_get_value(EXPLAIN SELECT d FROM t_sabi FORCE INDEX(bi) WHERE a = 503, rows, 1)
+--let $range_after = query_get_value(EXPLAIN SELECT d FROM t_sabi FORCE INDEX(bi) WHERE a < 100, rows, 1)
+
+--let $assert_text = equality estimate survives a compaction with the table closed
+--let $assert_cond = $eq_after = $eq_before
+--source include/assert.inc
+
+--let $assert_text = range estimate survives a compaction with the table closed
+--let $assert_cond = $range_after = $range_before
+--source include/assert.inc
+
+DROP TABLE t_sabi;
