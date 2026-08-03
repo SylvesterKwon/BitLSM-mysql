@@ -108,10 +108,13 @@ class Rdb_bitlsm_stats_listener : public rocksdb::EventListener {
 // Per-CF UDI factory installed on every data CF's BlockBasedTableOptions. Knows
 // only its cf_name.
 //
-// Build path: dispatches to the bound SABIFactory via the registry. Unbound ->
-// null builder -> RocksDB skips the UDI wrapper (zero per-row cost on
-// non-bitlsm / not-yet-bound CFs). Building presupposes an open table, so the
-// CF is always bound by then.
+// Build path: dispatches to the bound SABIFactory via the registry. A CF the
+// registry knows nothing about is an ordinary non-bitlsm CF -> null builder ->
+// RocksDB skips the UDI wrapper (zero per-row cost). A CF that HAS a persisted
+// descriptor but no factory is a broken invariant, not a fast path: the build
+// fails with a non-OK Status rather than quietly finalizing an SST without its
+// SABI block. Rdb_ddl_manager::populate binds every descriptor at DB open, so
+// the binding no longer waits for someone to open the table.
 //
 // Read path: registry-independent. v5 SABI blobs are self-describing (the
 // directory persists attr roles), so a reader opens an SST with no schema
@@ -126,6 +129,18 @@ class Rdb_bitlsm_udi_factory : public rocksdb::UserDefinedIndexFactory {
       : m_cf_name(std::move(cf_name)) {}
   const char *Name() const override { return "bitlsm.sabi"; }
   rocksdb::UserDefinedIndexBuilder *NewBuilder() const override;
+  // RocksDB calls this overload at SST build. Three states:
+  //   no entry           -> null builder + OK (ordinary non-bitlsm CF)
+  //   entry with factory -> build SABI
+  //   entry, no factory  -> non-OK; the SST build fails instead of silently
+  //                         producing a SABI-less file. Unreachable once
+  //                         Rdb_ddl_manager::populate has bound every CF with a
+  //                         persisted descriptor -- an invariant check, not a
+  //                         policy knob.
+  rocksdb::Status NewBuilder(
+      const rocksdb::UserDefinedIndexOption &option,
+      std::unique_ptr<rocksdb::UserDefinedIndexBuilder> &builder)
+      const override;
   std::unique_ptr<rocksdb::UserDefinedIndexReader> NewReader(
       rocksdb::Slice &index_block) const override;
   // RocksDB calls this overload at SST open; it validates the v5 footer then

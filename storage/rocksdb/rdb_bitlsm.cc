@@ -156,6 +156,27 @@ rocksdb::UserDefinedIndexBuilder *Rdb_bitlsm_udi_factory::NewBuilder() const {
   return f ? f->NewBuilder() : nullptr;
 }
 
+rocksdb::Status Rdb_bitlsm_udi_factory::NewBuilder(
+    const rocksdb::UserDefinedIndexOption & /*option*/,
+    std::unique_ptr<rocksdb::UserDefinedIndexBuilder> &builder) const {
+  auto &registry = Rdb_bitlsm_registry::instance();
+  auto f = registry.get(m_cf_name);
+  if (f) {
+    builder.reset(f->NewBuilder());
+    return rocksdb::Status::OK();
+  }
+  if (registry.expects_sabi(m_cf_name)) {
+    // A descriptor for this CF exists in the data dictionary but its factory is
+    // missing. Writing the SST anyway would drop the bitmaps with no trace, so
+    // fail the flush/compaction instead.
+    return rocksdb::Status::Corruption(
+        "bitlsm: column family '" + m_cf_name +
+        "' has a persisted SABI descriptor but no bound builder");
+  }
+  builder.reset();  // ordinary CF: no UDI wrapper, zero per-row cost
+  return rocksdb::Status::OK();
+}
+
 namespace {
 // Process-global schema-less SABIFactory for the read path. A default-
 // constructed SABIFactory is reader-only: v5 SABI blobs carry their own attr
