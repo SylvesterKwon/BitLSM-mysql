@@ -68,6 +68,15 @@ class Rdb_bitlsm_registry {
   // surface rather than swallow.
   size_t estimator_refresh_all();
 
+  // Marks cf_name as "a persisted SABI descriptor exists for this CF". Set at
+  // DB open right after a successful bind, and also when a descriptor fails to
+  // load, so the build path can tell an ordinary CF (no entry -> skip the UDI
+  // wrapper) from a bitlsm CF whose builder is missing (-> fail the SST build).
+  // Call AFTER bind(): this creates the entry if absent, and an entry with
+  // empty roles would make a later bind() look like a D5 schema conflict.
+  void mark_expected(const std::string &cf_name);
+  bool expects_sabi(const std::string &cf_name) const;
+
  private:
   Rdb_bitlsm_registry() = default;
   struct Entry {
@@ -75,6 +84,8 @@ class Rdb_bitlsm_registry {
     std::shared_ptr<bit_lsm::SABIFactory> factory;
     // M5: refresh worker + stats cache; empty until estimator_attach.
     std::unique_ptr<bit_lsm::CardinalityEstimator> estimator;
+    // A BITLSM_INDEX_INFO record exists for this CF (set at DB open).
+    bool expected = false;
   };
   mutable std::mutex m_mutex;
   std::unordered_map<std::string, Entry> m_map;
@@ -97,10 +108,13 @@ class Rdb_bitlsm_stats_listener : public rocksdb::EventListener {
 // Per-CF UDI factory installed on every data CF's BlockBasedTableOptions. Knows
 // only its cf_name.
 //
-// Build path: dispatches to the bound SABIFactory via the registry. Unbound ->
-// null builder -> RocksDB skips the UDI wrapper (zero per-row cost on
-// non-bitlsm / not-yet-bound CFs). Building presupposes an open table, so the
-// CF is always bound by then.
+// Build path: dispatches to the bound SABIFactory via the registry. A CF the
+// registry knows nothing about is an ordinary non-bitlsm CF -> null builder ->
+// RocksDB skips the UDI wrapper (zero per-row cost). A CF that HAS a persisted
+// descriptor but no factory is a broken invariant, not a fast path: the build
+// fails with a non-OK Status rather than quietly finalizing an SST without its
+// SABI block. Rdb_ddl_manager::populate binds every descriptor at DB open, so
+// the binding no longer waits for someone to open the table.
 //
 // Read path: registry-independent. v5 SABI blobs are self-describing (the
 // directory persists attr roles), so a reader opens an SST with no schema
@@ -115,6 +129,18 @@ class Rdb_bitlsm_udi_factory : public rocksdb::UserDefinedIndexFactory {
       : m_cf_name(std::move(cf_name)) {}
   const char *Name() const override { return "bitlsm.sabi"; }
   rocksdb::UserDefinedIndexBuilder *NewBuilder() const override;
+  // RocksDB calls this overload at SST build. Three states:
+  //   no entry           -> null builder + OK (ordinary non-bitlsm CF)
+  //   entry with factory -> build SABI
+  //   entry, no factory  -> non-OK; the SST build fails instead of silently
+  //                         producing a SABI-less file. Unreachable once
+  //                         Rdb_ddl_manager::populate has bound every CF with a
+  //                         persisted descriptor -- an invariant check, not a
+  //                         policy knob.
+  rocksdb::Status NewBuilder(
+      const rocksdb::UserDefinedIndexOption &option,
+      std::unique_ptr<rocksdb::UserDefinedIndexBuilder> &builder)
+      const override;
   std::unique_ptr<rocksdb::UserDefinedIndexReader> NewReader(
       rocksdb::Slice &index_block) const override;
   // RocksDB calls this overload at SST open; it validates the v5 footer then
@@ -126,5 +152,13 @@ class Rdb_bitlsm_udi_factory : public rocksdb::UserDefinedIndexFactory {
  private:
   std::string m_cf_name;
 };
+
+// Rebuild a SABIFactory from a persisted descriptor blob (rdb_bitlsm_descriptor
+// .h) and bind it to cf_name. Called from Rdb_ddl_manager::populate at DB open,
+// before auto compactions are re-enabled, so every SST written afterwards
+// carries its SABI block whether or not the table has been opened. Returns
+// false on an undecodable blob or a D5 schema conflict on that CF.
+bool rdb_bitlsm_bind_persisted(const std::string &cf_name,
+                               const std::string &blob);
 
 }  // namespace myrocks

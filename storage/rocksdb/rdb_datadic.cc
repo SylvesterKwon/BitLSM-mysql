@@ -56,6 +56,7 @@
 #include "./ha_rocksdb.h"
 #include "./ha_rocksdb_proto.h"
 #include "./rdb_bitlsm.h"
+#include "./rdb_bitlsm_descriptor.h"
 #include "./rdb_cf_manager.h"
 #include "./rdb_utils.h"
 
@@ -3985,6 +3986,50 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
     return HA_ERR_UNSUPPORTED;
   }
 
+  // (3b) Persist the build descriptor next to the data, keyed by the PK's
+  // GL_INDEX_ID. Rdb_ddl_manager::populate replays it at DB open, before auto
+  // compactions are re-enabled, so the SST build path stops depending on a
+  // table being open. Write-through on bind is sufficient: a SABI-less SST can
+  // only exist if rows were written, writing rows requires an open table, and
+  // an open table runs exactly this code.
+  //
+  // Already persisted -> compare bytes. A mismatch means the value-blob layout
+  // this table produces today differs from the one the persisted bitmaps were
+  // built with; continuing would mis-extract the existing rows, so fail the
+  // open instead.
+  {
+    Rdb_bitlsm_descriptor desc;
+    desc.schema = schema;
+    desc.plan = *plan;
+    const std::string blob = rdb_bitlsm_serialize_descriptor(desc);
+
+    const GL_INDEX_ID pk_gl_index_id = pk_def->get_gl_index_id();
+    Rdb_dict_manager *const dict =
+        rdb_get_dict_manager()->get_dict_manager_selector_non_const(
+            pk_gl_index_id.cf_id);
+    std::string stored;
+    if (dict->get_bitlsm_descriptor(pk_gl_index_id, &stored)) {
+      if (stored != blob) {
+        LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                        "BITLSM_INDEX: persisted build descriptor for column "
+                        "family '%s' does not match the current table layout "
+                        "(unsupported schema change on a bitlsm table)",
+                        pk_cf_name.c_str());
+        return HA_ERR_UNSUPPORTED;
+      }
+    } else {
+      rocksdb::WriteBatch batch = Rdb_dict_manager::begin();
+      dict->put_bitlsm_descriptor(batch, pk_gl_index_id, blob);
+      if (dict->commit(batch) != HA_EXIT_SUCCESS) {
+        LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                        "BITLSM_INDEX: failed to persist the build descriptor "
+                        "for column family '%s'",
+                        pk_cf_name.c_str());
+        return HA_ERR_INTERNAL_ERROR;
+      }
+    }
+  }
+
   // (4) M5: attach the cardinality estimator to the bound CF (idempotent
   // across reopen -- a running worker is kept). Non-blocking: the ctor spawns
   // the refresh worker and primes the initial build asynchronously. `schema`
@@ -5117,6 +5162,46 @@ bool Rdb_ddl_manager::populate(uint32_t validate_tables, bool lock) {
                         tdef->full_tablename().c_str());
         return true;
       }
+      // Re-establish the BitLSM SABI build binding for this CF before auto
+      // compactions are re-enabled (ha_rocksdb.cc, right after ddl_manager
+      // init). Descriptors are keyed by the PK's GL_INDEX_ID because SABI is
+      // embedded in the PK data CF's row values.
+      if (index_info.m_index_type == Rdb_key_def::INDEX_TYPE_PRIMARY ||
+          index_info.m_index_type == Rdb_key_def::INDEX_TYPE_HIDDEN_PRIMARY) {
+        std::string bitlsm_blob;
+        if (dict_user_table->get_bitlsm_descriptor(gl_index_id, &bitlsm_blob)) {
+          rocksdb::ColumnFamilyHandle *const cfh =
+              m_cf_manager->get_cf(gl_index_id.cf_id);
+          if (cfh == nullptr) {
+            // No handle means no CF to write to either, so nothing here can
+            // lose its SABI blocks. Log and carry on.
+            // NO_LINT_DEBUG
+            LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                            "BITLSM_INDEX: no column family handle for cf_id "
+                            "%u (index (%u,%u), table %s); build binding not "
+                            "restored",
+                            gl_index_id.cf_id, gl_index_id.cf_id,
+                            gl_index_id.index_id,
+                            tdef->full_tablename().c_str());
+          } else if (!rdb_bitlsm_bind_persisted(cfh->GetName(), bitlsm_blob)) {
+            // Undecodable blob, or a D5 schema conflict on this CF. Do NOT
+            // fail startup: that would leave no way to even DROP the offending
+            // table. Mark the CF instead -- expects_sabi() with no factory
+            // makes the build path fail this CF's flushes and compactions
+            // loudly, so a SABI-less SST still cannot appear.
+            Rdb_bitlsm_registry::instance().mark_expected(cfh->GetName());
+            // NO_LINT_DEBUG
+            LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                            "BITLSM_INDEX: could not restore the build binding "
+                            "for index (%u,%u), table %s; SST builds on column "
+                            "family '%s' will fail until this is resolved",
+                            gl_index_id.cf_id, gl_index_id.index_id,
+                            tdef->full_tablename().c_str(),
+                            cfh->GetName().c_str());
+          }
+        }
+      }
+
       // check if the cf is system cf
       uint cur_max_index_id = gl_index_id.cf_id == system_cf_id
                                   ? max_dd_index_id_in_dict
@@ -5997,6 +6082,48 @@ void Rdb_dict_manager::add_or_update_index_cf_mapping(
   batch.Put(m_system_cfh, key_writer.to_slice(), value_writer.to_slice());
 }
 
+void Rdb_dict_manager::put_bitlsm_descriptor(rocksdb::WriteBatch &batch,
+                                             const GL_INDEX_ID &gl_index_id,
+                                             const std::string &blob) const {
+  Rdb_buf_writer<Rdb_key_def::INDEX_NUMBER_SIZE * 3> key_writer;
+  dump_index_id(&key_writer, Rdb_key_def::BITLSM_INDEX_INFO, gl_index_id);
+
+  // The blob is variable-length (one walk entry per value field), so it does
+  // not fit the fixed-size Rdb_buf_writer the other records use.
+  std::string value;
+  value.reserve(Rdb_key_def::VERSION_SIZE + blob.size());
+  uchar version_buf[Rdb_key_def::VERSION_SIZE];
+  rdb_netbuf_store_uint16(version_buf, Rdb_key_def::BITLSM_INDEX_INFO_VERSION);
+  value.append(reinterpret_cast<const char *>(version_buf),
+               Rdb_key_def::VERSION_SIZE);
+  value.append(blob);
+
+  batch.Put(m_system_cfh, key_writer.to_slice(), rocksdb::Slice(value));
+}
+
+bool Rdb_dict_manager::get_bitlsm_descriptor(const GL_INDEX_ID &gl_index_id,
+                                             std::string *const blob) const {
+  Rdb_buf_writer<Rdb_key_def::INDEX_NUMBER_SIZE * 3> key_writer;
+  dump_index_id(&key_writer, Rdb_key_def::BITLSM_INDEX_INFO, gl_index_id);
+
+  std::string value;
+  const rocksdb::Status status = get_value(key_writer.to_slice(), &value);
+  if (!status.ok() || value.size() < Rdb_key_def::VERSION_SIZE) return false;
+
+  const uint16 version =
+      rdb_netbuf_to_uint16(reinterpret_cast<const uchar *>(value.data()));
+  if (version != Rdb_key_def::BITLSM_INDEX_INFO_VERSION) {
+    // NO_LINT_DEBUG
+    LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                    "BITLSM_INDEX: unexpected descriptor dictionary version %u "
+                    "for index (%u,%u)",
+                    version, gl_index_id.cf_id, gl_index_id.index_id);
+    return false;
+  }
+  blob->assign(value, Rdb_key_def::VERSION_SIZE, std::string::npos);
+  return true;
+}
+
 void Rdb_dict_manager::add_cf_flags(rocksdb::WriteBatch &batch, uint32_t cf_id,
                                     uint32_t cf_flags) const {
   Rdb_buf_writer<Rdb_key_def::INDEX_NUMBER_SIZE * 2> key_writer;
@@ -6028,6 +6155,7 @@ void Rdb_dict_manager::delete_index_info(rocksdb::WriteBatch &batch,
   delete_with_prefix(batch, Rdb_key_def::INDEX_INFO, gl_index_id);
   delete_with_prefix(batch, Rdb_key_def::INDEX_STATISTICS, gl_index_id);
   delete_with_prefix(batch, Rdb_key_def::AUTO_INC, gl_index_id);
+  delete_with_prefix(batch, Rdb_key_def::BITLSM_INDEX_INFO, gl_index_id);
 }
 
 bool Rdb_dict_manager::get_index_info(

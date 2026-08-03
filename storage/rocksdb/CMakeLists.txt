@@ -199,6 +199,7 @@ SET(ROCKSDB_SE_SOURCES
   rdb_vector_db.cc rdb_vector_db.h
   rdb_bitlsm_smoke.cc
   rdb_bitlsm.cc rdb_bitlsm.h
+  rdb_bitlsm_descriptor.cc rdb_bitlsm_descriptor.h
   rdb_bitlsm_query.cc rdb_bitlsm_query.h
   rdb_bitlsm_read.cc rdb_bitlsm_read.h
   rdb_bulk_load.cc rdb_bulk_load.h
@@ -349,6 +350,21 @@ IF (NOT HAVE_EXTERNAL_ROCKSDB)
   TARGET_LINK_LIBRARIES(rdb_bitlsm_decoder_test pthread)
 ENDIF()
 
+# Standalone gtest for the persisted BitLSM build descriptor. Same rationale as
+# the decoder test above: rdb_bitlsm_descriptor.h pulls in no server or RocksDB
+# headers, so the serialization can be exercised without linking the engine.
+IF (NOT HAVE_EXTERNAL_ROCKSDB)
+  ADD_EXECUTABLE(rdb_bitlsm_descriptor_test
+    rdb_bitlsm_descriptor_test.cc
+    rdb_bitlsm_descriptor.cc
+    ${GTEST_FUSED_DIR}/gtest/gtest-all.cc
+    ${GTEST_FUSED_DIR}/gtest/gtest_main.cc)
+  TARGET_INCLUDE_DIRECTORIES(rdb_bitlsm_descriptor_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+  TARGET_COMPILE_OPTIONS(rdb_bitlsm_descriptor_test PRIVATE -w)
+  TARGET_LINK_LIBRARIES(rdb_bitlsm_descriptor_test pthread)
+ENDIF()
+
 IF (NOT HAVE_EXTERNAL_ROCKSDB)
   # TODO: read this file list from src.mk:TOOL_SOURCES
   ADD_LIBRARY(rocksdb_tool
@@ -376,7 +392,7 @@ ENDIF()
 # the RocksDB-touching targets to C++20; the rest of the server stays C++17.
 # -std=c++20 is appended after the global -std=c++17 and gcc honors the last one.
 FOREACH(rdb_cxx20_tgt rocksdb_sources rocksdb rocksdb_se rocksdb_tool sst_dump ldb
-                      rdb_bitlsm_decoder_test)
+                      rdb_bitlsm_decoder_test rdb_bitlsm_descriptor_test)
   IF(TARGET ${rdb_cxx20_tgt})
     TARGET_COMPILE_OPTIONS(${rdb_cxx20_tgt} PRIVATE -std=c++20)
   ENDIF()
