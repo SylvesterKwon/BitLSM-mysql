@@ -496,6 +496,11 @@ class Rdb_key_def {
     DROPPED_CF = 10,
     MAX_DD_INDEX_ID = 11,
     SERVER_VERSION = 12,
+    // BitLSM SABI build descriptor, keyed by the PK's GL_INDEX_ID. Lets the SST
+    // build path bind a CF at DB open (Rdb_ddl_manager::populate) instead of at
+    // first table open, so a compaction that runs before anyone opens the table
+    // can no longer finalize SSTs without their SABI blocks.
+    BITLSM_INDEX_INFO = 13,
     END_DICT_INDEX_ID = 255,
     MIN_DD_INDEX_ID = 256,
   };
@@ -513,6 +518,7 @@ class Rdb_key_def {
     AUTO_INCREMENT_VERSION = 1,
     DROPPED_CF_VERSION = 1,
     SERVER_VERSION_VERSION = 1,
+    BITLSM_INDEX_INFO_VERSION = 1,
     // Version for index stats is stored in IndexStats struct
   };
 
@@ -1753,6 +1759,16 @@ class Rdb_dict_manager : public Ensure_initialized {
                          const GL_INDEX_ID &index_id) const;
   bool get_index_info(const GL_INDEX_ID &gl_index_id,
                       struct Rdb_index_info *const index_info) const;
+
+  /* BitLSM SABI build descriptor (see rdb_bitlsm_descriptor.h). The stored
+     value is [dict version uint16][opaque descriptor blob]; this layer never
+     parses the blob. Deleted together with the rest of the index metadata by
+     delete_index_info(). */
+  void put_bitlsm_descriptor(rocksdb::WriteBatch &batch,
+                             const GL_INDEX_ID &gl_index_id,
+                             const std::string &blob) const;
+  bool get_bitlsm_descriptor(const GL_INDEX_ID &gl_index_id,
+                             std::string *const blob) const;
 
   /* CF id => CF flags */
   void add_cf_flags(rocksdb::WriteBatch &batch, uint cf_id,

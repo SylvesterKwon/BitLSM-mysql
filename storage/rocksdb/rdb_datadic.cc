@@ -5997,6 +5997,48 @@ void Rdb_dict_manager::add_or_update_index_cf_mapping(
   batch.Put(m_system_cfh, key_writer.to_slice(), value_writer.to_slice());
 }
 
+void Rdb_dict_manager::put_bitlsm_descriptor(rocksdb::WriteBatch &batch,
+                                             const GL_INDEX_ID &gl_index_id,
+                                             const std::string &blob) const {
+  Rdb_buf_writer<Rdb_key_def::INDEX_NUMBER_SIZE * 3> key_writer;
+  dump_index_id(&key_writer, Rdb_key_def::BITLSM_INDEX_INFO, gl_index_id);
+
+  // The blob is variable-length (one walk entry per value field), so it does
+  // not fit the fixed-size Rdb_buf_writer the other records use.
+  std::string value;
+  value.reserve(Rdb_key_def::VERSION_SIZE + blob.size());
+  uchar version_buf[Rdb_key_def::VERSION_SIZE];
+  rdb_netbuf_store_uint16(version_buf, Rdb_key_def::BITLSM_INDEX_INFO_VERSION);
+  value.append(reinterpret_cast<const char *>(version_buf),
+               Rdb_key_def::VERSION_SIZE);
+  value.append(blob);
+
+  batch.Put(m_system_cfh, key_writer.to_slice(), rocksdb::Slice(value));
+}
+
+bool Rdb_dict_manager::get_bitlsm_descriptor(const GL_INDEX_ID &gl_index_id,
+                                             std::string *const blob) const {
+  Rdb_buf_writer<Rdb_key_def::INDEX_NUMBER_SIZE * 3> key_writer;
+  dump_index_id(&key_writer, Rdb_key_def::BITLSM_INDEX_INFO, gl_index_id);
+
+  std::string value;
+  const rocksdb::Status status = get_value(key_writer.to_slice(), &value);
+  if (!status.ok() || value.size() < Rdb_key_def::VERSION_SIZE) return false;
+
+  const uint16 version =
+      rdb_netbuf_to_uint16(reinterpret_cast<const uchar *>(value.data()));
+  if (version != Rdb_key_def::BITLSM_INDEX_INFO_VERSION) {
+    // NO_LINT_DEBUG
+    LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                    "BITLSM_INDEX: unexpected descriptor dictionary version %u "
+                    "for index (%u,%u)",
+                    version, gl_index_id.cf_id, gl_index_id.index_id);
+    return false;
+  }
+  blob->assign(value, Rdb_key_def::VERSION_SIZE, std::string::npos);
+  return true;
+}
+
 void Rdb_dict_manager::add_cf_flags(rocksdb::WriteBatch &batch, uint32_t cf_id,
                                     uint32_t cf_flags) const {
   Rdb_buf_writer<Rdb_key_def::INDEX_NUMBER_SIZE * 2> key_writer;
@@ -6028,6 +6070,7 @@ void Rdb_dict_manager::delete_index_info(rocksdb::WriteBatch &batch,
   delete_with_prefix(batch, Rdb_key_def::INDEX_INFO, gl_index_id);
   delete_with_prefix(batch, Rdb_key_def::INDEX_STATISTICS, gl_index_id);
   delete_with_prefix(batch, Rdb_key_def::AUTO_INC, gl_index_id);
+  delete_with_prefix(batch, Rdb_key_def::BITLSM_INDEX_INFO, gl_index_id);
 }
 
 bool Rdb_dict_manager::get_index_info(
