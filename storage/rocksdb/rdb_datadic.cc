@@ -56,6 +56,7 @@
 #include "./ha_rocksdb.h"
 #include "./ha_rocksdb_proto.h"
 #include "./rdb_bitlsm.h"
+#include "./rdb_bitlsm_descriptor.h"
 #include "./rdb_cf_manager.h"
 #include "./rdb_utils.h"
 
@@ -3983,6 +3984,50 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
                     "bitlsm schema (only one bitlsm table per CF is supported)",
                     pk_cf_name.c_str());
     return HA_ERR_UNSUPPORTED;
+  }
+
+  // (3b) Persist the build descriptor next to the data, keyed by the PK's
+  // GL_INDEX_ID. Rdb_ddl_manager::populate replays it at DB open, before auto
+  // compactions are re-enabled, so the SST build path stops depending on a
+  // table being open. Write-through on bind is sufficient: a SABI-less SST can
+  // only exist if rows were written, writing rows requires an open table, and
+  // an open table runs exactly this code.
+  //
+  // Already persisted -> compare bytes. A mismatch means the value-blob layout
+  // this table produces today differs from the one the persisted bitmaps were
+  // built with; continuing would mis-extract the existing rows, so fail the
+  // open instead.
+  {
+    Rdb_bitlsm_descriptor desc;
+    desc.schema = schema;
+    desc.plan = *plan;
+    const std::string blob = rdb_bitlsm_serialize_descriptor(desc);
+
+    const GL_INDEX_ID pk_gl_index_id = pk_def->get_gl_index_id();
+    Rdb_dict_manager *const dict =
+        rdb_get_dict_manager()->get_dict_manager_selector_non_const(
+            pk_gl_index_id.cf_id);
+    std::string stored;
+    if (dict->get_bitlsm_descriptor(pk_gl_index_id, &stored)) {
+      if (stored != blob) {
+        LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                        "BITLSM_INDEX: persisted build descriptor for column "
+                        "family '%s' does not match the current table layout "
+                        "(unsupported schema change on a bitlsm table)",
+                        pk_cf_name.c_str());
+        return HA_ERR_UNSUPPORTED;
+      }
+    } else {
+      rocksdb::WriteBatch batch = Rdb_dict_manager::begin();
+      dict->put_bitlsm_descriptor(batch, pk_gl_index_id, blob);
+      if (dict->commit(batch) != HA_EXIT_SUCCESS) {
+        LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                        "BITLSM_INDEX: failed to persist the build descriptor "
+                        "for column family '%s'",
+                        pk_cf_name.c_str());
+        return HA_ERR_INTERNAL_ERROR;
+      }
+    }
   }
 
   // (4) M5: attach the cardinality estimator to the bound CF (idempotent
