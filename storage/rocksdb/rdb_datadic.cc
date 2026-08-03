@@ -5162,6 +5162,46 @@ bool Rdb_ddl_manager::populate(uint32_t validate_tables, bool lock) {
                         tdef->full_tablename().c_str());
         return true;
       }
+      // Re-establish the BitLSM SABI build binding for this CF before auto
+      // compactions are re-enabled (ha_rocksdb.cc, right after ddl_manager
+      // init). Descriptors are keyed by the PK's GL_INDEX_ID because SABI is
+      // embedded in the PK data CF's row values.
+      if (index_info.m_index_type == Rdb_key_def::INDEX_TYPE_PRIMARY ||
+          index_info.m_index_type == Rdb_key_def::INDEX_TYPE_HIDDEN_PRIMARY) {
+        std::string bitlsm_blob;
+        if (dict_user_table->get_bitlsm_descriptor(gl_index_id, &bitlsm_blob)) {
+          rocksdb::ColumnFamilyHandle *const cfh =
+              m_cf_manager->get_cf(gl_index_id.cf_id);
+          if (cfh == nullptr) {
+            // No handle means no CF to write to either, so nothing here can
+            // lose its SABI blocks. Log and carry on.
+            // NO_LINT_DEBUG
+            LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                            "BITLSM_INDEX: no column family handle for cf_id "
+                            "%u (index (%u,%u), table %s); build binding not "
+                            "restored",
+                            gl_index_id.cf_id, gl_index_id.cf_id,
+                            gl_index_id.index_id,
+                            tdef->full_tablename().c_str());
+          } else if (!rdb_bitlsm_bind_persisted(cfh->GetName(), bitlsm_blob)) {
+            // Undecodable blob, or a D5 schema conflict on this CF. Do NOT
+            // fail startup: that would leave no way to even DROP the offending
+            // table. Mark the CF instead -- expects_sabi() with no factory
+            // makes the build path fail this CF's flushes and compactions
+            // loudly, so a SABI-less SST still cannot appear.
+            Rdb_bitlsm_registry::instance().mark_expected(cfh->GetName());
+            // NO_LINT_DEBUG
+            LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
+                            "BITLSM_INDEX: could not restore the build binding "
+                            "for index (%u,%u), table %s; SST builds on column "
+                            "family '%s' will fail until this is resolved",
+                            gl_index_id.cf_id, gl_index_id.index_id,
+                            tdef->full_tablename().c_str(),
+                            cfh->GetName().c_str());
+          }
+        }
+      }
+
       // check if the cf is system cf
       uint cur_max_index_id = gl_index_id.cf_id == system_cf_id
                                   ? max_dd_index_id_in_dict

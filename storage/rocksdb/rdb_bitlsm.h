@@ -68,6 +68,15 @@ class Rdb_bitlsm_registry {
   // surface rather than swallow.
   size_t estimator_refresh_all();
 
+  // Marks cf_name as "a persisted SABI descriptor exists for this CF". Set at
+  // DB open right after a successful bind, and also when a descriptor fails to
+  // load, so the build path can tell an ordinary CF (no entry -> skip the UDI
+  // wrapper) from a bitlsm CF whose builder is missing (-> fail the SST build).
+  // Call AFTER bind(): this creates the entry if absent, and an entry with
+  // empty roles would make a later bind() look like a D5 schema conflict.
+  void mark_expected(const std::string &cf_name);
+  bool expects_sabi(const std::string &cf_name) const;
+
  private:
   Rdb_bitlsm_registry() = default;
   struct Entry {
@@ -75,6 +84,8 @@ class Rdb_bitlsm_registry {
     std::shared_ptr<bit_lsm::SABIFactory> factory;
     // M5: refresh worker + stats cache; empty until estimator_attach.
     std::unique_ptr<bit_lsm::CardinalityEstimator> estimator;
+    // A BITLSM_INDEX_INFO record exists for this CF (set at DB open).
+    bool expected = false;
   };
   mutable std::mutex m_mutex;
   std::unordered_map<std::string, Entry> m_map;
@@ -126,5 +137,13 @@ class Rdb_bitlsm_udi_factory : public rocksdb::UserDefinedIndexFactory {
  private:
   std::string m_cf_name;
 };
+
+// Rebuild a SABIFactory from a persisted descriptor blob (rdb_bitlsm_descriptor
+// .h) and bind it to cf_name. Called from Rdb_ddl_manager::populate at DB open,
+// before auto compactions are re-enabled, so every SST written afterwards
+// carries its SABI block whether or not the table has been opened. Returns
+// false on an undecodable blob or a D5 schema conflict on that CF.
+bool rdb_bitlsm_bind_persisted(const std::string &cf_name,
+                               const std::string &blob);
 
 }  // namespace myrocks

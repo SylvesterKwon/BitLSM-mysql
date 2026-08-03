@@ -1,6 +1,8 @@
 /* Copyright (c) Meta Platforms, Inc. and affiliates. */
 #include "./rdb_bitlsm.h"
 
+#include "./rdb_bitlsm_descriptor.h"
+
 /* rocksdb-internal headers, needed only for the estimator_attach casts (the
    same DBImpl / ColumnFamilyHandleImpl casts BitLSMIterator and the standalone
    BitLSM ctor already exercise). Contained to this TU. */
@@ -116,6 +118,36 @@ std::shared_ptr<bit_lsm::SABIFactory> Rdb_bitlsm_registry::get(
   std::lock_guard<std::mutex> lk(m_mutex);
   auto it = m_map.find(cf_name);
   return it == m_map.end() ? nullptr : it->second.factory;
+}
+
+void Rdb_bitlsm_registry::mark_expected(const std::string &cf_name) {
+  std::lock_guard<std::mutex> lk(m_mutex);
+  m_map[cf_name].expected = true;
+}
+
+bool Rdb_bitlsm_registry::expects_sabi(const std::string &cf_name) const {
+  std::lock_guard<std::mutex> lk(m_mutex);
+  auto it = m_map.find(cf_name);
+  return it != m_map.end() && it->second.expected;
+}
+
+bool rdb_bitlsm_bind_persisted(const std::string &cf_name,
+                               const std::string &blob) {
+  Rdb_bitlsm_descriptor desc;
+  if (!rdb_bitlsm_deserialize_descriptor(blob, &desc)) return false;
+
+  auto plan =
+      std::make_shared<const Rdb_bitlsm_attr_plan>(std::move(desc.plan));
+  auto factory = std::make_shared<bit_lsm::SABIFactory>(
+      desc.schema,
+      [plan] { return std::make_unique<Rdb_bitlsm_extractor>(plan); });
+
+  auto &registry = Rdb_bitlsm_registry::instance();
+  if (!registry.bind(cf_name, desc.schema.roles, std::move(factory))) {
+    return false;
+  }
+  registry.mark_expected(cf_name);
+  return true;
 }
 
 rocksdb::UserDefinedIndexBuilder *Rdb_bitlsm_udi_factory::NewBuilder() const {
