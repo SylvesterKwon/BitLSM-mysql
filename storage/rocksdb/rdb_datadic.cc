@@ -5186,7 +5186,7 @@ bool Rdb_ddl_manager::populate(uint32_t validate_tables, bool lock) {
           } else if (!rdb_bitlsm_bind_persisted(cfh->GetName(), bitlsm_blob)) {
             // Undecodable blob, or a D5 schema conflict on this CF. Do NOT
             // fail startup: that would leave no way to even DROP the offending
-            // table. Mark the CF instead -- expects_sabi() with no factory
+            // table. Mark the CF instead -- "expected" with no factory
             // makes the build path fail this CF's flushes and compactions
             // loudly, so a SABI-less SST still cannot appear.
             Rdb_bitlsm_registry::instance().mark_expected(cfh->GetName());

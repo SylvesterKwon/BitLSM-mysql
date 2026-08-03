@@ -122,13 +122,19 @@ std::shared_ptr<bit_lsm::SABIFactory> Rdb_bitlsm_registry::get(
 
 void Rdb_bitlsm_registry::mark_expected(const std::string &cf_name) {
   std::lock_guard<std::mutex> lk(m_mutex);
-  m_map[cf_name].expected = true;
+  m_expected.insert(cf_name);
 }
 
-bool Rdb_bitlsm_registry::expects_sabi(const std::string &cf_name) const {
+std::shared_ptr<bit_lsm::SABIFactory> Rdb_bitlsm_registry::get_for_build(
+    const std::string &cf_name, bool *expected) const {
   std::lock_guard<std::mutex> lk(m_mutex);
   auto it = m_map.find(cf_name);
-  return it != m_map.end() && it->second.expected;
+  if (it != m_map.end() && it->second.factory) {
+    *expected = true;
+    return it->second.factory;
+  }
+  *expected = m_expected.count(cf_name) != 0;
+  return nullptr;
 }
 
 bool rdb_bitlsm_bind_persisted(const std::string &cf_name,
@@ -159,13 +165,13 @@ rocksdb::UserDefinedIndexBuilder *Rdb_bitlsm_udi_factory::NewBuilder() const {
 rocksdb::Status Rdb_bitlsm_udi_factory::NewBuilder(
     const rocksdb::UserDefinedIndexOption & /*option*/,
     std::unique_ptr<rocksdb::UserDefinedIndexBuilder> &builder) const {
-  auto &registry = Rdb_bitlsm_registry::instance();
-  auto f = registry.get(m_cf_name);
+  bool expected = false;
+  auto f = Rdb_bitlsm_registry::instance().get_for_build(m_cf_name, &expected);
   if (f) {
     builder.reset(f->NewBuilder());
     return rocksdb::Status::OK();
   }
-  if (registry.expects_sabi(m_cf_name)) {
+  if (expected) {
     // A descriptor for this CF exists in the data dictionary but its factory is
     // missing. Writing the SST anyway would drop the bitmaps with no trace, so
     // fail the flush/compaction instead.
