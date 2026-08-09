@@ -48,6 +48,7 @@ for f in \
   src/include/sabi_table_iterator.cpp \
   src/include/bit_lsm_query.cpp \
   src/include/bit_lsm_iterator.cpp \
+  src/include/bit_lsm_shadow_check.cpp \
   src/include/bit_lsm_merging_iterator.cpp \
   src/include/bit_lsm_level_iterator.cpp \
   src/include/bit_lsm_memtable_iterator.cpp \
