@@ -88,6 +88,9 @@
 #include "util/coding_lean.h"
 #include "util/stop_watch.h"
 
+/* BitLSM includes */
+#include "block_prefetch_queue.h"  // bit_lsm::EnableRocksDbIOUring
+
 /* MyRocks includes */
 #include "./clone/client.h"
 #include "./clone/common.h"
@@ -944,10 +947,9 @@ std::atomic<uint64_t> rocksdb_vectors_rows_read(0);
 /* count of centroids lists that vectors were read from */
 std::atomic<uint64_t> rocksdb_vectors_centroid_lists_read(0);
 
-// RocksDB contracts
-extern "C" {
-bool RocksDbIOUringEnable() { return rocksdb_use_io_uring; }
-}
+// RocksDB's weak RocksDbIOUringEnable() contract is defined by BitLSM
+// (block_prefetch_queue.cpp), which needs the same switch for its own
+// prefetch queue. rocksdb_use_io_uring feeds it in rocksdb_init_internal.
 
 static int rocksdb_trace_block_cache_access(
     THD *const thd MY_ATTRIBUTE((__unused__)),
@@ -2237,8 +2239,9 @@ static MYSQL_SYSVAR_LONGLONG(sim_cache_size, rocksdb_sim_cache_size,
                              /* Block size */ 0);
 
 static MYSQL_SYSVAR_BOOL(use_io_uring, rocksdb_use_io_uring,
-                         PLUGIN_VAR_RQCMDARG, "Use io_uring for RocksDB",
-                         nullptr, nullptr, rocksdb_use_io_uring);
+                         PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+                         "Use io_uring for RocksDB", nullptr, nullptr,
+                         rocksdb_use_io_uring);
 
 static MYSQL_SYSVAR_BOOL(
     use_hyper_clock_cache, rocksdb_use_hyper_clock_cache,
@@ -9167,6 +9170,13 @@ static int rocksdb_init_internal(void *const p) {
                     "RocksDB: Can't enable both use_direct_reads "
                     "and allow_mmap_reads\n");
     DBUG_RETURN(HA_EXIT_FAILURE);
+  }
+
+  // BitLSM's io_uring opt-in is one-way, so make the choice here, before any
+  // file is opened -- a file keeps the mode it was opened with. That is also
+  // why use_io_uring is read-only: there is no way back once the server is up.
+  if (rocksdb_use_io_uring) {
+    bit_lsm::EnableRocksDbIOUring();
   }
 
   // Check whether the filesystem backing rocksdb_datadir allows O_DIRECT
