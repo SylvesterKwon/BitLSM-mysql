@@ -58,8 +58,10 @@ SELECT VARIABLE_VALUE INTO @m1 FROM performance_schema.global_status
 # Bin boundaries move with rho, row count and SST layout, so a tight bound
 # would be a maintenance trap. Half the table is far beyond noise for a
 # one-in-fifty-five-years window, and still fails loudly at zero pruning
-# (candidates == 20000).
---let $assert_text = a selective DATE range prunes the candidate set ($cand of 20000)
+# (candidates == 20000). The count itself stays out of the text for the same
+# reason: echoing it pins the exact bin layout into the .result, so every
+# binning change fails the test with a diff that carries no signal.
+--let $assert_text = a selective DATE range prunes the candidate set (under 10000 of 20000)
 --let $assert_cond = $cand < 10000
 --source include/assert.inc
 

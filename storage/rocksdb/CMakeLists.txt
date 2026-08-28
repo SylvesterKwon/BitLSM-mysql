@@ -167,7 +167,6 @@ INCLUDE_DIRECTORIES(
   ${ROCKSDB_ROOT}/third-party/gtest-1.8.1/fused-src
   ${CMAKE_SOURCE_DIR}/rocksdb/src/include
   ${croaring_SOURCE_DIR}/cpp/roaring
-  ${CMAKE_SOURCE_DIR}/rocksdb/third_party/folly-tdigest/include
 )
 
 SET(ROCKSDB_SE_SOURCES

@@ -40,21 +40,20 @@ rm $MKFILE
 # BitLSM bitmap-layer sources, compiled into the plugin against the single
 # rocksdb. This list is owned by MyRocks (BitLSM stays free of consumer-specific
 # files); update it when bumping the BitLSM submodule. roaring comes via
-# FetchContent (see CMakeLists); folly-tdigest is compiled from vendored source.
+# FetchContent (see CMakeLists).
 for f in \
   src/include/sabi_factory.cpp \
   src/include/sabi_builder.cpp \
   src/include/sabi_reader.cpp \
   src/include/sabi_table_iterator.cpp \
+  src/include/block_prefetch_queue.cpp \
   src/include/bit_lsm_query.cpp \
   src/include/bit_lsm_iterator.cpp \
   src/include/bit_lsm_shadow_check.cpp \
   src/include/bit_lsm_merging_iterator.cpp \
   src/include/bit_lsm_level_iterator.cpp \
   src/include/bit_lsm_memtable_iterator.cpp \
-  src/include/bit_lsm_estimator.cpp \
-  third_party/folly-tdigest/src/TDigest.cpp \
-  third_party/folly-tdigest/src/DoubleRadixSort.cpp
+  src/include/bit_lsm_estimator.cpp
 do
   echo ../../rocksdb/$f
 done
