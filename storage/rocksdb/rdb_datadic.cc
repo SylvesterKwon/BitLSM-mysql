@@ -3720,10 +3720,12 @@ uint Rdb_key_def::setup_vector_index(const TABLE &tbl,
                              m_vector_index);
 }
 
-// Derive the extractor encoding AND the SABI role for a BITLSM attribute column
-// from its Field type. Single source of truth so the build-time role (which
-// picks ORDERED vs UNORDERED binning) and the extract-time encoding can never
-// disagree (a mismatch would mis-bin rows).
+// Derive the extractor encoding AND the SABI index type for a BITLSM attribute
+// column from its Field type. Single source of truth so the build-time index
+// type (which picks kRange equal-mass vs kEquality frequency-balanced binning)
+// and the extract-time encoding can never disagree (a mismatch would mis-bin
+// rows). Binary columns take their index type from kBinaryIndexType, the same
+// constant rdb_bitlsm_query.cc::field_to_attr reads.
 //
 // M3a-4 SCOPE: only the encodings below are implemented. DATE/NEWDATE packs
 // into a 3-byte order-monotone okey (Enc::DATE3, below). DATETIME/DATETIME2/
@@ -3734,7 +3736,7 @@ uint Rdb_key_def::setup_vector_index(const TABLE &tbl,
 // type.
 static bool bitlsm_derive_enc(const Field *field,
                               Rdb_bitlsm_attr_plan::Enc *enc,
-                              bit_lsm::AttrRole *role) {
+                              bit_lsm::IndexType *index_type) {
   using Enc = Rdb_bitlsm_attr_plan::Enc;
   switch (field->real_type()) {
     case MYSQL_TYPE_TINY:
@@ -3743,24 +3745,24 @@ static bool bitlsm_derive_enc(const Field *field,
     case MYSQL_TYPE_LONG:
     case MYSQL_TYPE_LONGLONG:
       *enc = field->is_unsigned() ? Enc::INT_UNSIGNED : Enc::INT_SIGNED;
-      *role = bit_lsm::ORDERED;
+      *index_type = bit_lsm::IndexType::kRange;
       return true;
     case MYSQL_TYPE_FLOAT:
       *enc = Enc::FLOAT32;
-      *role = bit_lsm::ORDERED;
+      *index_type = bit_lsm::IndexType::kRange;
       return true;
     case MYSQL_TYPE_DOUBLE:
       *enc = Enc::FLOAT64;
-      *role = bit_lsm::ORDERED;
+      *index_type = bit_lsm::IndexType::kRange;
       return true;
     case MYSQL_TYPE_NEWDATE:  // DATE stored as 3B little-endian, order-monotone
       *enc = Enc::DATE3;
-      *role = bit_lsm::ORDERED;
+      *index_type = bit_lsm::IndexType::kRange;
       return true;
     case MYSQL_TYPE_STRING:   // CHAR/BINARY, fixed width (binary collation)
     case MYSQL_TYPE_VARCHAR:  // VARCHAR/VARBINARY (binary collation)
       *enc = Enc::BINARY_STR;
-      *role = bit_lsm::UNORDERED;
+      *index_type = kBinaryIndexType;
       return true;
     default:
       return false;  // not yet supported by the extractor
@@ -3844,25 +3846,25 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
   const bool hidden_pk = Rdb_key_def::table_has_hidden_pk(tbl);
 
   // (1) Derive per-attribute encoding + role from the Field types. This is the
-  // single source of truth: schema.roles (build-time binning) and the
+  // single source of truth: schema.index_types (build-time binning) and the
   // extractor encodings come from the same switch, so they cannot disagree.
   // Reject types the extractor does not yet handle (M3a-4 scope).
   bit_lsm::SABISchema schema;
-  schema.roles.reserve(ki->user_defined_key_parts);
+  schema.index_types.reserve(ki->user_defined_key_parts);
   // field_index -> (attr slot, encoding) for the target columns.
   std::unordered_map<uint, std::pair<uint32_t, Rdb_bitlsm_attr_plan::Enc>>
       attr_of_field;
   for (uint i = 0; i < ki->user_defined_key_parts; i++) {
     const Field *field = ki->key_part[i].field;
     Rdb_bitlsm_attr_plan::Enc enc;
-    bit_lsm::AttrRole role;
-    if (!bitlsm_derive_enc(field, &enc, &role)) {
+    bit_lsm::IndexType index_type;
+    if (!bitlsm_derive_enc(field, &enc, &index_type)) {
       LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                       "BITLSM_INDEX: attribute type not yet supported by the "
                       "extractor (M3a-4 scope)");
       return HA_ERR_UNSUPPORTED;
     }
-    schema.roles.push_back(role);
+    schema.index_types.push_back(index_type);
     attr_of_field.emplace(field->field_index(),
                           std::make_pair(static_cast<uint32_t>(i), enc));
   }
@@ -3976,7 +3978,7 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
       std::make_shared<bit_lsm::SABIFactory>(schema, [const_plan] {
         return std::make_unique<Rdb_bitlsm_extractor>(const_plan);
       });
-  if (!Rdb_bitlsm_registry::instance().bind(pk_cf_name, schema.roles, factory)) {
+  if (!Rdb_bitlsm_registry::instance().bind(pk_cf_name, schema.index_types, factory)) {
     // D5/D17: this CF already hosts a different bitlsm schema. Fail loudly
     // instead of silently letting the last writer win.
     LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,

@@ -26,7 +26,8 @@ namespace myrocks {
 //   - `(c0, c1, ...) IN ((v00, ...), (v10, ...), ...)` (row constructor) ->
 //     one clause_group of EQUALs PER COLUMN. That is a weakening of the DNF
 //     the row form denotes, which CNF cannot express exactly.
-//   - UNORDERED (binary string) attrs: only EQUAL is representable.
+//   - kEquality attrs: only EQUAL is representable; a binary column
+//     indexed kRange takes range operators like any other attr.
 //   - functions, column-to-column, IS NULL, NOT IN, arithmetic, subqueries,
 //     attr types the extractor cannot bin: omitted.
 //

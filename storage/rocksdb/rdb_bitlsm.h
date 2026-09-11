@@ -32,7 +32,7 @@ class Rdb_bitlsm_registry {
   // Bind a CF to a SABIFactory. Returns false if cf_name is already bound to a
   // DIFFERENT schema (D5: <=1 bitlsm schema per CF) so the caller can fail the
   // open loudly. Same-schema rebind (reopen) is idempotent OK.
-  bool bind(const std::string &cf_name, std::vector<bit_lsm::AttrRole> roles,
+  bool bind(const std::string &cf_name, std::vector<bit_lsm::IndexType> index_types,
             std::shared_ptr<bit_lsm::SABIFactory> factory);
 
   // Returns nullptr if cf_name is not bound (non-bitlsm or not yet opened).
@@ -80,7 +80,7 @@ class Rdb_bitlsm_registry {
  private:
   Rdb_bitlsm_registry() = default;
   struct Entry {
-    std::vector<bit_lsm::AttrRole> roles;
+    std::vector<bit_lsm::IndexType> index_types;
     std::shared_ptr<bit_lsm::SABIFactory> factory;
     // M5: refresh worker + stats cache; empty until estimator_attach.
     std::unique_ptr<bit_lsm::CardinalityEstimator> estimator;

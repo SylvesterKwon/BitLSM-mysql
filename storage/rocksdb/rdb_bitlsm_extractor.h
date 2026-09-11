@@ -15,6 +15,24 @@
 
 namespace myrocks {
 
+// Which predicates BITLSM_INDEX accelerates on a binary (CHAR/VARCHAR with a
+// binary collation) column -- the single policy choice, read by BOTH derive
+// sites: rdb_datadic.cc::bitlsm_derive_enc (build-time binning) and
+// rdb_bitlsm_query.cc::field_to_attr (query-time comparand). They must agree
+// or rows get mis-binned, which is why this lives in one header rather than
+// twice as a literal.
+//
+// kRange is sound for every column that reaches here: BITLSM_INDEX takes
+// binary collations only, so memcmp over the stored bytes IS the column's
+// order. kEquality serves `=` alone and makes BitLSMQuery::Validate reject
+// every range predicate, which the translator then omits -- that was the old
+// behaviour and the reason string ranges did not prune. The two differ in how
+// bins are cut (kRange by equal mass over sorted values, kEquality by a
+// frequency-balanced value dictionary), so a skewed equality-only column may
+// still measure better as kEquality; change it here when it does.
+inline constexpr bit_lsm::IndexType kBinaryIndexType =
+    bit_lsm::IndexType::kRange;
+
 // Immutable "cheat sheet" describing how to walk a MyRocks primary-key value
 // blob and pull out the BITLSM attribute columns. Built ONCE at CF-bind time
 // (table open, in Rdb_key_def::setup_bitlsm_index) from the TABLE/Field
@@ -26,15 +44,17 @@ namespace myrocks {
 //   [TTL 8B]? [null bitmap : null_bytes_len B] [unpack_info block]?
 //   [STORE_ALL field data, in table field order]
 struct Rdb_bitlsm_attr_plan {
-  // How a target field's bytes become an EncodedAttr. ORDERED roles map to a
-  // monotone okey (uint64); the UNORDERED role emits opaque bytes.
+  // How a target field's bytes become an EncodedAttr. SABI compares every
+  // attribute by memcmp, so a numeric field is mapped to a monotone okey and
+  // then to its 8-byte big-endian form; a binary field is already in that
+  // domain and is emitted as-is.
   enum class Enc : uint8_t {
     INT_SIGNED,    // little-endian, sign-extend `len` bytes -> I64ToOkey
     INT_UNSIGNED,  // little-endian `len` bytes -> U64ToOkey
     FLOAT32,       // 4B IEEE-754 LE -> double -> F64ToOkey
     FLOAT64,       // 8B IEEE-754 LE -> F64ToOkey
     DATE3,         // 3B LE packed NEWDATE (monotone in date order) -> U64ToOkey
-    BINARY_STR,    // UNORDERED: std::string_view over the raw data bytes
+    BINARY_STR,    // binary: std::string_view over the raw data bytes
   };
 
   // Physical shape of a STORE_ALL value field: how to locate its bytes and
@@ -73,13 +93,17 @@ struct Rdb_bitlsm_attr_plan {
 // HOT PATH: exactly one virtual call (ExtractAll) per row on the
 // flush/compaction thread; the body does a single linear walk of the value up
 // to the last attribute plus a few arithmetic ops per attribute. No heap
-// allocation, no TABLE*/Field access; UNORDERED attrs emit a std::string_view
-// into `value` (valid only for the duration of this call).
+// allocation: binary attrs emit a std::string_view into `value`, numeric attrs
+// one into per-attr scratch owned by this extractor. Both are valid only for
+// the duration of this call, which is what bit_lsm::EncodedAttr promises.
 class Rdb_bitlsm_extractor : public bit_lsm::AttrExtractor {
  public:
   explicit Rdb_bitlsm_extractor(
       std::shared_ptr<const Rdb_bitlsm_attr_plan> plan)
-      : m_plan(std::move(plan)) {}
+      : m_plan(std::move(plan)),
+        m_okey_scratch(
+            static_cast<size_t>(m_plan->attr_num) * bit_lsm::kOkeyBytes,
+            '\0') {}
 
   void ExtractAll(std::string_view key, std::string_view value,
                   bit_lsm::EncodedAttr *out) override {
@@ -146,28 +170,34 @@ class Rdb_bitlsm_extractor : public bit_lsm::AttrExtractor {
 
       switch (e.enc) {
         case Rdb_bitlsm_attr_plan::Enc::INT_SIGNED:
-          out[e.attr_index] = bit_lsm::I64ToOkey(
-              sign_extend(read_le(base + foff, static_cast<unsigned>(flen)),
-                          static_cast<unsigned>(flen)));
+          out[e.attr_index] = okey_bytes(
+              e.attr_index,
+              bit_lsm::I64ToOkey(sign_extend(
+                  read_le(base + foff, static_cast<unsigned>(flen)),
+                  static_cast<unsigned>(flen))));
           break;
         case Rdb_bitlsm_attr_plan::Enc::INT_UNSIGNED:
-          out[e.attr_index] = bit_lsm::U64ToOkey(
-              read_le(base + foff, static_cast<unsigned>(flen)));
+          out[e.attr_index] = okey_bytes(
+              e.attr_index, bit_lsm::U64ToOkey(read_le(
+                                base + foff, static_cast<unsigned>(flen))));
           break;
         case Rdb_bitlsm_attr_plan::Enc::FLOAT32: {
           float f;
           std::memcpy(&f, base + foff, 4);
-          out[e.attr_index] = bit_lsm::F64ToOkey(static_cast<double>(f));
+          out[e.attr_index] =
+              okey_bytes(e.attr_index,
+                         bit_lsm::F64ToOkey(static_cast<double>(f)));
           break;
         }
         case Rdb_bitlsm_attr_plan::Enc::FLOAT64: {
           double d;
           std::memcpy(&d, base + foff, 8);
-          out[e.attr_index] = bit_lsm::F64ToOkey(d);
+          out[e.attr_index] = okey_bytes(e.attr_index, bit_lsm::F64ToOkey(d));
           break;
         }
         case Rdb_bitlsm_attr_plan::Enc::DATE3:
-          out[e.attr_index] = bit_lsm::U64ToOkey(read_le(base + foff, 3));
+          out[e.attr_index] = okey_bytes(
+              e.attr_index, bit_lsm::U64ToOkey(read_le(base + foff, 3)));
           break;
         case Rdb_bitlsm_attr_plan::Enc::BINARY_STR:
           out[e.attr_index] = std::string_view(base + foff, flen);
@@ -177,6 +207,18 @@ class Rdb_bitlsm_extractor : public bit_lsm::AttrExtractor {
   }
 
  private:
+  // SABI orders every attribute by memcmp, so a numeric attr's okey reaches it
+  // as 8 big-endian bytes. They are written into this extractor's own per-attr
+  // scratch -- one slot per attribute, so two attrs in the same row never
+  // share a buffer -- which keeps the returned view valid for the whole
+  // ExtractAll call without allocating on the hot path.
+  inline std::string_view okey_bytes(uint32_t attr_index, uint64_t okey) {
+    char *p = m_okey_scratch.data() +
+              static_cast<size_t>(attr_index) * bit_lsm::kOkeyBytes;
+    bit_lsm::OkeyToBytes(okey, p);
+    return std::string_view(p, bit_lsm::kOkeyBytes);
+  }
+
   // Read `len` (<=8) little-endian bytes into an unsigned 64-bit value.
   static inline uint64_t read_le(const char *p, unsigned len) {
     uint64_t v = 0;
@@ -195,6 +237,7 @@ class Rdb_bitlsm_extractor : public bit_lsm::AttrExtractor {
   }
 
   std::shared_ptr<const Rdb_bitlsm_attr_plan> m_plan;
+  std::string m_okey_scratch;  // attr_num * kOkeyBytes, see okey_bytes()
 };
 
 }  // namespace myrocks

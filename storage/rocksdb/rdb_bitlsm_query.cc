@@ -2,6 +2,10 @@
 
 #include "./rdb_bitlsm_query.h"
 
+/* kBinaryIndexType: the binary-column index-type policy, shared with
+   rdb_datadic.cc so build-time binning and query-time comparands agree. */
+#include "./rdb_bitlsm_extractor.h"
+
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -43,6 +47,10 @@ enum class ValKind { SKIP, I64, U64, DBL, STR, DATE };
 struct AttrMeta {
   uint32_t attr_idx;  // position in the index's user-defined key parts
   ValKind kind;
+  // Which predicates this attr's bins serve. kEquality rejects every non-EQUAL
+  // operator at Validate, so the translator must omit those conditions rather
+  // than emit a query that fails validation.
+  bit_lsm::IndexType index_type;
 };
 
 // Map a Field to (AttrSpec, ValKind). All types here are the ones the extractor
@@ -50,8 +58,8 @@ struct AttrMeta {
 // a placeholder AttrSpec so attr_idx alignment is preserved, but is marked SKIP
 // so no condition is emitted for it.
 static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
-  using bit_lsm::ORDERED;
-  using bit_lsm::UNORDERED;
+  using bit_lsm::IndexType;
+  using bit_lsm::PhysicalType;
   const bool nullable = f->is_nullable();
   switch (f->real_type()) {
     case MYSQL_TYPE_TINY:
@@ -60,45 +68,44 @@ static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
     case MYSQL_TYPE_LONG:
     case MYSQL_TYPE_LONGLONG: {
       const bool uns = f->is_unsigned();
-      uint8_t w = static_cast<uint8_t>(f->pack_length());
+      uint16_t w = static_cast<uint16_t>(f->pack_length());
       if (w == 3) w = 4;  // INT24 -> nearest valid AttrSpec width
-      *spec = AttrSpec(ORDERED, w, /*is_signed=*/!uns, /*is_float=*/false,
+      *spec = AttrSpec(IndexType::kRange,
+                       uns ? PhysicalType::kUint : PhysicalType::kInt, w,
                        nullable);
       *kind = uns ? ValKind::U64 : ValKind::I64;
       return;
     }
     case MYSQL_TYPE_FLOAT:
-      *spec = AttrSpec(ORDERED, 4, /*is_signed=*/true, /*is_float=*/true,
-                       nullable);
+      *spec = AttrSpec(IndexType::kRange, PhysicalType::kFloat, 4, nullable);
       *kind = ValKind::DBL;
       return;
     case MYSQL_TYPE_DOUBLE:
-      *spec = AttrSpec(ORDERED, 8, /*is_signed=*/true, /*is_float=*/true,
-                       nullable);
+      *spec = AttrSpec(IndexType::kRange, PhysicalType::kFloat, 8, nullable);
       *kind = ValKind::DBL;
       return;
-    case MYSQL_TYPE_STRING:   // CHAR/BINARY (binary collation)
+    case MYSQL_TYPE_STRING:  // CHAR/BINARY -- fixed width (binary collation)
+      *spec = AttrSpec(kBinaryIndexType, PhysicalType::kBinary,
+                       static_cast<uint16_t>(f->pack_length()), nullable);
+      *kind = ValKind::STR;
+      return;
     case MYSQL_TYPE_VARCHAR:  // VARCHAR/VARBINARY (binary collation)
-      *spec = AttrSpec(UNORDERED, 0, /*is_signed=*/false, /*is_float=*/false,
-                       nullable);
+      *spec = AttrSpec(kBinaryIndexType, PhysicalType::kVarBinary, 0, nullable);
       *kind = ValKind::STR;
       return;
     case MYSQL_TYPE_NEWDATE:  // DATE (Field_newdate: 3 bytes, LE packed)
-      // `width` decodes nothing on this path: the SABI schema persists only
-      // roles (rdb_datadic.cc), and MyRocks drives the iterator in
-      // ResultMode::Candidate, which leaves CompiledQuery inert and skips
-      // per-row Eval (bit_lsm_iterator.cpp). BitLSMQuery::Validate only
-      // branches on is_signed/is_float (both false here, matching the
-      // extractor's unsigned, non-float U64ToOkey(read_le(..., 3))); it never
-      // reads width. `width` is filler -- AttrSpec widths are 1/2/4/8, so
-      // DATE's 3 is not expressible here and does not need to be.
-      *spec = AttrSpec(ORDERED, 4, /*is_signed=*/false, /*is_float=*/false,
-                       nullable);
+      // kUint matches the extractor, which reads the 3 LE bytes and runs them
+      // through U64ToOkey; the comparand is packed the same way. `width` is
+      // filler -- AttrSpec widths are 1/2/4/8 so 3 is not expressible, and
+      // nothing on this path decodes it: the adapter walks the MyRocks value
+      // blob with its own Rdb_bitlsm_attr_plan rather than the core's
+      // physical-type row layout, and Validate branches on physical type
+      // only, never on width.
+      *spec = AttrSpec(IndexType::kRange, PhysicalType::kUint, 4, nullable);
       *kind = ValKind::DATE;
       return;
     default:
-      *spec = AttrSpec(ORDERED, 8, /*is_signed=*/true, /*is_float=*/false,
-                       nullable);
+      *spec = AttrSpec(IndexType::kRange, PhysicalType::kInt, 8, nullable);
       *kind = ValKind::SKIP;
       return;
   }
@@ -237,8 +244,13 @@ static bool make_condition(Item_func *f, const Ctx &ctx, QueryCondition *cond) {
 
   CompareOp op;
   if (!map_op(f->functype(), flip, &op)) return false;
-  // UNORDERED attrs are equality-only; a non-EQUAL op is not representable.
-  if (meta.kind == ValKind::STR && op != CompareOp::EQUAL) return false;
+  // kEquality attrs serve `=` only; a non-EQUAL op is not representable and
+  // Validate would reject the whole query, so omit the condition instead.
+  // A binary column indexed kRange takes range operators like any other attr:
+  // its bytes are its order.
+  if (meta.index_type == bit_lsm::IndexType::kEquality &&
+      op != CompareOp::EQUAL)
+    return false;
 
   if (!extract_value(cst, meta.kind, &cond->value)) return false;
   cond->attr_idx = meta.attr_idx;
@@ -272,7 +284,7 @@ static bool make_in_terms(Item_func_in *in, const Ctx &ctx, OrClause *clause) {
 // A positive `field BETWEEN lo AND hi` is the conjunction `field >= lo AND
 // field <= hi`: TWO independent clause_groups. Handled at the conjunction level
 // (not in collect_disjunction, which builds a single OR clause) because it
-// contributes two groups. ORDERED attrs only -- an UNORDERED/STR attr has no
+// contributes two groups. kRange attrs only -- a kEquality attr has no
 // representable range. Both bounds are extracted BEFORE either group is pushed,
 // so a partial (potentially non-weakening) translation is never emitted.
 // Returns false (caller drops the whole conjunct -> safe weakening) on NOT
@@ -283,7 +295,9 @@ static bool make_between_groups(Item_func *f, const Ctx &ctx, BitLSMQuery *q) {
 
   AttrMeta meta{};
   if (index_field_of(f->arguments()[0], ctx, &meta) == nullptr) return false;
-  if (meta.kind == ValKind::SKIP || meta.kind == ValKind::STR) return false;
+  if (meta.kind == ValKind::SKIP ||
+      meta.index_type == bit_lsm::IndexType::kEquality)
+    return false;
 
   Item *lo = f->arguments()[1];
   Item *hi = f->arguments()[2];
@@ -519,18 +533,20 @@ bool rdb_bitlsm_assemble_query(const KEY &key_info, Item *cond,
                                BitLSMQuery *out_query,
                                BitLSMOptions *out_options) {
   // (1) Build the schema/options from the index Field types (single source of
-  // truth for role + comparand variant), and the field_index -> attr map.
+  // truth for index type, physical type and comparand variant), and the
+  // field_index -> attr map.
   Ctx ctx;
   out_options->attr_specs.clear();
   out_options->attr_specs.reserve(key_info.user_defined_key_parts);
   for (uint i = 0; i < key_info.user_defined_key_parts; i++) {
     const Field *f = key_info.key_part[i].field;
-    AttrSpec spec;
+    AttrSpec spec(bit_lsm::IndexType::kRange, bit_lsm::PhysicalType::kInt, 8);
     ValKind kind;
     field_to_attr(f, &spec, &kind);
     out_options->attr_specs.push_back(spec);
-    ctx.by_field.emplace(f->field_index(),
-                         AttrMeta{static_cast<uint32_t>(i), kind});
+    ctx.by_field.emplace(
+        f->field_index(),
+        AttrMeta{static_cast<uint32_t>(i), kind, spec.index_type});
   }
   out_options->attr_num =
       static_cast<uint32_t>(out_options->attr_specs.size());

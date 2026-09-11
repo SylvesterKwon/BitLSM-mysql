@@ -17,12 +17,12 @@ Rdb_bitlsm_registry &Rdb_bitlsm_registry::instance() {
 }
 
 bool Rdb_bitlsm_registry::bind(const std::string &cf_name,
-                               std::vector<bit_lsm::AttrRole> roles,
+                               std::vector<bit_lsm::IndexType> index_types,
                                std::shared_ptr<bit_lsm::SABIFactory> factory) {
   std::lock_guard<std::mutex> lk(m_mutex);
   auto it = m_map.find(cf_name);
   if (it != m_map.end()) {
-    if (it->second.roles != roles) {
+    if (it->second.index_types != index_types) {
       // D5 violation: CF already hosts a different bitlsm schema.
       return false;
     }
@@ -33,7 +33,7 @@ bool Rdb_bitlsm_registry::bind(const std::string &cf_name,
     return true;
   }
   m_map.emplace(cf_name,
-                Entry{std::move(roles), std::move(factory), nullptr});
+                Entry{std::move(index_types), std::move(factory), nullptr});
   return true;
 }
 
@@ -143,7 +143,7 @@ bool rdb_bitlsm_bind_persisted(const std::string &cf_name,
       [plan] { return std::make_unique<Rdb_bitlsm_extractor>(plan); });
 
   auto &registry = Rdb_bitlsm_registry::instance();
-  if (!registry.bind(cf_name, desc.schema.roles, std::move(factory))) {
+  if (!registry.bind(cf_name, desc.schema.index_types, std::move(factory))) {
     return false;
   }
   registry.mark_expected(cf_name);

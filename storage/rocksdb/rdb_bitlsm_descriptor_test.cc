@@ -8,7 +8,9 @@ namespace {
 
 Rdb_bitlsm_descriptor make_desc() {
   Rdb_bitlsm_descriptor d;
-  d.schema.roles = {bit_lsm::ORDERED, bit_lsm::UNORDERED, bit_lsm::ORDERED};
+  d.schema.index_types = {bit_lsm::IndexType::kRange,
+                        bit_lsm::IndexType::kEquality,
+                        bit_lsm::IndexType::kRange};
   d.schema.rho = 0.01;
 
   d.plan.attr_num = 3;
@@ -56,7 +58,7 @@ TEST(RdbBitlsmDescriptor, RoundTrip) {
   Rdb_bitlsm_descriptor out;
   ASSERT_TRUE(rdb_bitlsm_deserialize_descriptor(blob, &out));
 
-  EXPECT_EQ(out.schema.roles, in.schema.roles);
+  EXPECT_EQ(out.schema.index_types, in.schema.index_types);
   EXPECT_DOUBLE_EQ(out.schema.rho, in.schema.rho);
   EXPECT_EQ(out.plan.attr_num, in.plan.attr_num);
   EXPECT_EQ(out.plan.ttl_bytes, in.plan.ttl_bytes);
@@ -88,7 +90,7 @@ TEST(RdbBitlsmDescriptor, ByteComparisonDetectsSchemaChange) {
   EXPECT_NE(a, rdb_bitlsm_serialize_descriptor(null_mask_changed));
 
   Rdb_bitlsm_descriptor role_changed = make_desc();
-  role_changed.schema.roles[1] = bit_lsm::ORDERED;
+  role_changed.schema.index_types[1] = bit_lsm::IndexType::kRange;
   EXPECT_NE(a, rdb_bitlsm_serialize_descriptor(role_changed));
 
   Rdb_bitlsm_descriptor rho_changed = make_desc();
