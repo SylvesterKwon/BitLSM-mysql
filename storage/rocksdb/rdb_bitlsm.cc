@@ -16,13 +16,29 @@ Rdb_bitlsm_registry &Rdb_bitlsm_registry::instance() {
   return inst;
 }
 
+Rdb_bitlsm_schema_key rdb_bitlsm_schema_key_of(
+    const bit_lsm::SABISchema &schema, const Rdb_bitlsm_attr_plan &plan) {
+  Rdb_bitlsm_schema_key key;
+  key.reserve(schema.index_types.size());
+  for (const auto index_type : schema.index_types) {
+    // Placeholder enc; the walk below sets the real one for every attr. A slot
+    // the walk never names would mean a schema with an attribute no field
+    // feeds, which setup_bitlsm_index does not build.
+    key.push_back({index_type, Rdb_bitlsm_attr_plan::Enc::BINARY_STR});
+  }
+  for (const auto &e : plan.walk) {
+    if (e.is_target && e.attr_index < key.size()) key[e.attr_index].enc = e.enc;
+  }
+  return key;
+}
+
 bool Rdb_bitlsm_registry::bind(const std::string &cf_name,
-                               std::vector<bit_lsm::IndexType> index_types,
+                               Rdb_bitlsm_schema_key schema_key,
                                std::shared_ptr<bit_lsm::SABIFactory> factory) {
   std::lock_guard<std::mutex> lk(m_mutex);
   auto it = m_map.find(cf_name);
   if (it != m_map.end()) {
-    if (it->second.index_types != index_types) {
+    if (it->second.schema_key != schema_key) {
       // D5 violation: CF already hosts a different bitlsm schema.
       return false;
     }
@@ -33,7 +49,7 @@ bool Rdb_bitlsm_registry::bind(const std::string &cf_name,
     return true;
   }
   m_map.emplace(cf_name,
-                Entry{std::move(index_types), std::move(factory), nullptr});
+                Entry{std::move(schema_key), std::move(factory), nullptr});
   return true;
 }
 
@@ -143,7 +159,9 @@ bool rdb_bitlsm_bind_persisted(const std::string &cf_name,
       [plan] { return std::make_unique<Rdb_bitlsm_extractor>(plan); });
 
   auto &registry = Rdb_bitlsm_registry::instance();
-  if (!registry.bind(cf_name, desc.schema.index_types, std::move(factory))) {
+  if (!registry.bind(cf_name,
+                     rdb_bitlsm_schema_key_of(desc.schema, *plan),
+                     std::move(factory))) {
     return false;
   }
   registry.mark_expected(cf_name);

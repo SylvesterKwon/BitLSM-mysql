@@ -3978,7 +3978,8 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
       std::make_shared<bit_lsm::SABIFactory>(schema, [const_plan] {
         return std::make_unique<Rdb_bitlsm_extractor>(const_plan);
       });
-  if (!Rdb_bitlsm_registry::instance().bind(pk_cf_name, schema.index_types, factory)) {
+  if (!Rdb_bitlsm_registry::instance().bind(
+          pk_cf_name, rdb_bitlsm_schema_key_of(schema, *plan), factory)) {
     // D5/D17: this CF already hosts a different bitlsm schema. Fail loudly
     // instead of silently letting the last writer win.
     LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,

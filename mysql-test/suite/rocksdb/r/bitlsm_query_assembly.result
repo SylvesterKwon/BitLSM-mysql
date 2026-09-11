@@ -56,11 +56,12 @@ SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 5 AND (a = 1 OR ABS(
 # WHERE a >= 5 AND (a = 1 OR ABS(b) = 2)
 #   assembled: [a0>=5]
 #
-# (7) UNORDERED (VARBINARY) attr with a non-EQUAL op (c > 'x') is omitted;
-# the ordered conjunct survives.
+# (7) A kRange VARBINARY attr takes a non-EQUAL op (c > 'x'): its bytes
+# are its order, so the comparison is representable and both conjuncts
+# survive.
 SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND c > 'x';
 # WHERE a >= 0 AND c > 'x'
-#   assembled: [a0>=0]
+#   assembled: [a0>=0 AND a2>'x']
 #
 # (8a) Type mapping: DOUBLE equality -> a1=<double>. IS NOT NULL forces
 # routing through bi and is itself omitted (unrepresentable), isolating
@@ -101,11 +102,11 @@ SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND a NOT BETWEEN 
 # WHERE a >= 0 AND a NOT BETWEEN 2 AND 10
 #   assembled: [a0>=0]
 #
-# (13) BETWEEN on an UNORDERED (VARBINARY) attr has no representable range
-# -> dropped; the leading ordered conjunct survives.
+# (13) BETWEEN on a kRange VARBINARY attr decomposes like any other range,
+# into the two bound conjuncts, alongside the leading one.
 SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND c BETWEEN 'a' AND 'z';
 # WHERE a >= 0 AND c BETWEEN 'a' AND 'z'
-#   assembled: [a0>=0]
+#   assembled: [a0>=0 AND a2>='a' AND a2<='z']
 #
 # (14) DATE equality -> a3=<packed>. The comparand is the 3-byte
 # Field_newdate packing (day + month*32 + year*512) read little-endian:

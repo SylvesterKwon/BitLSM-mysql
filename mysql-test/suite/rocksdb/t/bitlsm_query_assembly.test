@@ -20,7 +20,8 @@
 #     are dropped (dropping a conjunct only weakens).
 #   - OR:  translated only if EVERY disjunct is representable, else the whole OR
 #     is dropped (dropping a disjunct would strengthen -- unsafe).
-#   - UNORDERED (VARBINARY) attrs are equality-only.
+#   - kEquality attrs are equality-only; a VARBINARY column indexed
+#     kRange takes range operators like any other attr.
 
 CREATE TABLE t_asm (
   id BIGINT NOT NULL,
@@ -103,10 +104,11 @@ INSERT INTO t_asm VALUES
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
 --echo #
---echo # (7) UNORDERED (VARBINARY) attr with a non-EQUAL op (c > 'x') is omitted;
---echo # the ordered conjunct survives.
+--echo # (7) A kRange VARBINARY attr takes a non-EQUAL op (c > 'x'): its bytes
+--echo # are its order, so the comparison is representable and both conjuncts
+--echo # survive.
 --let $w = a >= 0 AND c > 'x'
---let $expected = a0>=0
+--let $expected = a0>=0 AND a2>'x'
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
 --echo #
@@ -155,10 +157,10 @@ INSERT INTO t_asm VALUES
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
 --echo #
---echo # (13) BETWEEN on an UNORDERED (VARBINARY) attr has no representable range
---echo # -> dropped; the leading ordered conjunct survives.
+--echo # (13) BETWEEN on a kRange VARBINARY attr decomposes like any other range,
+--echo # into the two bound conjuncts, alongside the leading one.
 --let $w = a >= 0 AND c BETWEEN 'a' AND 'z'
---let $expected = a0>=0
+--let $expected = a0>=0 AND a2>='a' AND a2<='z'
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
 --echo #
