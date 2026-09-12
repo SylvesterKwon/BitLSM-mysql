@@ -1,0 +1,27 @@
+CREATE TABLE t_kwp (
+id BIGINT NOT NULL,
+s VARBINARY(16),
+payload INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_kwp_cf',
+INDEX bi (s ORDERED) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO t_kwp
+WITH RECURSIVE q(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM q WHERE n<19999)
+SELECT n, CONCAT('v', LPAD(n, 5, '0')), n FROM q;
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+#
+# A 500-of-20000 window before the restart.
+include/assert.inc [ORDERED key part prunes the range before restart]
+# restart
+#
+# Same window after the restart. Had the keyword not persisted, the
+# reopened table would bin s as a plain binary attr and prune nothing.
+include/assert.inc [ORDERED key part survives the restart and still prunes]
+#
+# The answer is the same either way -- which is why the candidate count,
+# not the row set, is what this test measures.
+SELECT COUNT(*) FROM t_kwp WHERE s BETWEEN 'v01000' AND 'v01499';
+COUNT(*)
+500
+DROP TABLE t_kwp;

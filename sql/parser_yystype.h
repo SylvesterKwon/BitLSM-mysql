@@ -708,6 +708,7 @@ union YYSTYPE {
   PT_role_or_privilege *role_or_privilege;
   Mem_root_array<PT_role_or_privilege *> *role_or_privilege_list;
   enum_order order_direction;
+  enum class Bitlsm_key_part_type bitlsm_key_part_type;
   Alter_info::enum_with_validation with_validation;
   PT_alter_table_action *alter_table_action;
   PT_alter_table_standalone_action *alter_table_standalone_action;

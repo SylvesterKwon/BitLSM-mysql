@@ -12,12 +12,13 @@
 # differential bitlsm_index_read test cannot see.
 #
 # Parameters:
+#   $t        - table to read (t_asm, or t_asm_ord for the ORDERED variant)
 #   $w        - WHERE predicate over the bi columns (a, b, c)
 #   $expected - the exact BitLSMQuery::ToString() the translator must produce
 #               ("" means no representable pruning condition)
 
 --disable_result_log
---eval SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE $w
+--eval SELECT id, a, b, c, d FROM $t FORCE INDEX(bi) WHERE $w
 --enable_result_log
 --let $got = query_get_value(SHOW SESSION STATUS LIKE 'rocksdb_bitlsm_last_query', Value, 1)
 --echo # WHERE $w

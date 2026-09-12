@@ -7311,7 +7311,19 @@ static bool bitlsm_type_supported(const Create_field *cf) {
 // Returns true on error (my_error already raised).
 static bool prepare_bitlsm_index(const Key_spec *key, KEY *key_info,
                                  List<Create_field> *create_list) {
-  if (!key->key_create_info.m_is_bitlsm) return false;  // not a bitlsm index
+  if (!key->key_create_info.m_is_bitlsm) {
+    // The keyword selects a BITLSM bin layout and means nothing to any other
+    // index type. Refuse it there rather than accept and ignore it, which
+    // would read as "this index answers ranges that way" and not be true.
+    for (const Key_part_spec *kp : key->columns) {
+      if (kp->get_bitlsm_type() != Bitlsm_key_part_type::NOT_SPECIFIED) {
+        my_error(ER_WRONG_ARGUMENTS, MYF(0),
+                 "ORDERED/UNORDERED is only allowed on a BITLSM_INDEX key part");
+        return true;
+      }
+    }
+    return false;  // not a bitlsm index
+  }
 
   // D3: virtual keyspace => plain non-unique secondary index only.
   if (key->type != KEYTYPE_MULTIPLE) {
@@ -7320,7 +7332,27 @@ static bool prepare_bitlsm_index(const Key_spec *key, KEY *key_info,
     return true;
   }
 
+  uint part_no = 0;
   for (const Key_part_spec *kp : key->columns) {
+    const Bitlsm_key_part_type declared = kp->get_bitlsm_type();
+    if (declared != Bitlsm_key_part_type::NOT_SPECIFIED) {
+      if (kp->has_expression()) {
+        my_error(ER_WRONG_ARGUMENTS, MYF(0),
+                 "ORDERED/UNORDERED is not allowed on a functional key part");
+        return true;
+      }
+      if (part_no >= sizeof(key_info->m_bitlsm_ordered_mask) * 8) {
+        my_error(ER_WRONG_ARGUMENTS, MYF(0),
+                 "BITLSM_INDEX has too many key parts for ORDERED/UNORDERED");
+        return true;
+      }
+      if (declared == Bitlsm_key_part_type::ORDERED)
+        key_info->m_bitlsm_ordered_mask |= (1U << part_no);
+      else
+        key_info->m_bitlsm_unordered_mask |= (1U << part_no);
+    }
+    ++part_no;
+
     const char *col = kp->get_field_name();
     const Create_field *cf = nullptr;
     for (const Create_field &f : *create_list)

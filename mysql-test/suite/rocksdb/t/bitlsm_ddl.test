@@ -77,6 +77,52 @@ CREATE TABLE t_fixedchar (
   INDEX bi (s) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 
+--echo # ==== ORDERED / UNORDERED key-part keyword ====
+
+--echo # Accept: ORDERED on a binary key part -- the case the keyword exists for.
+CREATE TABLE t_kw_ord (
+  id BIGINT NOT NULL,
+  a INT, s VARBINARY(16),
+  PRIMARY KEY (id) COMMENT 'cfname=t_kw_ord_cf',
+  INDEX bi (a, s ORDERED) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+DROP TABLE t_kw_ord;
+
+--echo # Accept: UNORDERED on a numeric key part -- the mirror case. A numeric
+--echo # is kRange by default; declaring it UNORDERED gives an equality-only
+--echo # column a frequency-balanced dictionary instead.
+CREATE TABLE t_kw_unord (
+  id BIGINT NOT NULL,
+  a INT, s VARBINARY(16),
+  PRIMARY KEY (id) COMMENT 'cfname=t_kw_unord_cf',
+  INDEX bi (a UNORDERED, s) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+DROP TABLE t_kw_unord;
+
+--echo # Reject: the keyword on a plain index. It selects a BITLSM bin layout
+--echo # and means nothing elsewhere, so accepting and ignoring it would read as
+--echo # a promise the index does not keep.
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_kw_plain (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_kw_plain_cf',
+  a INT,
+  INDEX k (a ORDERED)
+) ENGINE=ROCKSDB;
+
+--echo # Reject: the keyword on a UNIQUE index.
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_kw_uniq (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_kw_uniq_cf',
+  a INT,
+  UNIQUE KEY u (a UNORDERED)
+) ENGINE=ROCKSDB;
+
+--echo # ORDERED and UNORDERED stay non-reserved: still usable as identifiers.
+CREATE TABLE t_kw_ident (ordered INT, unordered INT, PRIMARY KEY (ordered));
+INSERT INTO t_kw_ident VALUES (1, 2);
+SELECT ordered, unordered FROM t_kw_ident;
+DROP TABLE t_kw_ident;
+
 --echo # Reject: virtual generated column
 --error ER_WRONG_ARGUMENTS
 CREATE TABLE t_vg (

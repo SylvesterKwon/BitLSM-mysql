@@ -1124,6 +1124,12 @@ static void fill_dd_indexes_from_keyinfo(
     // storing bitlsm marker (M3a-2: DD persistence of KEY::m_is_bitlsm)
     if (key->is_bitlsm_index()) {
       idx_options->set("bitlsm", (uint)1);
+      // The per-key-part ORDERED/UNORDERED keywords decide how the SSTs were
+      // binned, so they have to survive a reopen with the marker itself.
+      if (key->m_bitlsm_ordered_mask != 0)
+        idx_options->set("bitlsm_ordered_mask", key->m_bitlsm_ordered_mask);
+      if (key->m_bitlsm_unordered_mask != 0)
+        idx_options->set("bitlsm_unordered_mask", key->m_bitlsm_unordered_mask);
     }
 
     /*

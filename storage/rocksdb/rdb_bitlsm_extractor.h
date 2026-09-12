@@ -15,23 +15,30 @@
 
 namespace myrocks {
 
-// Which predicates BITLSM_INDEX accelerates on a binary (CHAR/VARCHAR with a
-// binary collation) column -- the single policy choice, read by BOTH derive
-// sites: rdb_datadic.cc::bitlsm_derive_enc (build-time binning) and
-// rdb_bitlsm_query.cc::field_to_attr (query-time comparand). They must agree
-// or rows get mis-binned, which is why this lives in one header rather than
-// twice as a literal.
+// Which predicates BITLSM_INDEX accelerates on one key part.
 //
-// kRange is sound for every column that reaches here: BITLSM_INDEX takes
-// binary collations only, so memcmp over the stored bytes IS the column's
-// order. kEquality serves `=` alone and makes BitLSMQuery::Validate reject
-// every range predicate, which the translator then omits -- that was the old
-// behaviour and the reason string ranges did not prune. The two differ in how
-// bins are cut (kRange by equal mass over sorted values, kEquality by a
-// frequency-balanced value dictionary), so a skewed equality-only column may
-// still measure better as kEquality; change it here when it does.
-inline constexpr bit_lsm::IndexType kBinaryIndexType =
-    bit_lsm::IndexType::kRange;
+// The default follows the column type: a numeric attribute is kRange (its okey
+// is totally ordered and ranges are the point of it), a binary string is
+// kEquality (bins cut by a frequency-balanced value dictionary, equality only).
+// That is what every index declared before the ORDERED/UNORDERED keyword
+// existed gets, so adding the keyword changed no existing layout.
+//
+// A key part may override it. ORDERED on a binary column is sound because
+// BITLSM_INDEX takes NO PAD binary collations only, so memcmp over the stored
+// bytes IS the column's order; that is what lets a string range prune. The
+// reverse, UNORDERED on a numeric, is equally expressible and gives an
+// equality-only column tighter bins.
+//
+// Both derive sites read this one function -- rdb_datadic.cc for build-time
+// binning and rdb_bitlsm_query.cc for the query-time comparand -- because a
+// disagreement between them mis-bins rows.
+inline bit_lsm::IndexType rdb_bitlsm_index_type_for(bool is_binary,
+                                                    bool declared_ordered,
+                                                    bool declared_unordered) {
+  if (declared_ordered) return bit_lsm::IndexType::kRange;
+  if (declared_unordered) return bit_lsm::IndexType::kEquality;
+  return is_binary ? bit_lsm::IndexType::kEquality : bit_lsm::IndexType::kRange;
+}
 
 // Immutable "cheat sheet" describing how to walk a MyRocks primary-key value
 // blob and pull out the BITLSM attribute columns. Built ONCE at CF-bind time

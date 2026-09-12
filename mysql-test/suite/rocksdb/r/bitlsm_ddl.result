@@ -74,6 +74,48 @@ s BINARY(16),
 INDEX bi (s) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 ERROR HY000: Incorrect arguments to BITLSM_INDEX column type is not supported
+# ==== ORDERED / UNORDERED key-part keyword ====
+# Accept: ORDERED on a binary key part -- the case the keyword exists for.
+CREATE TABLE t_kw_ord (
+id BIGINT NOT NULL,
+a INT, s VARBINARY(16),
+PRIMARY KEY (id) COMMENT 'cfname=t_kw_ord_cf',
+INDEX bi (a, s ORDERED) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+DROP TABLE t_kw_ord;
+# Accept: UNORDERED on a numeric key part -- the mirror case. A numeric
+# is kRange by default; declaring it UNORDERED gives an equality-only
+# column a frequency-balanced dictionary instead.
+CREATE TABLE t_kw_unord (
+id BIGINT NOT NULL,
+a INT, s VARBINARY(16),
+PRIMARY KEY (id) COMMENT 'cfname=t_kw_unord_cf',
+INDEX bi (a UNORDERED, s) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+DROP TABLE t_kw_unord;
+# Reject: the keyword on a plain index. It selects a BITLSM bin layout
+# and means nothing elsewhere, so accepting and ignoring it would read as
+# a promise the index does not keep.
+CREATE TABLE t_kw_plain (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_kw_plain_cf',
+a INT,
+INDEX k (a ORDERED)
+) ENGINE=ROCKSDB;
+ERROR HY000: Incorrect arguments to ORDERED/UNORDERED is only allowed on a BITLSM_INDEX key part
+# Reject: the keyword on a UNIQUE index.
+CREATE TABLE t_kw_uniq (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_kw_uniq_cf',
+a INT,
+UNIQUE KEY u (a UNORDERED)
+) ENGINE=ROCKSDB;
+ERROR HY000: Incorrect arguments to ORDERED/UNORDERED is only allowed on a BITLSM_INDEX key part
+# ORDERED and UNORDERED stay non-reserved: still usable as identifiers.
+CREATE TABLE t_kw_ident (ordered INT, unordered INT, PRIMARY KEY (ordered));
+INSERT INTO t_kw_ident VALUES (1, 2);
+SELECT ordered, unordered FROM t_kw_ident;
+ordered	unordered
+1	2
+DROP TABLE t_kw_ident;
 # Reject: virtual generated column
 CREATE TABLE t_vg (
 id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_vg_cf',

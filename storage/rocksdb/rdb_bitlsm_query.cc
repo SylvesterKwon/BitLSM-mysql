@@ -2,7 +2,7 @@
 
 #include "./rdb_bitlsm_query.h"
 
-/* kBinaryIndexType: the binary-column index-type policy, shared with
+/* rdb_bitlsm_index_type_for(): the index-type policy, shared with
    rdb_datadic.cc so build-time binning and query-time comparands agree. */
 #include "./rdb_bitlsm_extractor.h"
 
@@ -57,7 +57,8 @@ struct AttrMeta {
 // accepts (the table would not exist otherwise). Anything unexpected still gets
 // a placeholder AttrSpec so attr_idx alignment is preserved, but is marked SKIP
 // so no condition is emitted for it.
-static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
+static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind,
+                          bool declared_ordered, bool declared_unordered) {
   using bit_lsm::IndexType;
   using bit_lsm::PhysicalType;
   const bool nullable = f->is_nullable();
@@ -70,27 +71,36 @@ static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
       const bool uns = f->is_unsigned();
       uint16_t w = static_cast<uint16_t>(f->pack_length());
       if (w == 3) w = 4;  // INT24 -> nearest valid AttrSpec width
-      *spec = AttrSpec(IndexType::kRange,
-                       uns ? PhysicalType::kUint : PhysicalType::kInt, w,
-                       nullable);
+      *spec = AttrSpec(
+          rdb_bitlsm_index_type_for(false, declared_ordered,
+                                    declared_unordered),
+          uns ? PhysicalType::kUint : PhysicalType::kInt, w, nullable);
       *kind = uns ? ValKind::U64 : ValKind::I64;
       return;
     }
     case MYSQL_TYPE_FLOAT:
-      *spec = AttrSpec(IndexType::kRange, PhysicalType::kFloat, 4, nullable);
+      *spec = AttrSpec(rdb_bitlsm_index_type_for(false, declared_ordered,
+                                                 declared_unordered),
+                       PhysicalType::kFloat, 4, nullable);
       *kind = ValKind::DBL;
       return;
     case MYSQL_TYPE_DOUBLE:
-      *spec = AttrSpec(IndexType::kRange, PhysicalType::kFloat, 8, nullable);
+      *spec = AttrSpec(rdb_bitlsm_index_type_for(false, declared_ordered,
+                                                 declared_unordered),
+                       PhysicalType::kFloat, 8, nullable);
       *kind = ValKind::DBL;
       return;
     case MYSQL_TYPE_STRING:  // CHAR/BINARY -- fixed width (binary collation)
-      *spec = AttrSpec(kBinaryIndexType, PhysicalType::kBinary,
+      *spec = AttrSpec(rdb_bitlsm_index_type_for(true, declared_ordered,
+                                                 declared_unordered),
+                       PhysicalType::kBinary,
                        static_cast<uint16_t>(f->pack_length()), nullable);
       *kind = ValKind::STR;
       return;
     case MYSQL_TYPE_VARCHAR:  // VARCHAR/VARBINARY (binary collation)
-      *spec = AttrSpec(kBinaryIndexType, PhysicalType::kVarBinary, 0, nullable);
+      *spec = AttrSpec(rdb_bitlsm_index_type_for(true, declared_ordered,
+                                                 declared_unordered),
+                       PhysicalType::kVarBinary, 0, nullable);
       *kind = ValKind::STR;
       return;
     case MYSQL_TYPE_NEWDATE:  // DATE (Field_newdate: 3 bytes, LE packed)
@@ -101,7 +111,9 @@ static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind) {
       // blob with its own Rdb_bitlsm_attr_plan rather than the core's
       // physical-type row layout, and Validate branches on physical type
       // only, never on width.
-      *spec = AttrSpec(IndexType::kRange, PhysicalType::kUint, 4, nullable);
+      *spec = AttrSpec(rdb_bitlsm_index_type_for(false, declared_ordered,
+                                                 declared_unordered),
+                       PhysicalType::kUint, 4, nullable);
       *kind = ValKind::DATE;
       return;
     default:
@@ -542,7 +554,9 @@ bool rdb_bitlsm_assemble_query(const KEY &key_info, Item *cond,
     const Field *f = key_info.key_part[i].field;
     AttrSpec spec(bit_lsm::IndexType::kRange, bit_lsm::PhysicalType::kInt, 8);
     ValKind kind;
-    field_to_attr(f, &spec, &kind);
+    field_to_attr(f, &spec, &kind,
+                  (key_info.m_bitlsm_ordered_mask >> i) & 1U,
+                  (key_info.m_bitlsm_unordered_mask >> i) & 1U);
     out_options->attr_specs.push_back(spec);
     ctx.by_field.emplace(
         f->field_index(),

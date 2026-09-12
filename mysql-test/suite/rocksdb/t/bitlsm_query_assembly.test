@@ -20,8 +20,9 @@
 #     are dropped (dropping a conjunct only weakens).
 #   - OR:  translated only if EVERY disjunct is representable, else the whole OR
 #     is dropped (dropping a disjunct would strengthen -- unsafe).
-#   - kEquality attrs are equality-only; a VARBINARY column indexed
-#     kRange takes range operators like any other attr.
+#   - A binary column is kEquality by default, so only EQUAL is
+#     representable on it; declaring the key part ORDERED makes range
+#     operators representable too (see the t_asm_ord section).
 
 CREATE TABLE t_asm (
   id BIGINT NOT NULL,
@@ -37,6 +38,8 @@ CREATE TABLE t_asm (
 # reads. attr mapping: a -> a0 (signed int64), b -> a1 (double), c -> a2
 # (unordered binary string), dt -> a3 (unsigned int64 holding the 3-byte
 # Field_newdate packing).
+--let $t = t_asm
+
 INSERT INTO t_asm VALUES
   (1, -50, -1.5, 'alpha', '2020-01-01', 100),
   (2,   1,  0.0, 'x',     '2020-06-15', 200),
@@ -104,11 +107,11 @@ INSERT INTO t_asm VALUES
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
 --echo #
---echo # (7) A kRange VARBINARY attr takes a non-EQUAL op (c > 'x'): its bytes
---echo # are its order, so the comparison is representable and both conjuncts
---echo # survive.
+--echo # (7) A VARBINARY attr is kEquality by default, so a non-EQUAL op on it
+--echo # (c > 'x') is not representable and is omitted; the ordered conjunct
+--echo # survives. The ORDERED counterpart is at the end of this file.
 --let $w = a >= 0 AND c > 'x'
---let $expected = a0>=0 AND a2>'x'
+--let $expected = a0>=0
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
 --echo #
@@ -157,10 +160,10 @@ INSERT INTO t_asm VALUES
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
 --echo #
---echo # (13) BETWEEN on a kRange VARBINARY attr decomposes like any other range,
---echo # into the two bound conjuncts, alongside the leading one.
+--echo # (13) BETWEEN on a default (kEquality) VARBINARY attr has no representable
+--echo # range -> dropped; the leading ordered conjunct survives.
 --let $w = a >= 0 AND c BETWEEN 'a' AND 'z'
---let $expected = a0>=0 AND a2>='a' AND a2<='z'
+--let $expected = a0>=0
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
 --echo #
@@ -209,3 +212,45 @@ INSERT INTO t_asm VALUES
 --source suite/rocksdb/include/bitlsm_query_assembly_check.inc
 
 DROP TABLE t_asm;
+
+--echo #
+--echo # ==== ORDERED key part: the same two shapes, now representable ====
+--echo #
+--echo # Same columns and same queries as (7) and (13); the only difference is
+--echo # that the c key part is declared ORDERED, which bins it by equal mass
+--echo # over sorted values instead of by a frequency-balanced dictionary. That
+--echo # is what makes a range over its bytes expressible.
+CREATE TABLE t_asm_ord (
+  id BIGINT NOT NULL,
+  a INT, b DOUBLE, c VARBINARY(16),
+  dt DATE,
+  d INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_asm_ord_cf',
+  INDEX bi (a, b, c ORDERED, dt) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+INSERT INTO t_asm_ord SELECT * FROM (SELECT 1 id, 1 a, 1.5 b, 'x' c,
+  DATE'2020-06-15' dt, 7 d) x;
+
+--let $t = t_asm_ord
+
+--echo #
+--echo # (18) ORDERED VARBINARY takes a non-EQUAL op: both conjuncts survive.
+--let $w = a >= 0 AND c > 'x'
+--let $expected = a0>=0 AND a2>'x'
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (19) BETWEEN on an ORDERED VARBINARY decomposes into its two bounds,
+--echo # exactly as it does on a numeric attr.
+--let $w = a >= 0 AND c BETWEEN 'a' AND 'z'
+--let $expected = a0>=0 AND a2>='a' AND a2<='z'
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+--echo #
+--echo # (20) Equality still works on an ORDERED attr -- kRange serves = too.
+--let $w = a IS NOT NULL AND c = 'x'
+--let $expected = a2='x'
+--source suite/rocksdb/include/bitlsm_query_assembly_check.inc
+
+DROP TABLE t_asm_ord;

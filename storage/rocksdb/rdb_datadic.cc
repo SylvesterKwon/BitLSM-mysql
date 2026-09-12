@@ -3724,8 +3724,9 @@ uint Rdb_key_def::setup_vector_index(const TABLE &tbl,
 // column from its Field type. Single source of truth so the build-time index
 // type (which picks kRange equal-mass vs kEquality frequency-balanced binning)
 // and the extract-time encoding can never disagree (a mismatch would mis-bin
-// rows). Binary columns take their index type from kBinaryIndexType, the same
-// constant rdb_bitlsm_query.cc::field_to_attr reads.
+// rows). The index type comes from rdb_bitlsm_index_type_for(), the same helper
+// rdb_bitlsm_query.cc::field_to_attr reads: column type by default, overridden
+// by the key part's ORDERED / UNORDERED keyword.
 //
 // M3a-4 SCOPE: only the encodings below are implemented. DATE/NEWDATE packs
 // into a 3-byte order-monotone okey (Enc::DATE3, below). DATETIME/DATETIME2/
@@ -3736,7 +3737,8 @@ uint Rdb_key_def::setup_vector_index(const TABLE &tbl,
 // type.
 static bool bitlsm_derive_enc(const Field *field,
                               Rdb_bitlsm_attr_plan::Enc *enc,
-                              bit_lsm::IndexType *index_type) {
+                              bit_lsm::IndexType *index_type,
+                              bool declared_ordered, bool declared_unordered) {
   using Enc = Rdb_bitlsm_attr_plan::Enc;
   switch (field->real_type()) {
     case MYSQL_TYPE_TINY:
@@ -3745,24 +3747,29 @@ static bool bitlsm_derive_enc(const Field *field,
     case MYSQL_TYPE_LONG:
     case MYSQL_TYPE_LONGLONG:
       *enc = field->is_unsigned() ? Enc::INT_UNSIGNED : Enc::INT_SIGNED;
-      *index_type = bit_lsm::IndexType::kRange;
+      *index_type = rdb_bitlsm_index_type_for(false, declared_ordered,
+                                             declared_unordered);
       return true;
     case MYSQL_TYPE_FLOAT:
       *enc = Enc::FLOAT32;
-      *index_type = bit_lsm::IndexType::kRange;
+      *index_type = rdb_bitlsm_index_type_for(false, declared_ordered,
+                                             declared_unordered);
       return true;
     case MYSQL_TYPE_DOUBLE:
       *enc = Enc::FLOAT64;
-      *index_type = bit_lsm::IndexType::kRange;
+      *index_type = rdb_bitlsm_index_type_for(false, declared_ordered,
+                                             declared_unordered);
       return true;
     case MYSQL_TYPE_NEWDATE:  // DATE stored as 3B little-endian, order-monotone
       *enc = Enc::DATE3;
-      *index_type = bit_lsm::IndexType::kRange;
+      *index_type = rdb_bitlsm_index_type_for(false, declared_ordered,
+                                             declared_unordered);
       return true;
     case MYSQL_TYPE_STRING:   // CHAR/BINARY, fixed width (binary collation)
     case MYSQL_TYPE_VARCHAR:  // VARCHAR/VARBINARY (binary collation)
       *enc = Enc::BINARY_STR;
-      *index_type = kBinaryIndexType;
+      *index_type = rdb_bitlsm_index_type_for(true, declared_ordered,
+                                              declared_unordered);
       return true;
     default:
       return false;  // not yet supported by the extractor
@@ -3858,7 +3865,9 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
     const Field *field = ki->key_part[i].field;
     Rdb_bitlsm_attr_plan::Enc enc;
     bit_lsm::IndexType index_type;
-    if (!bitlsm_derive_enc(field, &enc, &index_type)) {
+    if (!bitlsm_derive_enc(field, &enc, &index_type,
+                           (ki->m_bitlsm_ordered_mask >> i) & 1U,
+                           (ki->m_bitlsm_unordered_mask >> i) & 1U)) {
       LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                       "BITLSM_INDEX: attribute type not yet supported by the "
                       "extractor (M3a-4 scope)");
