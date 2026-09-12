@@ -117,6 +117,29 @@ CREATE TABLE t_kw_uniq (
   UNIQUE KEY u (a UNORDERED)
 ) ENGINE=ROCKSDB;
 
+--echo # SHOW CREATE TABLE round-trips the keyword. Without this a dump and
+--echo # restore would rebuild the index with the default bin layout and
+--echo # silently stop pruning whatever the keyword was there to prune.
+CREATE TABLE t_kw_show (
+  id BIGINT NOT NULL,
+  a INT, s VARBINARY(16), u INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_kw_show_cf',
+  INDEX bi (a, s ORDERED, u UNORDERED) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SHOW CREATE TABLE t_kw_show;
+DROP TABLE t_kw_show;
+
+--echo # Reject: a key part prefix length. SABI bins the whole stored value, so
+--echo # a prefix would be accepted and then ignored -- the index would not be
+--echo # the one that was asked for.
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_kw_prefix (
+  id BIGINT NOT NULL,
+  s VARBINARY(16),
+  PRIMARY KEY (id) COMMENT 'cfname=t_kw_prefix_cf',
+  INDEX bi (s(4)) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
 --echo # ORDERED and UNORDERED stay non-reserved: still usable as identifiers.
 CREATE TABLE t_kw_ident (ordered INT, unordered INT, PRIMARY KEY (ordered));
 INSERT INTO t_kw_ident VALUES (1, 2);

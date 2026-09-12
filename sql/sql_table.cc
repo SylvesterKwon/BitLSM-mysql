@@ -7362,6 +7362,14 @@ static bool prepare_bitlsm_index(const Key_spec *key, KEY *key_info,
       }
     if (cf == nullptr) continue;  // resolved by the generic key column builder
 
+    if (kp->get_prefix_length() != 0) {
+      // SABI bins the whole stored value; a prefix length would be accepted
+      // and then ignored, so the index would not be the one the user asked
+      // for. Refuse rather than quietly widen it.
+      my_error(ER_WRONG_ARGUMENTS, MYF(0),
+               "BITLSM_INDEX does not support a key part prefix length");
+      return true;
+    }
     if (cf->is_virtual_gcol()) {  // D10: value doesn't store virtual columns
       my_error(ER_WRONG_ARGUMENTS, MYF(0),
                "BITLSM_INDEX cannot index a virtual generated column");

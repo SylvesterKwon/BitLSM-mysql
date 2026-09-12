@@ -109,6 +109,36 @@ a INT,
 UNIQUE KEY u (a UNORDERED)
 ) ENGINE=ROCKSDB;
 ERROR HY000: Incorrect arguments to ORDERED/UNORDERED is only allowed on a BITLSM_INDEX key part
+# SHOW CREATE TABLE round-trips the keyword. Without this a dump and
+# restore would rebuild the index with the default bin layout and
+# silently stop pruning whatever the keyword was there to prune.
+CREATE TABLE t_kw_show (
+id BIGINT NOT NULL,
+a INT, s VARBINARY(16), u INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_kw_show_cf',
+INDEX bi (a, s ORDERED, u UNORDERED) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SHOW CREATE TABLE t_kw_show;
+Table	Create Table
+t_kw_show	CREATE TABLE `t_kw_show` (
+  `id` bigint NOT NULL,
+  `a` int DEFAULT NULL,
+  `s` varbinary(16) DEFAULT NULL,
+  `u` int DEFAULT NULL,
+  PRIMARY KEY (`id`) COMMENT 'cfname=t_kw_show_cf',
+  KEY `bi` (`a`,`s` ORDERED,`u` UNORDERED) BITLSM_INDEX
+) ENGINE=ROCKSDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP TABLE t_kw_show;
+# Reject: a key part prefix length. SABI bins the whole stored value, so
+# a prefix would be accepted and then ignored -- the index would not be
+# the one that was asked for.
+CREATE TABLE t_kw_prefix (
+id BIGINT NOT NULL,
+s VARBINARY(16),
+PRIMARY KEY (id) COMMENT 'cfname=t_kw_prefix_cf',
+INDEX bi (s(4)) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+ERROR HY000: Incorrect arguments to BITLSM_INDEX does not support a key part prefix length
 # ORDERED and UNORDERED stay non-reserved: still usable as identifiers.
 CREATE TABLE t_kw_ident (ordered INT, unordered INT, PRIMARY KEY (ordered));
 INSERT INTO t_kw_ident VALUES (1, 2);
