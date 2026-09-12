@@ -1,0 +1,82 @@
+--source include/have_rocksdb.inc
+
+# The per-key-part ORDERED keyword decides how the SSTs were binned, so it has
+# to survive the DD round-trip with the BITLSM marker itself: a reopened table
+# that fell back to the binary default would bin against SSTs built the other
+# way. bitlsm_ddl_persist covers the marker; this covers the keyword.
+#
+# Measured the way bitlsm_date_prune measures, and for the same reason: the row
+# set is correct either way (ICP re-checks every candidate), so only the
+# CANDIDATE COUNT shows whether the range actually pruned.
+# rocksdb_number_multiget_keys_read counts one per candidate.
+
+# Under UDT the read path skips the bitmap entirely and full-scans the PK, so
+# there is no pruning to measure. Own file rather than an if-branch inside
+# bitlsm_ddl_persist: a branch would emit different output per combination and
+# a single recorded .result cannot match both.
+--let $udt = `SELECT @@rocksdb_enable_udt_in_mem`
+if ($udt) {
+--skip BitLSM keyword pruning runs under non-UDT combinations only
+}
+
+CREATE TABLE t_kwp (
+  id BIGINT NOT NULL,
+  s VARBINARY(16),
+  payload INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_kwp_cf',
+  INDEX bi (s ORDERED) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO t_kwp
+WITH RECURSIVE q(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM q WHERE n<19999)
+SELECT n, CONCAT('v', LPAD(n, 5, '0')), n FROM q;
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+
+--echo #
+--echo # A 500-of-20000 window before the restart.
+--disable_query_log
+--disable_result_log
+SELECT VARIABLE_VALUE INTO @m0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='rocksdb_number_multiget_keys_read';
+SELECT SUM(payload) INTO @s FROM t_kwp FORCE INDEX(bi)
+  WHERE s BETWEEN 'v01000' AND 'v01499';
+SELECT VARIABLE_VALUE INTO @m1 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='rocksdb_number_multiget_keys_read';
+--let $cand_before = `SELECT @m1-@m0`
+--enable_result_log
+--enable_query_log
+
+# Loose on purpose, as in bitlsm_date_prune: this asserts that pruning
+# happened, not a bin count. Without the ORDERED keyword the range is not
+# representable, every row is a candidate, and this reads 20000.
+--let $assert_text = ORDERED key part prunes the range before restart
+--let $assert_cond = $cand_before < 10000
+--source include/assert.inc
+
+--source include/restart_mysqld.inc
+
+--echo #
+--echo # Same window after the restart. Had the keyword not persisted, the
+--echo # reopened table would bin s as a plain binary attr and prune nothing.
+--disable_query_log
+--disable_result_log
+SELECT VARIABLE_VALUE INTO @m0 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='rocksdb_number_multiget_keys_read';
+SELECT SUM(payload) INTO @s FROM t_kwp FORCE INDEX(bi)
+  WHERE s BETWEEN 'v01000' AND 'v01499';
+SELECT VARIABLE_VALUE INTO @m1 FROM performance_schema.global_status
+  WHERE VARIABLE_NAME='rocksdb_number_multiget_keys_read';
+--let $cand_after = `SELECT @m1-@m0`
+--enable_result_log
+--enable_query_log
+
+--let $assert_text = ORDERED key part survives the restart and still prunes
+--let $assert_cond = $cand_after < 10000
+--source include/assert.inc
+
+--echo #
+--echo # The answer is the same either way -- which is why the candidate count,
+--echo # not the row set, is what this test measures.
+SELECT COUNT(*) FROM t_kwp WHERE s BETWEEN 'v01000' AND 'v01499';
+
+DROP TABLE t_kwp;

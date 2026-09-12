@@ -1446,6 +1446,8 @@ void warn_about_deprecated_binary(THD *thd)
 %token  LAST_INSERT_IDS_SYM 10024                /* FB MYSQL */
 %token<lexer.keyword> RAFT_LOG_POSITION_SYM 10025   /* FB MYSQL */
 %token<lexer.keyword> BITLSM_INDEX_SYM 10026            /* FB MYSQL */
+%token<lexer.keyword> ORDERED_SYM 10027                 /* FB MYSQL */
+%token<lexer.keyword> UNORDERED_SYM 10028               /* FB MYSQL */
 
 /*
   Resolve column attribute ambiguity -- force precedence of "UNIQUE KEY" against
@@ -1539,6 +1541,9 @@ void warn_about_deprecated_binary(THD *thd)
 
 %type <order_direction>
         ordering_direction opt_ordering_direction
+
+%type <bitlsm_key_part_type>
+        opt_bitlsm_key_part_type
 
 /*
   Bit field of MYSQL_START_TRANS_OPT_* flags.
@@ -8234,13 +8239,14 @@ key_list:
         ;
 
 key_part:
-          ident opt_ordering_direction
+          ident opt_ordering_direction opt_bitlsm_key_part_type
           {
-            $$= NEW_PTN PT_key_part_specification(to_lex_cstring($1), $2, 0);
+            $$= NEW_PTN PT_key_part_specification(to_lex_cstring($1), $2, 0,
+                                                  $3);
             if ($$ == NULL)
               MYSQL_YYABORT;
           }
-        | ident '(' NUM ')' opt_ordering_direction
+        | ident '(' NUM ')' opt_ordering_direction opt_bitlsm_key_part_type
           {
             int key_part_length= atoi($3.str);
             if (!key_part_length)
@@ -8248,7 +8254,7 @@ key_part:
               my_error(ER_KEY_PART_0, MYF(0), $1.str);
             }
             $$= NEW_PTN PT_key_part_specification(to_lex_cstring($1), $5,
-                                                  key_part_length);
+                                                  key_part_length, $6);
             if ($$ == NULL)
               MYSQL_YYABORT; /* purecov: deadcode */
           }
@@ -12910,6 +12916,17 @@ opt_ordering_direction:
         | ordering_direction
         ;
 
+/*
+  BITLSM_INDEX per-key-part index type. Only meaningful on a BITLSM_INDEX;
+  prepare_bitlsm_index rejects it anywhere else rather than letting it be
+  silently ignored.
+*/
+opt_bitlsm_key_part_type:
+          /* empty */   { $$= Bitlsm_key_part_type::NOT_SPECIFIED; }
+        | ORDERED_SYM   { $$= Bitlsm_key_part_type::ORDERED; }
+        | UNORDERED_SYM { $$= Bitlsm_key_part_type::UNORDERED; }
+        ;
+
 ordering_direction:
           ASC         { $$= ORDER_ASC; }
         | DESC        { $$= ORDER_DESC; }
@@ -16064,6 +16081,7 @@ ident_keywords_unambiguous:
         | OPEN_SYM
         | OPTIONAL_SYM
         | OPTIONS_SYM
+        | ORDERED_SYM
         | ORDINALITY_SYM
         | ORGANIZATION_SYM
         | OTHERS_SYM
@@ -16243,6 +16261,7 @@ ident_keywords_unambiguous:
         | UNDOFILE_SYM
         | UNDO_BUFFER_SIZE_SYM
         | UNKNOWN_SYM
+        | UNORDERED_SYM
         | UNREGISTER_SYM
         | UNTIL_SYM
         | UPGRADE_SYM

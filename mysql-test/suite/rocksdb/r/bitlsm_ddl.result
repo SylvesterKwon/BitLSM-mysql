@@ -50,6 +50,102 @@ s VARCHAR(32) CHARACTER SET utf8mb4,
 INDEX bi (s) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 ERROR HY000: Incorrect arguments to BITLSM_INDEX column type is not supported
+# Reject: PAD SPACE binary collation. utf8mb4_bin sorts by bytes but pads,
+# so SQL holds 'ab' = 'ab ' where SABI's memcmp does not -- a row with a
+# trailing space would be pruned away from a query that must match it.
+CREATE TABLE t_padbin (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_padbin_cf',
+s VARCHAR(32) COLLATE utf8mb4_bin,
+INDEX bi (s) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+ERROR HY000: Incorrect arguments to BITLSM_INDEX column type is not supported
+# Accept: NO PAD binary collation -- the stored bytes are the value.
+CREATE TABLE t_nopadbin (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_nopadbin_cf',
+s VARCHAR(32) COLLATE utf8mb4_0900_bin,
+INDEX bi (s) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+DROP TABLE t_nopadbin;
+# Reject: fixed-width CHAR/BINARY. The row stores it space-padded, so the
+# bytes differ from the comparand a query supplies even under NO PAD.
+CREATE TABLE t_fixedchar (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_fixedchar_cf',
+s BINARY(16),
+INDEX bi (s) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+ERROR HY000: Incorrect arguments to BITLSM_INDEX column type is not supported
+# ==== ORDERED / UNORDERED key-part keyword ====
+# Accept: ORDERED on a binary key part -- the case the keyword exists for.
+CREATE TABLE t_kw_ord (
+id BIGINT NOT NULL,
+a INT, s VARBINARY(16),
+PRIMARY KEY (id) COMMENT 'cfname=t_kw_ord_cf',
+INDEX bi (a, s ORDERED) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+DROP TABLE t_kw_ord;
+# Accept: UNORDERED on a numeric key part -- the mirror case. A numeric
+# is kRange by default; declaring it UNORDERED gives an equality-only
+# column a frequency-balanced dictionary instead.
+CREATE TABLE t_kw_unord (
+id BIGINT NOT NULL,
+a INT, s VARBINARY(16),
+PRIMARY KEY (id) COMMENT 'cfname=t_kw_unord_cf',
+INDEX bi (a UNORDERED, s) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+DROP TABLE t_kw_unord;
+# Reject: the keyword on a plain index. It selects a BITLSM bin layout
+# and means nothing elsewhere, so accepting and ignoring it would read as
+# a promise the index does not keep.
+CREATE TABLE t_kw_plain (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_kw_plain_cf',
+a INT,
+INDEX k (a ORDERED)
+) ENGINE=ROCKSDB;
+ERROR HY000: Incorrect arguments to ORDERED/UNORDERED is only allowed on a BITLSM_INDEX key part
+# Reject: the keyword on a UNIQUE index.
+CREATE TABLE t_kw_uniq (
+id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_kw_uniq_cf',
+a INT,
+UNIQUE KEY u (a UNORDERED)
+) ENGINE=ROCKSDB;
+ERROR HY000: Incorrect arguments to ORDERED/UNORDERED is only allowed on a BITLSM_INDEX key part
+# SHOW CREATE TABLE round-trips the keyword. Without this a dump and
+# restore would rebuild the index with the default bin layout and
+# silently stop pruning whatever the keyword was there to prune.
+CREATE TABLE t_kw_show (
+id BIGINT NOT NULL,
+a INT, s VARBINARY(16), u INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_kw_show_cf',
+INDEX bi (a, s ORDERED, u UNORDERED) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+SHOW CREATE TABLE t_kw_show;
+Table	Create Table
+t_kw_show	CREATE TABLE `t_kw_show` (
+  `id` bigint NOT NULL,
+  `a` int DEFAULT NULL,
+  `s` varbinary(16) DEFAULT NULL,
+  `u` int DEFAULT NULL,
+  PRIMARY KEY (`id`) COMMENT 'cfname=t_kw_show_cf',
+  KEY `bi` (`a`,`s` ORDERED,`u` UNORDERED) BITLSM_INDEX
+) ENGINE=ROCKSDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP TABLE t_kw_show;
+# Reject: a key part prefix length. SABI bins the whole stored value, so
+# a prefix would be accepted and then ignored -- the index would not be
+# the one that was asked for.
+CREATE TABLE t_kw_prefix (
+id BIGINT NOT NULL,
+s VARBINARY(16),
+PRIMARY KEY (id) COMMENT 'cfname=t_kw_prefix_cf',
+INDEX bi (s(4)) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+ERROR HY000: Incorrect arguments to BITLSM_INDEX does not support a key part prefix length
+# ORDERED and UNORDERED stay non-reserved: still usable as identifiers.
+CREATE TABLE t_kw_ident (ordered INT, unordered INT, PRIMARY KEY (ordered));
+INSERT INTO t_kw_ident VALUES (1, 2);
+SELECT ordered, unordered FROM t_kw_ident;
+ordered	unordered
+1	2
+DROP TABLE t_kw_ident;
 # Reject: virtual generated column
 CREATE TABLE t_vg (
 id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_vg_cf',

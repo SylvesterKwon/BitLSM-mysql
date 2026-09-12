@@ -86,9 +86,9 @@ std::string rdb_bitlsm_serialize_descriptor(
   put_u16(&out, RDB_BITLSM_DESCRIPTOR_VERSION);
 
   // --- schema ---
-  put_u32(&out, static_cast<uint32_t>(desc.schema.roles.size()));
-  for (const auto role : desc.schema.roles) {
-    put_u8(&out, static_cast<uint8_t>(role));
+  put_u32(&out, static_cast<uint32_t>(desc.schema.index_types.size()));
+  for (const auto index_type : desc.schema.index_types) {
+    put_u8(&out, static_cast<uint8_t>(index_type));
   }
   put_double(&out, desc.schema.rho);
 
@@ -119,14 +119,17 @@ bool rdb_bitlsm_deserialize_descriptor(std::string_view blob,
   Reader r(blob);
   if (r.u16() != RDB_BITLSM_DESCRIPTOR_VERSION || r.bad()) return false;
 
-  const uint32_t role_count = r.u32();
-  if (!r.count_fits(role_count)) return false;
-  out->schema.roles.clear();
-  out->schema.roles.reserve(role_count);
-  for (uint32_t i = 0; i < role_count; ++i) {
+  const uint32_t index_type_count = r.u32();
+  if (!r.count_fits(index_type_count)) return false;
+  out->schema.index_types.clear();
+  out->schema.index_types.reserve(index_type_count);
+  for (uint32_t i = 0; i < index_type_count; ++i) {
     const uint8_t v = r.u8();
-    if (v > static_cast<uint8_t>(bit_lsm::ORDERED)) return false;
-    out->schema.roles.push_back(static_cast<bit_lsm::AttrRole>(v));
+    // Wire values are unchanged by the AttrRole -> IndexType rename:
+    // UNORDERED(0)/ORDERED(1) became kEquality(0)/kRange(1), same numbering,
+    // so descriptors written before the rename still decode correctly.
+    if (v > static_cast<uint8_t>(bit_lsm::IndexType::kRange)) return false;
+    out->schema.index_types.push_back(static_cast<bit_lsm::IndexType>(v));
   }
   out->schema.rho = r.dbl();
 

@@ -1487,6 +1487,11 @@ static bool fill_index_from_dd(THD *thd, TABLE_SHARE *share,
   // M3a-2: restore BITLSM_INDEX flag from the data dictionary.
   if (idx_options.exists("bitlsm")) {
     keyinfo->m_is_bitlsm = true;
+    if (idx_options.exists("bitlsm_ordered_mask"))
+      idx_options.get("bitlsm_ordered_mask", &keyinfo->m_bitlsm_ordered_mask);
+    if (idx_options.exists("bitlsm_unordered_mask"))
+      idx_options.get("bitlsm_unordered_mask",
+                      &keyinfo->m_bitlsm_unordered_mask);
   }
 
   // Read comment

@@ -90,6 +90,15 @@ class KEY_CREATE_INFO {
 
 extern KEY_CREATE_INFO default_key_create_info;
 
+// BITLSM_INDEX only: the optional per-key-part ORDERED / UNORDERED keyword.
+// It selects which predicates the attribute's bins serve -- ORDERED cuts bins
+// by equal mass over sorted values and answers ranges, UNORDERED bins by a
+// frequency-balanced value dictionary and answers equality alone. NOT_SPECIFIED
+// leaves the choice to the column type (numeric -> ordered, binary string ->
+// unordered), which is what every index declared before this keyword existed
+// gets, so the default is unchanged.
+enum class Bitlsm_key_part_type { NOT_SPECIFIED, ORDERED, UNORDERED };
+
 class Key_part_spec {
  public:
   Key_part_spec(Item *expression, enum_order order)
@@ -108,13 +117,19 @@ class Key_part_spec {
         m_expression(expression),
         m_has_expression(true) {}
 
-  Key_part_spec(LEX_CSTRING column_name, uint prefix_length, enum_order order)
+  Key_part_spec(LEX_CSTRING column_name, uint prefix_length, enum_order order,
+                Bitlsm_key_part_type bitlsm_type =
+                    Bitlsm_key_part_type::NOT_SPECIFIED)
       : m_is_ascending((order == ORDER_DESC) ? false : true),
         m_is_explicit(order != ORDER_NOT_RELEVANT),
         m_field_name(column_name.str),
         m_prefix_length(prefix_length),
         m_expression(nullptr),
-        m_has_expression(false) {}
+        m_has_expression(false),
+        m_bitlsm_type(bitlsm_type) {}
+
+  /// The ORDERED / UNORDERED keyword this key part carried, if any.
+  Bitlsm_key_part_type get_bitlsm_type() const { return m_bitlsm_type; }
 
   bool operator==(const Key_part_spec &other) const;
   /**
@@ -206,6 +221,9 @@ class Key_part_spec {
     key part.
   */
   bool m_has_expression;
+
+  /// BITLSM_INDEX per-key-part index type; NOT_SPECIFIED when absent.
+  Bitlsm_key_part_type m_bitlsm_type{Bitlsm_key_part_type::NOT_SPECIFIED};
 };
 
 class Key_spec {

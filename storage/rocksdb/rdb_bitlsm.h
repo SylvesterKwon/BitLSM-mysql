@@ -22,6 +22,27 @@
 
 namespace myrocks {
 
+// What makes two BITLSM schemas on one CF "the same" for the D5 one-schema-per-
+// CF check. The index type alone stopped being enough when binary columns
+// became kRange like numerics: an INT attr and a VARBINARY attr now share an
+// index type and would compare equal, letting a second, incompatible table
+// bind to the CF. The extractor encoding is what actually fixes a column's
+// bytes, so the key pairs the two.
+struct Rdb_bitlsm_attr_key {
+  bit_lsm::IndexType index_type;
+  Rdb_bitlsm_attr_plan::Enc enc;
+  // Width too: INT and BIGINT share (kRange, INT_SIGNED) and would otherwise
+  // still compare equal. FIXED carries the field's byte count, VARLEN/BLOB the
+  // length-prefix size, so this is what pins the byte representation.
+  uint32_t len;
+  bool operator==(const Rdb_bitlsm_attr_key &) const = default;
+};
+using Rdb_bitlsm_schema_key = std::vector<Rdb_bitlsm_attr_key>;
+
+// Build the key from the two halves every bind site already holds.
+Rdb_bitlsm_schema_key rdb_bitlsm_schema_key_of(
+    const bit_lsm::SABISchema &schema, const Rdb_bitlsm_attr_plan &plan);
+
 // Process-global map cf_name -> bound SABIFactory. Written by
 // Rdb_key_def::setup_bitlsm_index at table open; read by the per-CF UDI factory
 // at SST build/open (cold paths). Guarded by an internal mutex.
@@ -32,7 +53,7 @@ class Rdb_bitlsm_registry {
   // Bind a CF to a SABIFactory. Returns false if cf_name is already bound to a
   // DIFFERENT schema (D5: <=1 bitlsm schema per CF) so the caller can fail the
   // open loudly. Same-schema rebind (reopen) is idempotent OK.
-  bool bind(const std::string &cf_name, std::vector<bit_lsm::AttrRole> roles,
+  bool bind(const std::string &cf_name, Rdb_bitlsm_schema_key schema_key,
             std::shared_ptr<bit_lsm::SABIFactory> factory);
 
   // Returns nullptr if cf_name is not bound (non-bitlsm or not yet opened).
@@ -80,7 +101,7 @@ class Rdb_bitlsm_registry {
  private:
   Rdb_bitlsm_registry() = default;
   struct Entry {
-    std::vector<bit_lsm::AttrRole> roles;
+    Rdb_bitlsm_schema_key schema_key;
     std::shared_ptr<bit_lsm::SABIFactory> factory;
     // M5: refresh worker + stats cache; empty until estimator_attach.
     std::unique_ptr<bit_lsm::CardinalityEstimator> estimator;

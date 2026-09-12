@@ -13,9 +13,12 @@ namespace myrocks {
 bool rdb_bitlsm_smoke_check() {
   bit_lsm::BitLSMOptions opts;
   opts.attr_num = 2;
-  // a0: ORDERED double (AttrSpec defaults), a1: UNORDERED opaque bytes.
-  opts.attr_specs = {bit_lsm::AttrSpec(bit_lsm::ORDERED),
-                     bit_lsm::AttrSpec(bit_lsm::UNORDERED)};
+  // a0: kRange 8-byte float, a1: kEquality variable-length opaque bytes.
+  opts.attr_specs = {
+      bit_lsm::AttrSpec(bit_lsm::IndexType::kRange,
+                        bit_lsm::PhysicalType::kFloat, 8),
+      bit_lsm::AttrSpec(bit_lsm::IndexType::kEquality,
+                        bit_lsm::PhysicalType::kVarBinary, 0)};
   opts.read_seqno = 0;
   opts.rho = 0.1;
 

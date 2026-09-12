@@ -2373,6 +2373,17 @@ bool store_create_info(THD *thd, Table_ref *table_list, String *packet,
       }
       if (key_part->key_part_flag & HA_REVERSE_SORT)
         packet->append(STRING_WITH_LEN(" DESC"));
+      // A BITLSM key part's ORDERED / UNORDERED keyword decides how the
+      // attribute is binned, so it has to come back out here: without it a
+      // dump and restore would rebuild the index with the default layout and
+      // silently stop pruning whatever the keyword was there to prune.
+      if (key_info->is_bitlsm_index() &&
+          j < sizeof(key_info->m_bitlsm_ordered_mask) * 8) {
+        if (key_info->m_bitlsm_ordered_mask & (1U << j))
+          packet->append(STRING_WITH_LEN(" ORDERED"));
+        else if (key_info->m_bitlsm_unordered_mask & (1U << j))
+          packet->append(STRING_WITH_LEN(" UNORDERED"));
+      }
     }
     packet->append(')');
     store_key_options(thd, packet, table, key_info);

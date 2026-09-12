@@ -669,8 +669,10 @@ PT_key_part_specification::PT_key_part_specification(Item *expression,
     : m_expression(expression), m_order(order) {}
 
 PT_key_part_specification::PT_key_part_specification(
-    const LEX_CSTRING &column_name, enum_order order, int prefix_length)
-    : m_expression(nullptr),
+    const LEX_CSTRING &column_name, enum_order order, int prefix_length,
+    Bitlsm_key_part_type bitlsm_type)
+    : m_bitlsm_type(bitlsm_type),
+      m_expression(nullptr),
       m_order(order),
       m_column_name(column_name),
       m_prefix_length(prefix_length) {}
@@ -1753,7 +1755,8 @@ static bool setup_index(keytype key_type, const LEX_STRING name,
           new (pc->mem_root) Key_part_spec(kp.get_expression(), kp.get_order());
     } else {
       spec = new (pc->mem_root) Key_part_spec(
-          kp.get_column_name(), kp.get_prefix_length(), kp.get_order());
+          kp.get_column_name(), kp.get_prefix_length(), kp.get_order(),
+          kp.get_bitlsm_type());
     }
     if (spec == nullptr || cols.push_back(spec)) {
       return true; /* purecov: deadcode */
@@ -1890,7 +1893,8 @@ bool PT_foreign_key_definition::contextualize(Table_ddl_parse_context *pc) {
     if (kp.contextualize(pc)) return true;
 
     Key_part_spec *spec = new (pc->mem_root) Key_part_spec(
-        kp.get_column_name(), kp.get_prefix_length(), kp.get_order());
+        kp.get_column_name(), kp.get_prefix_length(), kp.get_order(),
+        kp.get_bitlsm_type());
     if (spec == nullptr || cols.push_back(spec)) {
       return true; /* purecov: deadcode */
     }

@@ -2094,7 +2094,9 @@ class PT_key_part_specification : public Parse_tree_node {
            index, or zero if it should index the entire column.
   */
   PT_key_part_specification(const LEX_CSTRING &column_name, enum_order order,
-                            int prefix_length);
+                            int prefix_length,
+                            Bitlsm_key_part_type bitlsm_type =
+                                Bitlsm_key_part_type::NOT_SPECIFIED);
 
   /**
     Contextualize this key part specification. This will also call itemize on
@@ -2157,7 +2159,16 @@ class PT_key_part_specification : public Parse_tree_node {
   */
   int get_prefix_length() const { return m_prefix_length; }
 
+  /**
+    @returns The BITLSM_INDEX per-key-part index type the user wrote, or
+             NOT_SPECIFIED when the keyword was absent.
+  */
+  Bitlsm_key_part_type get_bitlsm_type() const { return m_bitlsm_type; }
+
  private:
+  /// BITLSM_INDEX per-key-part index type (ORDERED / UNORDERED keyword).
+  Bitlsm_key_part_type m_bitlsm_type{Bitlsm_key_part_type::NOT_SPECIFIED};
+
   /**
     The indexed expression in case this is a functional key part. Only valid if
     has_expression() returns true.

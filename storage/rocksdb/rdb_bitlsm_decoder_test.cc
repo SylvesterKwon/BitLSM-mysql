@@ -57,12 +57,26 @@ std::string make_key(uint32_t index_number, std::string_view tail = "pk") {
   return k;
 }
 
-std::vector<EncodedAttr> run(const Rdb_bitlsm_attr_plan &plan,
-                             std::string_view key, std::string_view value) {
+// An EncodedAttr borrows: binary attrs view `value`, numeric attrs view the
+// extractor's okey scratch. The extractor here is local, so its scratch dies
+// at return -- copy every view into an owning string before handing results
+// to the assertions.
+using OwnedAttr = std::variant<std::monostate, std::string>;
+
+std::vector<OwnedAttr> run(const Rdb_bitlsm_attr_plan &plan,
+                           std::string_view key, std::string_view value) {
   auto shared = std::make_shared<const Rdb_bitlsm_attr_plan>(plan);
   Rdb_bitlsm_extractor extractor(shared);
-  std::vector<EncodedAttr> out(plan.attr_num);
-  extractor.ExtractAll(key, value, out.data());
+  std::vector<EncodedAttr> enc(plan.attr_num);
+  extractor.ExtractAll(key, value, enc.data());
+  std::vector<OwnedAttr> out;
+  out.reserve(plan.attr_num);
+  for (const auto &e : enc) {
+    if (std::holds_alternative<std::string_view>(e))
+      out.emplace_back(std::string(std::get<std::string_view>(e)));
+    else
+      out.emplace_back(std::monostate{});
+  }
   return out;
 }
 
@@ -144,16 +158,16 @@ TEST(BitlsmDecoder, MixedRowExtractsAllTypes) {
   auto out = run(plan, make_key(kIdxNo), v);
 
   ASSERT_EQ(out.size(), 6u);
-  ASSERT_TRUE(std::holds_alternative<uint64_t>(out[0]));
-  EXPECT_EQ(std::get<uint64_t>(out[0]), bit_lsm::I64ToOkey(-5));
-  ASSERT_TRUE(std::holds_alternative<uint64_t>(out[1]));
-  EXPECT_EQ(std::get<uint64_t>(out[1]), bit_lsm::U64ToOkey(300));
-  ASSERT_TRUE(std::holds_alternative<uint64_t>(out[2]));
-  EXPECT_EQ(std::get<uint64_t>(out[2]), bit_lsm::F64ToOkey(2.5));
-  ASSERT_TRUE(std::holds_alternative<uint64_t>(out[3]));
-  EXPECT_EQ(std::get<uint64_t>(out[3]), bit_lsm::U64ToOkey(0x332211));
-  ASSERT_TRUE(std::holds_alternative<std::string_view>(out[4]));
-  EXPECT_EQ(std::get<std::string_view>(out[4]), std::string_view("hi"));
+  ASSERT_TRUE(std::holds_alternative<std::string>(out[0]));
+  EXPECT_EQ(std::get<std::string>(out[0]), bit_lsm::OkeyToBytes(bit_lsm::I64ToOkey(-5)));
+  ASSERT_TRUE(std::holds_alternative<std::string>(out[1]));
+  EXPECT_EQ(std::get<std::string>(out[1]), bit_lsm::OkeyToBytes(bit_lsm::U64ToOkey(300)));
+  ASSERT_TRUE(std::holds_alternative<std::string>(out[2]));
+  EXPECT_EQ(std::get<std::string>(out[2]), bit_lsm::OkeyToBytes(bit_lsm::F64ToOkey(2.5)));
+  ASSERT_TRUE(std::holds_alternative<std::string>(out[3]));
+  EXPECT_EQ(std::get<std::string>(out[3]), bit_lsm::OkeyToBytes(bit_lsm::U64ToOkey(0x332211)));
+  ASSERT_TRUE(std::holds_alternative<std::string>(out[4]));
+  EXPECT_EQ(std::get<std::string>(out[4]), std::string("hi"));
   EXPECT_TRUE(std::holds_alternative<std::monostate>(out[5]));  // NULL
 }
 
@@ -173,8 +187,8 @@ TEST(BitlsmDecoder, ForeignRowAndShortKeyAreAllNull) {
   // Matching index number -> extracts normally (sanity anchor).
   {
     auto out = run(plan, make_key(42), v);
-    ASSERT_TRUE(std::holds_alternative<uint64_t>(out[0]));
-    EXPECT_EQ(std::get<uint64_t>(out[0]), bit_lsm::I64ToOkey(-5));
+    ASSERT_TRUE(std::holds_alternative<std::string>(out[0]));
+    EXPECT_EQ(std::get<std::string>(out[0]), bit_lsm::OkeyToBytes(bit_lsm::I64ToOkey(-5)));
   }
   // Different index number -> foreign row -> monostate.
   {
@@ -204,10 +218,10 @@ TEST(BitlsmDecoder, SignExtensionAndSignedMonotonicity) {
   put_le(&v, uint32_t(-1) & 0xff, 1);      // int8 -1 == 0xFF
 
   auto out = run(plan, make_key(7), v);
-  ASSERT_TRUE(std::holds_alternative<uint64_t>(out[0]));
-  EXPECT_EQ(std::get<uint64_t>(out[0]), bit_lsm::I64ToOkey(-3));
-  ASSERT_TRUE(std::holds_alternative<uint64_t>(out[1]));
-  EXPECT_EQ(std::get<uint64_t>(out[1]), bit_lsm::I64ToOkey(-1));
+  ASSERT_TRUE(std::holds_alternative<std::string>(out[0]));
+  EXPECT_EQ(std::get<std::string>(out[0]), bit_lsm::OkeyToBytes(bit_lsm::I64ToOkey(-3)));
+  ASSERT_TRUE(std::holds_alternative<std::string>(out[1]));
+  EXPECT_EQ(std::get<std::string>(out[1]), bit_lsm::OkeyToBytes(bit_lsm::I64ToOkey(-1)));
 
   // Order preservation: -3 < 0 < 5 must hold in okey space.
   EXPECT_LT(bit_lsm::I64ToOkey(-3), bit_lsm::I64ToOkey(0));
@@ -227,8 +241,8 @@ TEST(BitlsmDecoder, Float32AndFloatMonotonicity) {
   put_f32(&v, 1.5f);
 
   auto out = run(plan, make_key(7), v);
-  ASSERT_TRUE(std::holds_alternative<uint64_t>(out[0]));
-  EXPECT_EQ(std::get<uint64_t>(out[0]), bit_lsm::F64ToOkey(static_cast<double>(1.5f)));
+  ASSERT_TRUE(std::holds_alternative<std::string>(out[0]));
+  EXPECT_EQ(std::get<std::string>(out[0]), bit_lsm::OkeyToBytes(bit_lsm::F64ToOkey(static_cast<double>(1.5f))));
 
   EXPECT_LT(bit_lsm::F64ToOkey(-2.0), bit_lsm::F64ToOkey(0.0));
   EXPECT_LT(bit_lsm::F64ToOkey(0.0), bit_lsm::F64ToOkey(3.5));
@@ -257,8 +271,8 @@ TEST(BitlsmDecoder, TtlAndUnpackInfoSkip) {
   put_le(&v, 4000000000u, 4);  // attr0 unsigned, > INT_MAX
 
   auto out = run(plan, make_key(7), v);
-  ASSERT_TRUE(std::holds_alternative<uint64_t>(out[0]));
-  EXPECT_EQ(std::get<uint64_t>(out[0]), bit_lsm::U64ToOkey(4000000000u));
+  ASSERT_TRUE(std::holds_alternative<std::string>(out[0]));
+  EXPECT_EQ(std::get<std::string>(out[0]), bit_lsm::OkeyToBytes(bit_lsm::U64ToOkey(4000000000u)));
 }
 
 }  // namespace

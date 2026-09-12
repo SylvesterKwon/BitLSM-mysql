@@ -7279,10 +7279,26 @@ static bool bitlsm_type_supported(const Create_field *cf) {
     case MYSQL_TYPE_DATE:
     case MYSQL_TYPE_NEWDATE:
       return true;
-    case MYSQL_TYPE_STRING:
     case MYSQL_TYPE_VARCHAR:
-      return cf->charset == &my_charset_bin ||
-             (cf->charset != nullptr && (cf->charset->state & MY_CS_BINSORT));
+      // SABI bins and compares a binary attribute by memcmp over the bytes the
+      // row stores, so the collation must agree that those bytes ARE the value.
+      // Binary sort order alone is not enough: utf8mb4_bin and latin1_bin are
+      // MY_CS_BINSORT but PAD SPACE, where SQL holds 'ab' = 'ab ' while memcmp
+      // does not. A row stored with a trailing space would then be pruned away
+      // from a query that must match it -- a false negative the engine's
+      // per-row re-check cannot recover, because the candidate never arrives.
+      // NO PAD binary collations (binary, *_0900_bin) have no such gap.
+      return cf->charset != nullptr &&
+             (cf->charset == &my_charset_bin ||
+              ((cf->charset->state & MY_CS_BINSORT) &&
+               cf->charset->pad_attribute == NO_PAD));
+    case MYSQL_TYPE_STRING:
+      // CHAR/BINARY is stored space-padded in the row, so the stored bytes
+      // differ from the comparand a query supplies ('ab' vs "ab  ") and the
+      // same false negative applies even under NO PAD. Supporting it means
+      // trimming on both the extract and the compare side; until that exists,
+      // refuse it at DDL rather than bin it wrong.
+      return false;
     default:
       return false;
   }
@@ -7295,7 +7311,19 @@ static bool bitlsm_type_supported(const Create_field *cf) {
 // Returns true on error (my_error already raised).
 static bool prepare_bitlsm_index(const Key_spec *key, KEY *key_info,
                                  List<Create_field> *create_list) {
-  if (!key->key_create_info.m_is_bitlsm) return false;  // not a bitlsm index
+  if (!key->key_create_info.m_is_bitlsm) {
+    // The keyword selects a BITLSM bin layout and means nothing to any other
+    // index type. Refuse it there rather than accept and ignore it, which
+    // would read as "this index answers ranges that way" and not be true.
+    for (const Key_part_spec *kp : key->columns) {
+      if (kp->get_bitlsm_type() != Bitlsm_key_part_type::NOT_SPECIFIED) {
+        my_error(ER_WRONG_ARGUMENTS, MYF(0),
+                 "ORDERED/UNORDERED is only allowed on a BITLSM_INDEX key part");
+        return true;
+      }
+    }
+    return false;  // not a bitlsm index
+  }
 
   // D3: virtual keyspace => plain non-unique secondary index only.
   if (key->type != KEYTYPE_MULTIPLE) {
@@ -7304,7 +7332,27 @@ static bool prepare_bitlsm_index(const Key_spec *key, KEY *key_info,
     return true;
   }
 
+  uint part_no = 0;
   for (const Key_part_spec *kp : key->columns) {
+    const Bitlsm_key_part_type declared = kp->get_bitlsm_type();
+    if (declared != Bitlsm_key_part_type::NOT_SPECIFIED) {
+      if (kp->has_expression()) {
+        my_error(ER_WRONG_ARGUMENTS, MYF(0),
+                 "ORDERED/UNORDERED is not allowed on a functional key part");
+        return true;
+      }
+      if (part_no >= sizeof(key_info->m_bitlsm_ordered_mask) * 8) {
+        my_error(ER_WRONG_ARGUMENTS, MYF(0),
+                 "BITLSM_INDEX has too many key parts for ORDERED/UNORDERED");
+        return true;
+      }
+      if (declared == Bitlsm_key_part_type::ORDERED)
+        key_info->m_bitlsm_ordered_mask |= (1U << part_no);
+      else
+        key_info->m_bitlsm_unordered_mask |= (1U << part_no);
+    }
+    ++part_no;
+
     const char *col = kp->get_field_name();
     const Create_field *cf = nullptr;
     for (const Create_field &f : *create_list)
@@ -7314,6 +7362,14 @@ static bool prepare_bitlsm_index(const Key_spec *key, KEY *key_info,
       }
     if (cf == nullptr) continue;  // resolved by the generic key column builder
 
+    if (kp->get_prefix_length() != 0) {
+      // SABI bins the whole stored value; a prefix length would be accepted
+      // and then ignored, so the index would not be the one the user asked
+      // for. Refuse rather than quietly widen it.
+      my_error(ER_WRONG_ARGUMENTS, MYF(0),
+               "BITLSM_INDEX does not support a key part prefix length");
+      return true;
+    }
     if (cf->is_virtual_gcol()) {  // D10: value doesn't store virtual columns
       my_error(ER_WRONG_ARGUMENTS, MYF(0),
                "BITLSM_INDEX cannot index a virtual generated column");

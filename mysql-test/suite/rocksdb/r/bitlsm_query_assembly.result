@@ -56,8 +56,9 @@ SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 5 AND (a = 1 OR ABS(
 # WHERE a >= 5 AND (a = 1 OR ABS(b) = 2)
 #   assembled: [a0>=5]
 #
-# (7) UNORDERED (VARBINARY) attr with a non-EQUAL op (c > 'x') is omitted;
-# the ordered conjunct survives.
+# (7) A VARBINARY attr is kEquality by default, so a non-EQUAL op on it
+# (c > 'x') is not representable and is omitted; the ordered conjunct
+# survives. The ORDERED counterpart is at the end of this file.
 SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND c > 'x';
 # WHERE a >= 0 AND c > 'x'
 #   assembled: [a0>=0]
@@ -101,8 +102,8 @@ SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND a NOT BETWEEN 
 # WHERE a >= 0 AND a NOT BETWEEN 2 AND 10
 #   assembled: [a0>=0]
 #
-# (13) BETWEEN on an UNORDERED (VARBINARY) attr has no representable range
-# -> dropped; the leading ordered conjunct survives.
+# (13) BETWEEN on a default (kEquality) VARBINARY attr has no representable
+# range -> dropped; the leading ordered conjunct survives.
 SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND c BETWEEN 'a' AND 'z';
 # WHERE a >= 0 AND c BETWEEN 'a' AND 'z'
 #   assembled: [a0>=0]
@@ -147,3 +148,37 @@ SELECT id, a, b, c, d FROM t_asm FORCE INDEX(bi) WHERE a >= 0 AND ((a, c) IN ((1
 # WHERE a >= 0 AND ((a, c) IN ((1, 'x'), (10, 'gamma')) OR b = 2.5)
 #   assembled: [a0>=0]
 DROP TABLE t_asm;
+#
+# ==== ORDERED key part: the same two shapes, now representable ====
+#
+# Same columns and same queries as (7) and (13); the only difference is
+# that the c key part is declared ORDERED, which bins it by equal mass
+# over sorted values instead of by a frequency-balanced dictionary. That
+# is what makes a range over its bytes expressible.
+CREATE TABLE t_asm_ord (
+id BIGINT NOT NULL,
+a INT, b DOUBLE, c VARBINARY(16),
+dt DATE,
+d INT,
+PRIMARY KEY (id) COMMENT 'cfname=t_asm_ord_cf',
+INDEX bi (a, b, c ORDERED, dt) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+INSERT INTO t_asm_ord SELECT * FROM (SELECT 1 id, 1 a, 1.5 b, 'x' c,
+DATE'2020-06-15' dt, 7 d) x;
+#
+# (18) ORDERED VARBINARY takes a non-EQUAL op: both conjuncts survive.
+SELECT id, a, b, c, d FROM t_asm_ord FORCE INDEX(bi) WHERE a >= 0 AND c > 'x';
+# WHERE a >= 0 AND c > 'x'
+#   assembled: [a0>=0 AND a2>'x']
+#
+# (19) BETWEEN on an ORDERED VARBINARY decomposes into its two bounds,
+# exactly as it does on a numeric attr.
+SELECT id, a, b, c, d FROM t_asm_ord FORCE INDEX(bi) WHERE a >= 0 AND c BETWEEN 'a' AND 'z';
+# WHERE a >= 0 AND c BETWEEN 'a' AND 'z'
+#   assembled: [a0>=0 AND a2>='a' AND a2<='z']
+#
+# (20) Equality still works on an ORDERED attr -- kRange serves = too.
+SELECT id, a, b, c, d FROM t_asm_ord FORCE INDEX(bi) WHERE a IS NOT NULL AND c = 'x';
+# WHERE a IS NOT NULL AND c = 'x'
+#   assembled: [a2='x']
+DROP TABLE t_asm_ord;
