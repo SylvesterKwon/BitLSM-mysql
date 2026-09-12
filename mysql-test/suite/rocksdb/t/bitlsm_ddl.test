@@ -50,6 +50,33 @@ CREATE TABLE t_txt (
   INDEX bi (s) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 
+--echo # Reject: PAD SPACE binary collation. utf8mb4_bin sorts by bytes but pads,
+--echo # so SQL holds 'ab' = 'ab ' where SABI's memcmp does not -- a row with a
+--echo # trailing space would be pruned away from a query that must match it.
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_padbin (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_padbin_cf',
+  s VARCHAR(32) COLLATE utf8mb4_bin,
+  INDEX bi (s) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+--echo # Accept: NO PAD binary collation -- the stored bytes are the value.
+CREATE TABLE t_nopadbin (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_nopadbin_cf',
+  s VARCHAR(32) COLLATE utf8mb4_0900_bin,
+  INDEX bi (s) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+DROP TABLE t_nopadbin;
+
+--echo # Reject: fixed-width CHAR/BINARY. The row stores it space-padded, so the
+--echo # bytes differ from the comparand a query supplies even under NO PAD.
+--error ER_WRONG_ARGUMENTS
+CREATE TABLE t_fixedchar (
+  id BIGINT NOT NULL PRIMARY KEY COMMENT 'cfname=t_fixedchar_cf',
+  s BINARY(16),
+  INDEX bi (s) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
 --echo # Reject: virtual generated column
 --error ER_WRONG_ARGUMENTS
 CREATE TABLE t_vg (

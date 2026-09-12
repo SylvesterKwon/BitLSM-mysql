@@ -24,10 +24,13 @@ Rdb_bitlsm_schema_key rdb_bitlsm_schema_key_of(
     // Placeholder enc; the walk below sets the real one for every attr. A slot
     // the walk never names would mean a schema with an attribute no field
     // feeds, which setup_bitlsm_index does not build.
-    key.push_back({index_type, Rdb_bitlsm_attr_plan::Enc::BINARY_STR});
+    key.push_back({index_type, Rdb_bitlsm_attr_plan::Enc::BINARY_STR, 0});
   }
   for (const auto &e : plan.walk) {
-    if (e.is_target && e.attr_index < key.size()) key[e.attr_index].enc = e.enc;
+    if (e.is_target && e.attr_index < key.size()) {
+      key[e.attr_index].enc = e.enc;
+      key[e.attr_index].len = e.len;
+    }
   }
   return key;
 }

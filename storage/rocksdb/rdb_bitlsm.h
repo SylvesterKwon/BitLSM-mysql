@@ -31,6 +31,10 @@ namespace myrocks {
 struct Rdb_bitlsm_attr_key {
   bit_lsm::IndexType index_type;
   Rdb_bitlsm_attr_plan::Enc enc;
+  // Width too: INT and BIGINT share (kRange, INT_SIGNED) and would otherwise
+  // still compare equal. FIXED carries the field's byte count, VARLEN/BLOB the
+  // length-prefix size, so this is what pins the byte representation.
+  uint32_t len;
   bool operator==(const Rdb_bitlsm_attr_key &) const = default;
 };
 using Rdb_bitlsm_schema_key = std::vector<Rdb_bitlsm_attr_key>;

@@ -7279,10 +7279,26 @@ static bool bitlsm_type_supported(const Create_field *cf) {
     case MYSQL_TYPE_DATE:
     case MYSQL_TYPE_NEWDATE:
       return true;
-    case MYSQL_TYPE_STRING:
     case MYSQL_TYPE_VARCHAR:
-      return cf->charset == &my_charset_bin ||
-             (cf->charset != nullptr && (cf->charset->state & MY_CS_BINSORT));
+      // SABI bins and compares a binary attribute by memcmp over the bytes the
+      // row stores, so the collation must agree that those bytes ARE the value.
+      // Binary sort order alone is not enough: utf8mb4_bin and latin1_bin are
+      // MY_CS_BINSORT but PAD SPACE, where SQL holds 'ab' = 'ab ' while memcmp
+      // does not. A row stored with a trailing space would then be pruned away
+      // from a query that must match it -- a false negative the engine's
+      // per-row re-check cannot recover, because the candidate never arrives.
+      // NO PAD binary collations (binary, *_0900_bin) have no such gap.
+      return cf->charset != nullptr &&
+             (cf->charset == &my_charset_bin ||
+              ((cf->charset->state & MY_CS_BINSORT) &&
+               cf->charset->pad_attribute == NO_PAD));
+    case MYSQL_TYPE_STRING:
+      // CHAR/BINARY is stored space-padded in the row, so the stored bytes
+      // differ from the comparand a query supplies ('ab' vs "ab  ") and the
+      // same false negative applies even under NO PAD. Supporting it means
+      // trimming on both the extract and the compare side; until that exists,
+      // refuse it at DDL rather than bin it wrong.
+      return false;
     default:
       return false;
   }
