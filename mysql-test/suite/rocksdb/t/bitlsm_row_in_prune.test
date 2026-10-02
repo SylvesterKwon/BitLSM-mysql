@@ -76,7 +76,7 @@ SELECT VARIABLE_VALUE INTO @m1 FROM performance_schema.global_status
 # number would make the test brittle against unrelated SABI tuning changes.
 # Half the table is far beyond noise for two columns this selective, and still
 # fails loudly at zero pruning (candidates == 20000).
---let $assert_text = a selective row-constructor IN prunes the candidate set ($cand of 20000)
+--let $assert_text = a selective row-constructor IN prunes the candidate set (under 10000 of 20000)
 --let $assert_cond = $cand < 10000
 --source include/assert.inc
 
