@@ -564,7 +564,7 @@ bool rdb_bitlsm_assemble_query(const KEY &key_info, Item *cond,
   }
   out_options->attr_num =
       static_cast<uint32_t>(out_options->attr_specs.size());
-  out_options->rho = 0.1;       // matches setup_bitlsm_index default
+  out_options->rho = 0.001;     // matches setup_bitlsm_index default
   out_options->read_seqno = 0;  // unused by Validate/ToString
 
   // (2) Walk the pushed condition into a CNF BitLSMQuery.
