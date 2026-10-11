@@ -1,9 +1,5 @@
-# Differential check for one AUTO-SELECTED bitlsm index read (M4a).
-#
-# Unlike the M3b check, this query carries NO FORCE INDEX(bi): the optimizer is
-# expected to have chosen bi on cost. The left side lets the optimizer choose;
-# the right side pins a full scan with IGNORE INDEX(bi). The two row sets must
-# be byte-for-byte identical.
+# Differential check for one auto-selected bitlsm read: no FORCE INDEX(bi), the
+# optimizer must choose bi on cost, and the rows must equal IGNORE INDEX(bi).
 #
 # Parameters:
 #   $qtitle - human description of the query

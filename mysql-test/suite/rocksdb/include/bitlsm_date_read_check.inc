@@ -1,18 +1,11 @@
-# Differential check for one bitlsm read on the DATE table t_date.
-#
-# Mirrors bitlsm_index_read_check.inc but for t_date's column list. Asserts the
-# FORCE INDEX(bi) row set is identical to the same query resolved by a full
-# table scan (IGNORE INDEX(bi)). A DATE comparand packed differently from the
-# way Field_newdate stores the column does not crash and does not change the
-# translated STRING -- it silently prunes away rows that should have matched.
-# This assertion is the only thing that catches it.
+# Differential check for one bitlsm read on t_date: FORCE INDEX(bi) must equal
+# the full scan (IGNORE INDEX(bi)). This is what catches a mis-packed DATE.
 #
 # Parameters:
 #   $qtitle - human description of the query
 #   $w      - WHERE predicate over t_date's bi columns (a, d)
 
-# payload is not in bi, so selecting it makes the index non-covering and pushes
-# the WHERE through ICP -- the point the translator reads.
+# payload is not in bi: non-covering, so the WHERE is pushed via ICP.
 --echo # $qtitle
 --eval SELECT id, a, d, payload FROM t_date FORCE INDEX(bi) WHERE $w ORDER BY id
 

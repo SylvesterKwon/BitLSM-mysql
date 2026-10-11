@@ -5715,44 +5715,25 @@ class handler {
   }
 
   /**
-    M5 (BitLSM): planning-time cardinality estimate for a conjunctive
-    condition against a BITLSM_INDEX. records_in_range cannot carry this
-    query shape (it speaks sorted-key intervals; a bitlsm predicate is a
-    multi-attribute conjunction), hence a dedicated hook.
+    Planning-time cardinality estimate for a conjunctive condition against a
+    BITLSM_INDEX. records_in_range cannot express this shape (sorted-key
+    intervals vs. a multi-attribute conjunction), hence a dedicated hook.
 
     @param inx             BITLSM_INDEX number
     @param cond            the condition range analysis ran on
-    @param[out] selectivity     joint match fraction of the engine's physical
-                                rows, in [0,1]; fallback keyparts contribute
-                                factor 1.0
-    @param[out] physical_rows   engine-side physical row count (the basis of
-                                the fetch-cost slot; shadowing-uncorrected)
-    @param[out] covered_parts   bit i set = user keypart i has at least one
-                                predicate that survived translation into the
-                                engine's bitmap query, i.e. it PRUNES fetch
-                                candidates. A keypart constrained in `cond`
-                                but absent here was dropped by translation
-                                (e.g. a string range): it still filters the
-                                plan's OUTPUT rows, but must not shrink the
-                                fetch-cost estimate.
+    @param[out] selectivity     joint match fraction of the physical rows
+    @param[out] physical_rows   engine-side physical row count
+    @param[out] covered_parts   keyparts whose predicate reached the bitmap
+                                query (they prune fetches); a constrained
+                                keypart absent here only filters output rows
     @param[out] fallback_parts  subset of covered_parts the estimator could
-                                not answer (no stats / NDV-truncated value);
-                                their factor in *selectivity is 1.0 -- the
-                                caller applies its own per-keypart fallback.
-    @param[out] candidate_selectivity  fraction of physical rows the read
-                                path is expected to FETCH: the match fraction
-                                rounded out to the engine's prune-bin
-                                boundaries (an equality candidates a whole
-                                bin even when one row matches). Feeds ONLY
-                                the fetch-cost slot; always >= *selectivity.
-    @param[out] memtable_entries  unflushed engine entries at estimate time.
-                                They carry no prune structure, so the read
-                                path fetches every one of them regardless of
-                                the predicate -- the caller ADDS this to the
-                                fetch count.
+                                not answer; they contribute 1.0 to *selectivity
+    @param[out] candidate_selectivity  fraction of physical rows the read path
+                                fetches (match fraction rounded out to prune
+                                bins); always >= *selectivity
+    @param[out] memtable_entries  unflushed entries, all of which are fetched
 
-    @return true when the engine served the estimate; false = no estimator
-            (caller keeps its full fallback path).
+    @return true when the engine served the estimate; false to fall back.
   */
   virtual bool bitlsm_estimate_selectivity(
       uint inx [[maybe_unused]], Item *cond [[maybe_unused]],

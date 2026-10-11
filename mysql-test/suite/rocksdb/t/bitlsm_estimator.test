@@ -1,12 +1,10 @@
 --source include/have_rocksdb.inc
 
-# M5: once statistics exist, the BITLSM_INDEX plan decision is driven by the
-# engine's cardinality estimator (live-SST stats served through
-# handler::bitlsm_estimate_selectivity) instead of the M4b sysvar constants.
-# Deterministic: stats are forced current with the
-# rocksdb_bitlsm_estimator_refresh trigger, never racing the async worker.
-# The M4b FALLBACK path is pinned separately by bitlsm_m4a_autoselect /
-# bitlsm_m4b_decision, which run with --rocksdb-bitlsm-estimator=0.
+# With statistics present, the BITLSM_INDEX plan decision comes from the engine
+# cardinality estimator (handler::bitlsm_estimate_selectivity), not the sysvars.
+# Stats are forced current with rocksdb_bitlsm_estimator_refresh so the test
+# never races the async worker. bitlsm_autoselect and bitlsm_cost_decision
+# cover the sysvar path.
 
 SELECT @@global.rocksdb_bitlsm_estimator;
 
@@ -18,8 +16,8 @@ CREATE TABLE t_est (
   INDEX bi (a, b, c) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 
-# 2000 rows. a: 1000 distinct (equality ~0.1%), b: 4 distinct (b<=1 = 50%),
-# c: 20 distinct strings v0..v19. d is a payload NOT in bi (non-covering).
+# a: 1000 distinct (equality ~0.1%), b: 4 distinct (b<=1 = 50%), c: 20 distinct
+# strings v0..v19. d is a payload not in bi (non-covering).
 --disable_query_log
 let $i = 0;
 while ($i < 2000) {
@@ -30,9 +28,9 @@ while ($i < 2000) {
 SELECT COUNT(*) FROM t_est;
 
 --echo #
---echo # ==== Phase 1: memtable only -> no stats yet (D-E3), decisions are the
---echo # ==== M4b sysvar fallback, verbatim. Magic prices b<=1 AND c BETWEEN as
---echo # ==== 0.33*0.33 = 11% and picks bi -- the q2_2-shaped mis-selection.
+--echo # ==== Phase 1: memtable only -> no stats yet, so decisions come from the
+--echo # ==== sysvar fallback. It prices b<=1 AND c BETWEEN as
+--echo # ==== 0.33*0.33 = 11% and picks bi (a mis-selection).
 --let $k = query_get_value(EXPLAIN SELECT d FROM t_est WHERE b <= 1 AND c BETWEEN 'v1' AND 'v5', key, 1)
 --let $assert_text = memtable-only: fallback magic routes range+string-range to bi
 --let $assert_cond = "$k" = "bi"
@@ -60,7 +58,7 @@ SET GLOBAL rocksdb_bitlsm_estimator_refresh = 1;
 --echo # (c) OR-of-equalities: optimize_cond wraps each OR arm's equality in a
 --echo #     multiple-equality (Item_equal) at PLANNING time; both translator
 --echo #     walks must unwrap it or the whole OR is dropped (all-or-nothing)
---echo #     and the estimate silently degrades to the sysvar magic. Covers
+--echo #     and the estimate silently degrades to the sysvar fallback. Covers
 --echo #     ORDERED and UNORDERED arms (SSB q3_3/q3_4 shape).
 --let $k = query_get_value(EXPLAIN SELECT d FROM t_est WHERE a = 503 OR a = 777, key, 1)
 --let $assert_text = estimator: OR of two selective ORDERED equalities routes to bi

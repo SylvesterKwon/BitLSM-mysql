@@ -89,7 +89,7 @@
 #include "util/stop_watch.h"
 
 /* BitLSM includes */
-#include "block_prefetch_queue.h"  // bit_lsm::EnableRocksDbIOUring
+#include "block_prefetch_queue.h"
 
 /* MyRocks includes */
 #include "./clone/client.h"
@@ -143,15 +143,12 @@ extern "C" void RocksDbThreadYield() {
 
 namespace myrocks {
 
-// M2 smoke: defined in rdb_bitlsm_smoke.cc. TEMPORARY -- replaced in M3.
+// Defined in rdb_bitlsm_smoke.cc.
 bool rdb_bitlsm_smoke_check();
 
 #ifndef NDEBUG
-// M3b-2 observability (debug builds only, zero cost in release): the ToString()
-// of the BitLSM query most recently assembled from a pushed WHERE on this
-// connection thread. Set in index_read_intern's bitlsm branch, read back by the
-// SHOW_SCOPE_SESSION status var rocksdb_bitlsm_last_query. thread_local because
-// mtr runs one statement at a time per connection thread.
+// Debug builds only: the last BitLSM query assembled from a pushed WHERE on
+// this connection, exposed as the session status var rocksdb_bitlsm_last_query.
 static thread_local std::string rdb_bitlsm_last_query_str;
 #endif
 
@@ -306,7 +303,7 @@ static int rocksdb_delete_column_family(THD *const /* thd */,
   auto &cf_manager = rdb_get_cf_manager();
   int ret = 0;
 
-  // M5: the estimator worker references this CF's ColumnFamilyData -- join it
+  // The estimator worker references this CF's ColumnFamilyData, so join it
   // before the handle can die. No-op for CFs without an estimator.
   Rdb_bitlsm_registry::instance().estimator_destroy(cf_name);
 
@@ -947,9 +944,9 @@ std::atomic<uint64_t> rocksdb_vectors_rows_read(0);
 /* count of centroids lists that vectors were read from */
 std::atomic<uint64_t> rocksdb_vectors_centroid_lists_read(0);
 
-// RocksDB's weak RocksDbIOUringEnable() contract is defined by BitLSM
-// (block_prefetch_queue.cpp), which needs the same switch for its own
-// prefetch queue. rocksdb_use_io_uring feeds it in rocksdb_init_internal.
+// RocksDB's weak RocksDbIOUringEnable() is defined by BitLSM
+// (block_prefetch_queue.cpp); rocksdb_use_io_uring feeds it in
+// rocksdb_init_internal.
 
 static int rocksdb_trace_block_cache_access(
     THD *const thd MY_ATTRIBUTE((__unused__)),
@@ -1501,21 +1498,18 @@ static MYSQL_SYSVAR_BOOL(enable_udt_in_mem, rocksdb_enable_udt_in_mem,
                          "support HLC snapshot reads in MyRocks",
                          nullptr, nullptr, rocksdb_enable_udt_in_mem);
 
-// M5: attach the BitLSM cardinality estimator (per-CF stats refresh worker)
-// to every bitlsm-bound column family at table open. Read-side only; feeds
-// planning-time selectivity once the optimizer swap (M5 step 4) lands.
+// Attach the BitLSM cardinality estimator (a per-CF stats refresh worker) to
+// every bitlsm-bound column family at table open.
 static bool rocksdb_bitlsm_estimator = true;
 static MYSQL_SYSVAR_BOOL(bitlsm_estimator, rocksdb_bitlsm_estimator,
                          PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
                          "Attach the BitLSM cardinality estimator to each "
                          "bitlsm-bound column family at table open (planning "
-                         "statistics; M5)",
+                         "statistics)",
                          nullptr, nullptr, true);
 
-// M5: trigger sysvar (force_flush_memtable_now pattern) -- synchronously
-// refresh every estimator's stats from the current live SST set, so MTR
-// tests and benchmark harnesses see deterministic estimates instead of
-// racing the async refresh worker.
+// Trigger sysvar: synchronously refresh every estimator's stats so tests and
+// benchmarks get deterministic estimates.
 static int rocksdb_bitlsm_estimator_refresh(
     THD *const thd, struct SYS_VAR *const var MY_ATTRIBUTE((__unused__)),
     void *const var_ptr MY_ATTRIBUTE((__unused__)),
@@ -1530,11 +1524,8 @@ static int rocksdb_bitlsm_estimator_refresh(
   const size_t refreshed =
       Rdb_bitlsm_registry::instance().estimator_refresh_all();
   if (refreshed == 0) {
-    // Estimators attach lazily at first table open, so a refresh on a
-    // freshly booted server used to no-op silently -- a repeated
-    // measurement-protocol trap. Surface it: open the bitlsm tables (any
-    // statement that instantiates the handler, e.g. LOCK TABLES ... READ)
-    // and set the trigger again.
+    // Estimators attach lazily at first table open, so nothing is bound on a
+    // freshly booted server. Warn instead of silently doing nothing.
     push_warning_printf(thd, Sql_condition::SL_WARNING, ER_WRONG_ARGUMENTS,
                         "rocksdb_bitlsm_estimator_refresh: no estimators "
                         "bound (bitlsm tables not opened yet); nothing was "
@@ -5105,18 +5096,13 @@ class Rdb_transaction {
   [[nodiscard]] virtual rocksdb::WriteBatchBase &get_indexed_write_batch(
       TABLE_TYPE table_type) = 0;
 
-  // M3b-3: the transaction's indexed write batch, for iterating this txn's own
-  // uncommitted writes per column family (WBWIIterator). Distinct from
-  // get_indexed_write_batch(): that hands out a writable batch and bumps the
-  // write counter; this is a read-only accessor for candidate generation.
-  // May be nullptr if the underlying transaction has not been started.
+  // This txn's own uncommitted writes, read-only (does not bump the write
+  // counter like get_indexed_write_batch()). nullptr before the txn starts.
   [[nodiscard]] virtual rocksdb::WriteBatchWithIndex *get_write_batch_with_index(
       TABLE_TYPE table_type) = 0;
 
-  // M3b-3: the transaction's current read snapshot (the view rdb_tx_multi_get
-  // and rdb_tx_get read against), so bitmap candidate generation can be pinned
-  // to the SAME seqno as the authoritative fetch. nullptr means "read latest"
-  // (no snapshot acquired yet).
+  // The read snapshot rdb_tx_get / rdb_tx_multi_get read against.
+  // nullptr means "read latest" (no snapshot acquired yet).
   [[nodiscard]] const rocksdb::Snapshot *get_read_snapshot(
       TABLE_TYPE table_type) const {
     return m_read_opts[table_type].snapshot;
@@ -9172,9 +9158,9 @@ static int rocksdb_init_internal(void *const p) {
     DBUG_RETURN(HA_EXIT_FAILURE);
   }
 
-  // BitLSM's io_uring opt-in is one-way, so make the choice here, before any
-  // file is opened -- a file keeps the mode it was opened with. That is also
-  // why use_io_uring is read-only: there is no way back once the server is up.
+  // BitLSM's io_uring opt-in is one-way and a file keeps the mode it was opened
+  // with, so decide before any file is opened. This is why use_io_uring is
+  // read-only.
   if (rocksdb_use_io_uring) {
     bit_lsm::EnableRocksDbIOUring();
   }
@@ -9477,9 +9463,8 @@ static int rocksdb_init_internal(void *const p) {
     DBUG_RETURN(HA_EXIT_FAILURE);
   }
 
-  // M5: RocksDB fixes the listener list at Open, before any bitlsm CF can be
-  // bound -- register unconditionally; events on non-bitlsm CFs are a hash
-  // miss + no-op.
+  // RocksDB fixes the listener list at Open, before any bitlsm CF can be bound,
+  // so register unconditionally. Events on non-bitlsm CFs are a no-op.
   main_opts.listeners.push_back(
       std::make_shared<myrocks::Rdb_bitlsm_stats_listener>());
 
@@ -9742,9 +9727,8 @@ static int rocksdb_init_internal(void *const p) {
 static int rocksdb_shutdown(bool minimalShutdown) {
   int error = 0;
 
-  // M5: join every estimator refresh worker BEFORE any teardown -- the
-  // workers reference ColumnFamilyData. Later flush completions then hit an
-  // empty registry (no-op). Idempotent, so unconditional is safe.
+  // Join every estimator refresh worker before any teardown: the workers
+  // reference ColumnFamilyData. Idempotent, so unconditional is safe.
   Rdb_bitlsm_registry::instance().estimator_shutdown();
 
   if (!minimalShutdown) {
@@ -9951,8 +9935,7 @@ static int rocksdb_init_func(void *const p) {
   if (ret) {
     rocksdb_done_func(p);
   } else {
-    // M2 smoke: prove the BitLSM bitmap API links and runs inside rocksdb_se.
-    // TEMPORARY -- replaced by Rdb_bitlsm_handler in M3.
+    // TODO: remove this startup smoke check (see rdb_bitlsm_smoke.cc).
     LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, "BitLSM API smoke: %s",
                     myrocks::rdb_bitlsm_smoke_check() ? "OK" : "FAILED");
   }
@@ -12133,20 +12116,10 @@ ulong ha_rocksdb::index_flags(bool &pk_can_be_decoded,
   }
 
   /*
-    A BITLSM_INDEX (D3) writes NO secondary-key entries; its reads are served by
-    SABI bitmap pruning + PK re-fetch, never index-only. Advertising
-    HA_KEYREAD_ONLY would let the optimizer plan a covering / index-only scan
-    (e.g. an unhinted COUNT(*), or a SELECT of only indexed columns), which
-    would read the empty SK keyspace and return WRONG results. Clear it so every
-    read fetches the full row through the engine's bitlsm read path.
-
-    Likewise the candidate iterator returns rows in PK/SST order, NOT in bi
-    keypart order. Advertising HA_READ_ORDER lets the optimizer skip
-    sort/temp for ORDER BY / GROUP BY it deems satisfied by index order
-    (e.g. GROUP BY on the leading keypart with later keyparts bound by
-    equality) and stream-aggregate an unordered input -> silently wrong,
-    fragmented results (C6). Reverse iteration is equally unsupported.
-    Clear both so every order-dependent plan materializes/sorts.
+    A BITLSM_INDEX has no secondary-key entries and its reads come back in PK
+    order, so it can serve neither an index-only scan (HA_KEYREAD_ONLY would
+    read the empty keyspace) nor an ordered scan (HA_READ_ORDER / HA_READ_PREV
+    would let ORDER BY / GROUP BY skip the sort over unordered input).
   */
   if (inx != table_arg->primary_key && table_arg->key_info != nullptr &&
       table_arg->key_info[inx].is_bitlsm_index()) {
@@ -12355,31 +12328,14 @@ int ha_rocksdb::index_read_intern(uchar *const buf, const uchar *const key,
   }
 
   if (kd.is_bitlsm_index()) {
-    // M3b-3: a BITLSM_INDEX writes no SK entries (D3), so this "index read" is
-    // served from the PK data CF, but candidates now come from SABI bitmap
-    // pruning instead of M3b-1's full PK scan. Two candidate sources are unioned
-    // (see the design's option B):
-    //   (a) bitmap-pruned COMMITTED rows -- a BitLSMIterator in Candidate mode
-    //       over the PK CF, pinned to the txn's read snapshot, skips SST blocks
-    //       whose SABI bins cannot satisfy the pushed WHERE; and
-    //   (b) this txn's own UNCOMMITTED PK writes (write batch), which the
-    //       committed-data iterator cannot see.
-    // Each candidate is then authoritatively re-fetched (rdb_tx_multi_get, which
-    // merges write batch + snapshot) and re-verified by the pushed ICP condition
-    // in index_next_with_direction_intern(). Pruning changes only WHICH rows are
-    // fetched, never how they are verified, so results stay IDENTICAL to a full
-    // scan (differential-verified). (BitLSM is excluded from ref access -- see
-    // find_best_ref in sql_planner.cc -- so a leading equality reaches SABI as an
-    // ICP residual too; there is no separate exact-key/ref filter to apply.)
+    // A BITLSM_INDEX read is served from the PK data CF. Candidates are the
+    // bitmap-pruned committed rows at the transaction's snapshot, unioned with
+    // its own uncommitted PK writes; index_next_with_direction_intern() then
+    // re-fetches and re-verifies each one, so pruning never changes a result.
     m_full_key_lookup = false;
 
-    // Translate the pushed WHERE into a bit_lsm query. The query is a
-    // conservative weakening (untranslatable parts are dropped -> no pruning,
-    // still correct), and its options are (re)derived from the index Field
-    // types -- the SAME source of truth the SABI bound to this CF was built from
-    // (M3a-4) -- so the query okey encoding agrees with how rows were binned.
-    // A missing/empty condition yields an empty query: all committed rows are
-    // candidates, but the options must still be schema-consistent.
+    // Translate the pushed WHERE. An absent condition yields an empty query
+    // (every committed row is a candidate); the options still follow the index.
     bit_lsm::BitLSMQuery bq;
     bit_lsm::BitLSMOptions bopts;
     Item *const bitlsm_cond =
@@ -12389,14 +12345,11 @@ int ha_rocksdb::index_read_intern(uchar *const buf, const uchar *const key,
     rdb_bitlsm_assemble_query(table->key_info[active_index], bitlsm_cond, &bq,
                               &bopts);
 #ifndef NDEBUG
-    // M3b-2 observation hook: expose the assembled query via the
-    // rocksdb_bitlsm_last_query session status var for bitlsm_query_assembly.
     rdb_bitlsm_last_query_str = bq.ToString();
 #endif
 
-    // Pin candidate generation to the transaction's read snapshot so it and the
-    // authoritative fetch see the same seqno. For a non-locking read index_init
-    // already acquired it; force it here if a delayed/absent snapshot remains.
+    // Candidate generation and the authoritative fetch must see the same
+    // snapshot. index_init normally acquired it already; force it otherwise.
     Rdb_transaction *const tx =
         get_or_create_tx(table->in_use, m_tbl_def->get_table_type());
     const TABLE_TYPE table_type = m_tbl_def->get_table_type();
@@ -12408,18 +12361,12 @@ int ha_rocksdb::index_read_intern(uchar *const buf, const uchar *const key,
 
     rocksdb::ColumnFamilyHandle *const pk_cfh = &m_pk_descr->get_cf();
 
-    // (a) committed candidates.
+    // Committed candidates.
     std::vector<std::string> committed;
     if (rocksdb_enable_udt_in_mem) {
-      // The pinned BitLSM iterator is not user-defined-timestamp aware: under
-      // UDT its candidate keys carry the embedded timestamp suffix, so the
-      // authoritative multi_get (which passes clean logical keys) would miss
-      // them. Fall back to a UDT-safe full PK scan for the committed source --
-      // no bitmap pruning under UDT, but correctness is preserved (the union
-      // with (b) and the per-row re-verify below are unchanged). m_iterator is
-      // MyRocks's native PK iterator and handles UDT transparently; the rows are
-      // in PK (index_id) order, so the scan stops once it leaves this PK's
-      // range.
+      // The BitLSM iterator is not user-defined-timestamp aware (its keys
+      // would carry the timestamp suffix), so under UDT fall back to a full PK
+      // scan through m_iterator. No pruning; the re-verify keeps it correct.
       uint pk_sz = 0;
       m_pk_descr->get_infimum_key(m_pk_packed_tuple, &pk_sz);
       const rocksdb::Slice pk_inf(
@@ -12440,21 +12387,20 @@ int ha_rocksdb::index_read_intern(uchar *const buf, const uchar *const key,
     } else if (tx_snapshot != nullptr &&
                !rdb_bitlsm_collect_candidates(rdb->GetBaseDB(), pk_cfh, bopts,
                                               bq, tx_snapshot, &committed)) {
-      // D17 fail-loud: the iterator threw (bad args / corrupt SABI). Surface a
-      // corrupt-data error rather than silently under-returning rows.
+      // The iterator threw (bad arguments or a corrupt SABI). Report corrupt
+      // data rather than silently returning fewer rows.
       DBUG_RETURN(handle_rocksdb_corrupt_data_error(thd));
     }
 
-    // Union + dedup into a sorted key set, filtering to this table's PK
-    // index_id (CR-1): a shared CF may hold foreign rows, and an empty query
-    // admits every committed row including foreign ones.
+    // Union and dedup into a sorted key set, keeping only this table's PK
+    // index_id: a shared CF may hold rows of other indexes.
     std::set<std::string> cand_set;
     for (auto &k : committed) {
       if (m_pk_descr->covers_key(rocksdb::Slice(k))) {
         cand_set.insert(std::move(k));
       }
     }
-    // (b) this txn's own uncommitted PK writes.
+    // This transaction's own uncommitted PK writes.
     rocksdb::WriteBatchWithIndex *const wbwi =
         tx->get_write_batch_with_index(table_type);
     if (wbwi != nullptr) {
@@ -13226,14 +13172,9 @@ int ha_rocksdb::index_next_with_direction_intern(uchar *const buf,
   }
 
   if (kd.is_bitlsm_index()) {
-    // M3b-3: walk the precomputed candidate PK set (bitmap-pruned committed rows
-    // ∪ this txn's own uncommitted writes; built in index_read_intern). For each
-    // candidate key, authoritatively fetch the row through the transaction
-    // (rdb_tx_multi_get merges write batch + snapshot) -- NOT via an iterator
-    // value, which is unavailable in Candidate mode -- decode it, and apply the
-    // same per-row filters M3b-1 used. Candidate order is PK order, NOT bitlsm-
-    // index order, so ICP_OUT_OF_RANGE is a per-row exclusion (skip and keep
-    // going), never an end-of-scan; the scan ends when the set is exhausted.
+    // Walk the candidate PK set built in index_read_intern, fetching each row
+    // through the transaction. Candidates are in PK order, not index order, so
+    // ICP_OUT_OF_RANGE excludes one row rather than ending the scan.
     Rdb_transaction *const tx =
         get_or_create_tx(table->in_use, m_tbl_def->get_table_type());
     const TABLE_TYPE table_type = m_tbl_def->get_table_type();
@@ -13249,12 +13190,9 @@ int ha_rocksdb::index_next_with_direction_intern(uchar *const buf,
       }
 
       if (skip_next) {
-        // The first call (from index_read_intern) evaluates the cursor's
-        // current position (0) without advancing.
         skip_next = false;
       } else {
-        // Forward-only: a bitlsm index has no order to preserve, so advance the
-        // candidate cursor regardless of move_forward.
+        // Forward-only regardless of move_forward: there is no index order.
         m_bitlsm_cand_pos++;
       }
 
@@ -13266,8 +13204,8 @@ int ha_rocksdb::index_next_with_direction_intern(uchar *const buf,
       const std::string &pk = m_bitlsm_candidates[m_bitlsm_cand_pos];
       const rocksdb::Slice pk_slice(pk);
 
-      // Authoritative fetch at the txn's read view. A not-found means the
-      // candidate was deleted (own write) or absent at this snapshot -> skip.
+      // Not-found means the candidate was deleted by this transaction or is
+      // absent at its snapshot. Skip it.
       rocksdb::PinnableSlice pin_value;
       rocksdb::Status status;
       rdb_tx_multi_get(tx, pk_cfh, 1, &pk_slice, &pin_value, table_type, &status,
@@ -14722,8 +14660,8 @@ int ha_rocksdb::update_write_indexes(const struct update_row_info &row_info,
       continue;
     }
 
-    // D3: a BITLSM_INDEX has no keyspace of its own (the SABI bitmap lives in
-    // the data CF's SST). Do not materialize secondary-key entries for it.
+    // A BITLSM_INDEX writes no secondary-key entries: the SABI bitmap lives in
+    // the PK data CF's SSTs, so the index has no keyspace of its own.
     if (m_key_descr_arr[key_id]->is_bitlsm_index()) {
       continue;
     }
@@ -15069,12 +15007,8 @@ int ha_rocksdb::index_init(uint idx, bool sorted MY_ATTRIBUTE((__unused__))) {
                                  *m_pk_descr, m_tbl_def, table, dd_table));
   } else if (idx != table->s->primary_key &&
              m_key_descr_arr[idx]->is_bitlsm_index()) {
-    // A BITLSM_INDEX writes no secondary-key entries (D3), so its own keyspace
-    // is empty. As of M3b-3 reads are answered from a SABI bitmap-pruned
-    // candidate set (built in index_read_intern) fetched authoritatively via the
-    // transaction, not a PK iterator. This m_iterator over the PK is kept only
-    // to satisfy the handler's iterator lifecycle (index_end reset, non-null
-    // asserts); the bitlsm read path never seeks it.
+    // A BITLSM_INDEX has an empty keyspace; this PK iterator only satisfies the
+    // handler's iterator lifecycle and serves the UDT fallback.
     m_iterator.reset(
         new Rdb_iterator_base(thd, this, *m_pk_descr, *m_pk_descr, m_tbl_def));
   } else {
@@ -16658,10 +16592,9 @@ ha_rows ha_rocksdb::records_in_range(uint inx, key_range *const min_key,
   DBUG_RETURN(ret);
 }
 
-// M5 (BitLSM): planning-time cardinality estimate for a BITLSM_INDEX. The
-// input is translated with the SAME code the read path uses, so predicates
-// the translation drops (string ranges, NOT BETWEEN, ...) do not shrink the
-// estimate -- they cannot shrink the candidate set either.
+// Planning-time cardinality estimate for a BITLSM_INDEX. The condition is
+// translated with the same code the read path uses, so a predicate the
+// translation drops shrinks neither the estimate nor the candidate set.
 bool ha_rocksdb::bitlsm_estimate_selectivity(
     uint inx, Item *cond, double *selectivity, ulonglong *physical_rows,
     key_part_map *covered_parts, key_part_map *fallback_parts,
@@ -16672,7 +16605,7 @@ bool ha_rocksdb::bitlsm_estimate_selectivity(
   const KEY &key_info = table->key_info[inx];
   if (!key_info.is_bitlsm_index()) DBUG_RETURN(false);
 
-  // The estimator lives on the PK data CF binding (where the SABI blobs do).
+  // The estimator is attached to the PK data CF, where the SABI blobs live.
   const std::shared_ptr<Rdb_key_def> &pk_def = m_tbl_def->get_pk_def();
   if (!pk_def) DBUG_RETURN(false);
   bit_lsm::CardinalityEstimator *est =
@@ -16687,8 +16620,7 @@ bool ha_rocksdb::bitlsm_estimate_selectivity(
   const bit_lsm::SABIQuery sq = bit_lsm::EncodeQuery(bq, bopts);
 
   const bit_lsm::EstimateResult res = est->Estimate(sq);
-  // Pre-first-flush / empty stats: nothing to estimate from; let the caller
-  // keep its full fallback path (D-E3 documented limit).
+  // No stats yet (nothing flushed): let the caller use its fallback path.
   if (res.physical_rows == 0) DBUG_RETURN(false);
 
   key_part_map covered = 0;
@@ -19002,9 +18934,7 @@ static int show_rocksdb_stall_vars(THD *thd MY_ATTRIBUTE((unused)),
 }
 
 #ifndef NDEBUG
-// M3b-2 observability: expose the ToString() of the last BitLSM query assembled
-// from a pushed WHERE on this session. SHOW_SCOPE_SESSION so mtr reads it with
-// `SHOW SESSION STATUS LIKE 'rocksdb_bitlsm_last_query'` right after a SELECT.
+// Session status var: the last BitLSM query assembled from a pushed WHERE.
 static int rocksdb_show_bitlsm_last_query(THD *thd MY_ATTRIBUTE((unused)),
                                           SHOW_VAR *var, char *buff) {
   const std::string &s = rdb_bitlsm_last_query_str;
@@ -19883,8 +19813,6 @@ bool ha_rocksdb::can_use_bloom_filter(THD *thd, const Rdb_key_def &kd,
 /* For modules that need access to the global data structures */
 rocksdb::TransactionDB *rdb_get_rocksdb_db() { return rdb; }
 
-// M5: sysvar gate for estimator_attach (read at table open in
-// setup_bitlsm_index).
 bool rdb_bitlsm_estimator_enabled() { return rocksdb_bitlsm_estimator; }
 
 Rdb_cf_manager &rdb_get_cf_manager() { return cf_manager; }

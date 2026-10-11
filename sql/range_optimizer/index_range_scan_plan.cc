@@ -592,30 +592,11 @@ bool check_for_unique_range(RANGE_SEQ_IF *seq, void *seq_init_param,
   return false;
 }
 
-// M4b: dead-simple, SABI-API-free selectivity estimate for a BITLSM_INDEX.
-// Walks the SEL_ROOT the range optimizer built from the pushed WHERE and
-// multiplies a magic per-keypart selectivity across the constrained keyparts
-// (independence assumption). Each keypart "level" is the R-B interval list for
-// one index column: adjacent SEL_ARGs (->next) are OR-ed points/ranges on that
-// column, and ->next_key_part descends to the next AND-ed column. We classify a
-// level as EQUALITY (one single-point interval -> eq_sel), IN-LIST (n
-// single-point intervals -> n*eq_sel, capped at 1.0), or RANGE (any non-point
-// interval, or anything we cannot classify -> range_sel, the conservative /
-// less-selective choice). Returns a selectivity in (0, 1].
-//
-// M5: per-keypart FALLBACK factors composing with the engine estimate. The
-// walk and eq/IN/range classification are M4b's; what changed is that each
-// constrained keypart now multiplies into one, both, or neither of TWO
-// selectivities:
-//   *rows_sel -- the plan's OUTPUT-row slot. Every predicate on an indexed
-//     column filters output (ICP re-verifies), so every keypart the engine
-//     did not estimate contributes here.
-//   *cost_sel -- the fetch-COST slot (candidate prunes). Only predicates
-//     that reached the engine's bitmap query can prune candidates; a keypart
-//     the translation DROPPED (string range etc.) must contribute 1.0 here --
-//     pricing it as a prune is exactly the H3 q2_2 mis-selection.
-// With no engine estimate (engine_ok=false) both slots get every factor,
-// which is verbatim M4b behavior.
+// Sysvar-based selectivity fallback for a BITLSM_INDEX. Walks the SEL_ROOT one
+// index column per level (->next: OR-ed intervals, ->next_key_part: next AND-ed
+// column), classifies each level as equality, IN-list or range, and multiplies
+// the per-keypart sysvar selectivity. *rows_sel takes every constrained keypart
+// (ICP filters output rows); *cost_sel only those the bitmap query can prune.
 static void bitlsm_fallback_selectivity(const SEL_ROOT *tree, double eq_sel,
                                         double range_sel, bool engine_ok,
                                         key_part_map engine_covered,
@@ -624,8 +605,8 @@ static void bitlsm_fallback_selectivity(const SEL_ROOT *tree, double eq_sel,
   *rows_sel = 1.0;
   *cost_sel = 1.0;
   for (const SEL_ROOT *level = tree; level != nullptr;) {
-    // Only KEY_RANGE levels carry real interval constraints. A MAYBE_KEY / empty
-    // level is an unknown constraint -> treat the rest as unconstrained, stop.
+    // Only KEY_RANGE levels carry interval constraints; treat anything else as
+    // unconstrained and stop.
     if (level->type != SEL_ROOT::Type::KEY_RANGE || level->root == nullptr)
       break;
     SEL_ARG *first = level->root->first();
@@ -642,11 +623,11 @@ static void bitlsm_fallback_selectivity(const SEL_ROOT *tree, double eq_sel,
 
     double kp_sel;
     if (has_range || point_count == 0) {
-      // Any non-point interval (or an unclassifiable keypart) -> RANGE. Being
-      // less selective here makes us less likely to wrongly pick BitLSM.
+      // Any non-point or unclassifiable interval counts as a range: the less
+      // selective choice, so a wrong classification does not favour BitLSM.
       kp_sel = range_sel;
     } else {
-      // Pure equality (point_count == 1) or IN-list (n points).
+      // Equality (one point) or IN-list (n points).
       kp_sel = std::min(1.0, point_count * eq_sel);
     }
 
@@ -656,26 +637,22 @@ static void bitlsm_fallback_selectivity(const SEL_ROOT *tree, double eq_sel,
     } else {
       const key_part_map bit = key_part_map{1} << first->part;
       if (bit & engine_fallback) {
-        // In the bitmap query but the estimator could not answer (no stats /
-        // NDV-truncated value): it prunes, magnitude unknown -> magic both.
+        // In the bitmap query, but the estimator had no answer for it: it
+        // prunes by an unknown amount, so use the sysvar for both slots.
         *rows_sel *= kp_sel;
         *cost_sel *= kp_sel;
       } else if (bit & engine_covered) {
-        // Estimated by the engine: its factor is inside the engine joint
-        // selectivity already -- multiply neither.
+        // Already inside the engine's joint selectivity.
       } else {
-        // Constrained in the WHERE but dropped by translation: filters
-        // output rows, prunes nothing.
+        // Dropped by the query translation: filters rows, prunes nothing.
         *rows_sel *= kp_sel;
       }
     }
 
-    // Descend to the next AND-ed keypart via the first interval's next_key_part.
-    // Rough: sibling intervals may carry different subtrees; the dead-simple
-    // walk does not model that.
+    // Sibling intervals may carry different subtrees; only the first is
+    // followed.
     level = first->next_key_part;
   }
-  // Guard: never collapse to 0 (mirrors M4b).
   if (*rows_sel <= 0.0) *rows_sel = eq_sel;
   if (*cost_sel <= 0.0) *cost_sel = eq_sel;
   if (*rows_sel > 1.0) *rows_sel = 1.0;
@@ -705,37 +682,12 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
   if (!tree) return HA_POS_ERROR;
   if (tree->type == SEL_ROOT::Type::IMPOSSIBLE) return 0L;
 
-  // M4a spike (BitLSM optimizer auto-selection, risk R1). A BITLSM_INDEX
-  // answers arbitrary attribute-subset predicates, so the keypart it constrains
-  // is frequently NOT the leading one. The stock gate below discards any tree
-  // whose root keypart isn't part 0 -- *before* any cost hook runs -- which
-  // blocks BitLSM from being costed at all (even under FORCE INDEX). Exempt
-  // BitLSM from the gate. When the tree is non-leading (or otherwise not a
-  // plain KEY_RANGE) we must ALSO skip the Sel_arg_range_sequence /
-  // multi_range_read_info_const machinery below: it assumes keyparts start at
-  // 0 and are contiguous, which a non-leading BitLSM tree violates (malformed
-  // min/max keys). Instead we hand back a synthetic (rows, cost). This is
-  // safe because at execution ha_rocksdb::index_read_intern's is_bitlsm_index()
-  // branch ignores range bounds entirely and serves the read via SABI bitmap
-  // pruning + PK re-fetch, so a rough estimate is all the planner needs. A
-  // *leading* BitLSM tree (part 0) still passes the original condition and
-  // falls through to the normal, already-working path (M3b FORCE INDEX).
-  //
-  // Restrict to plain SELECT: the BitLSM read path is a NON-locking snapshot
-  // candidate scan (bitmap prune + tx multi_get). If it were chosen for DML
-  // (UPDATE/DELETE), the scan would not take the per-row PK locks a locking
-  // scan does, tripping the engine's row-lock accounting. Every index -- incl.
-  // the BitLSM index, whose PK-suffix keyparts match a WHERE on the PK -- is
-  // considered for DML too, so without this guard a DML "WHERE id=..." would
-  // auto-select BitLSM via a non-leading (PK-suffix) tree and break.
-  //
-  // A4: SELECT ... FOR UPDATE / FOR SHARE is also SQLCOM_SELECT, but it takes
-  // per-row PK locks that the non-locking candidate scan would silently skip
-  // (leaving the "locked" rows unlocked). Exclude locking reads from BitLSM
-  // auto-selection -- a locking read falls back to a lock-taking access path.
-  // lock_descriptor() is the parsed lock intent (TL_WRITE = FOR UPDATE,
-  // TL_READ_WITH_SHARED_LOCKS = FOR SHARE); a missing table ref is treated as
-  // non-plain and excluded (conservative).
+  // A BITLSM_INDEX constrains arbitrary keyparts, so it bypasses the
+  // leading-keypart gate and the range-sequence machinery below (both assume
+  // contiguous keyparts from 0) and gets a synthetic (rows, cost) instead.
+  // Execution ignores the range bounds and serves the read by bitmap pruning
+  // plus PK re-fetch. That path takes no row locks, so only plain SELECT
+  // qualifies: no DML, no FOR UPDATE / FOR SHARE.
   const auto *const bitlsm_tl = param->table->pos_in_table_list;
   const bool bitlsm_locking_read =
       bitlsm_tl == nullptr ||
@@ -744,16 +696,9 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
   const bool is_bitlsm = thd->lex->sql_command == SQLCOM_SELECT &&
                          !bitlsm_locking_read &&
                          param->table->key_info[keynr].is_bitlsm_index();
-  // BitLSM ALWAYS uses the synthetic whole-index path, even for a leading-column
-  // RANGE. On the normal path a leading range is consumed as the access bound
-  // and never reaches SABI pruning; forcing whole-index leaves it as a residual
-  // index condition -> pushed via ICP -> the SABI query -> the bitmap prunes on
-  // that attribute (verified: a<K drops candidates to the leading-attr bin).
-  // NOTE: a leading *equality* is served by a ref access path outside this
-  // function, so it is still consumed as the ref key and NOT pushed via ICP --
-  // that gap is unaffected by this flag (see m_bitlsm_ref_key post-filter, which
-  // keeps it correct but unpruned). No execution regression: every BitLSM read
-  // scans the whole CF at execution regardless; this only adds pruning.
+  // Always take the whole-index path, even for a leading-column range. As an
+  // access bound the range would never reach the bitmap query; as an ICP
+  // residual it prunes.
   const bool bitlsm_synthetic = is_bitlsm;
 
   if (!is_bitlsm &&
@@ -761,19 +706,11 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
     return HA_POS_ERROR;  // Don't use tree
 
   if (bitlsm_synthetic) {
-    // M5: engine-served estimate (real live-SST stats via the handler hook),
-    // composed with per-keypart sysvar fallback for whatever the engine did
-    // not answer. With no estimator (sysvar off, empty CF, no cond) this
-    // degrades verbatim to the M4b magic estimator.
+    // Engine estimate from live SST stats, plus sysvar fallbacks for keyparts
+    // the engine did not answer (all of them without an estimator).
     ha_rows table_rows = file->stats.records;
     if (table_rows == 0) table_rows = 1;
 
-    // (1a) Engine estimate: joint MATCH selectivity (row slot), its
-    // bin-rounded CANDIDATE counterpart (cost slot -- the read path fetches
-    // whole prune bins, not matching rows), the engine's physical row count
-    // (the fetch-cost basis; the row basis stays stats.records -- two
-    // different "total rows" worlds, see the M5 spec), and the unflushed
-    // entry count (no prune structure before flush: all of it is fetched).
     double engine_sel = 1.0, engine_cand_sel = 1.0;
     ulonglong engine_phys = 0, engine_mem = 0;
     key_part_map engine_covered = 0, engine_fb = 0;
@@ -784,9 +721,6 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
                                           &engine_covered, &engine_fb,
                                           &engine_cand_sel, &engine_mem);
 
-    // (1b) Sysvar fallback factors for keyparts outside the engine estimate,
-    // split by slot (output rows vs fetch cost -- translation-dropped
-    // predicates filter rows but prune nothing).
     const double eq_sel = thd->variables.bitlsm_eq_selectivity;
     const double range_sel = thd->variables.bitlsm_range_selectivity;
     double fb_rows_sel, fb_cost_sel;
@@ -795,17 +729,11 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
                                 &fb_cost_sel);
     const double rows_selectivity =
         std::min(1.0, engine_sel * fb_rows_sel);
-    // Cost slot composes the CANDIDATE fraction (bin-rounded, >= match) with
-    // the same sysvar fallback factors -- an unanswered keypart approximates
-    // both its match and its candidate contribution.
     const double cost_selectivity =
         std::min(1.0, engine_cand_sel * fb_cost_sel);
 
-    // candidate_count = the plan's output-row estimate (row slot, anchored to
-    // the server's logical row count). fetch_count = expected PK re-fetches
-    // (cost slot); with an engine estimate it is the CANDIDATE mass over the
-    // ENGINE's physical row count (the read path fetches whole prune bins,
-    // plus shadowed versions), plus every unflushed memtable entry.
+    // candidate_count: output rows over the server's row count. fetch_count:
+    // PK re-fetches over the engine's physical rows, plus unflushed entries.
     const ha_rows candidate_count = std::max<ha_rows>(
         1, static_cast<ha_rows>(static_cast<double>(table_rows) *
                                 rows_selectivity));
@@ -818,44 +746,26 @@ ha_rows check_quick_select(THD *thd, RANGE_OPT_PARAM *param, uint idx,
                   : candidate_count;
     rows = candidate_count;
 
-    // Force the default MRR impl so execution goes read_range_first ->
-    // index_first -> index_read_intern (the BitLSM branch), the most
-    // predictable route into our bitmap read path.
+    // Default MRR implementation, so execution reaches index_read_intern via
+    // read_range_first and index_first.
     *mrr_flags = HA_MRR_USE_DEFAULT_IMPL | HA_MRR_NO_ASSOCIATION;
     *bufsize = thd->variables.read_rnd_buff_size;
     *is_ror_scan = false;     // never an index-merge / ROR child
     *is_imerge_scan = false;
     if (unique_range) *unique_range = false;
 
-    // (2) Cost that GROWS with fetch_count: bitmap prune overhead + one
-    // random PK re-fetch (tx multi_get, row-at-a-time) per candidate. Each
-    // candidate is priced as a RANDOM point lookup, which is meaningfully
-    // costlier than reading one row in a sequential table scan. We derive that
-    // per-fetch cost from the table's OWN full-scan cost per row, so the
-    // BitLSM-vs-full-scan decision reduces to a stable RATIO -- roughly
-    // "auto-select BitLSM iff estimated selectivity < 1/kRandomFetchFactor"
-    // (~0.2 by default). Anchoring to the scan cost makes the decision immune
-    // to absolute cost jitter (MyRocks data_file_length estimates wobble run to
-    // run and between memtable/SST states); both sides scale together so the
-    // boundary stays put. A non-selective predicate (candidate ~ table_rows) is
-    // then priced well above a full scan and loses; a selective one wins.
+    // Each candidate costs one random PK point lookup, priced relative to the
+    // table's own per-row scan cost so the decision is a ratio immune to
+    // absolute cost jitter: roughly BitLSM iff selectivity < 1/fetch factor.
     const Cost_model_table *const cost_model = param->table->cost_model();
     const double full_scan_cost =
         file->table_scan_cost().total_cost() +
         cost_model->row_evaluate_cost(static_cast<double>(table_rows));
     const double scan_cost_per_row =
         full_scan_cost / static_cast<double>(table_rows);
-    // A random PK point re-fetch ~ this many sequential rows. CALIBRATED
-    // (2026-07-23, release, bitlsm_a2_cf_sweep harness: 1M rows, S=1/10/50
-    // SSTs, 24-point regression time = G_S + c_f*candidates + c_m*matches,
-    // residuals <= 1.3%): c_f = 4.79 / 4.82 / 6.47 sequential-row
-    // equivalents at S = 1 / 10 / 50 -- the historical 5.0 is the shallow
-    // -tree measurement, kept as the central value. Known upward pressure:
-    // deep L0 (each Get consults more files) and cache-miss regimes; the
-    // sysvar below stays the per-deployment escape hatch. The candidate
-    // -generation intercept measured ~0 at this scale (stays folded into
-    // prune_overhead); the per-MATCH term cancels against the full scan's
-    // own row work and is deliberately not modeled.
+    // A random PK point re-fetch costs about this many sequential rows.
+    // Calibrated empirically against a full table scan on 1M-row tables; the
+    // sysvar below is the per-deployment override.
     const double kBitlsmRandomFetchFactor = 5.0;
     const double per_fetch_cost = kBitlsmRandomFetchFactor * scan_cost_per_row;
     const double prune_overhead = cost_model->row_evaluate_cost(1.0);
@@ -1297,19 +1207,9 @@ AccessPath *get_key_scans_params(THD *thd, RANGE_OPT_PARAM *param,
 
   Quick_ranges ranges(param->return_mem_root);
   unsigned used_key_parts = 0, num_exact_key_parts = 0;
-  // M4a spike R1: a non-leading BitLSM tree (see check_quick_select above)
-  // cannot be turned into a valid index range -- get_ranges_from_tree /
-  // Sel_arg range building assume the tree is rooted at keypart 0, so it would
-  // store a non-leading column's value into the leading keypart slot and build
-  // a malformed range. Instead inject a single WHOLE-INDEX range (min=-inf,
-  // max=+inf). At execution this drives read_range_first(nullptr,...) ->
-  // index_first -> index_read_intern, where the is_bitlsm_index() branch
-  // ignores the (cosmetic) bounds and serves the read from the SABI bitmap +
-  // PK re-fetch. ALWAYS whole-index for BitLSM (even a leading tree): matches the
-  // always-synthetic cost path in check_quick_select, so a leading-column RANGE
-  // is left as a residual condition pushed via ICP into the SABI prune instead
-  // of being consumed as an access bound (which left it unpruned). A leading
-  // equality still goes through ref access (elsewhere) and is not affected here.
+  // A BitLSM tree may be rooted at a non-leading keypart, which range building
+  // (rooted at keypart 0) cannot turn into a valid range. Inject one
+  // whole-index range; execution ignores the bounds (see check_quick_select).
   const bool bitlsm_whole_index = used_key->is_bitlsm_index();
   if (bitlsm_whole_index) {
     QUICK_RANGE *whole = new (param->return_mem_root) QUICK_RANGE();  // full

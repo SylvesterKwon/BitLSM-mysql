@@ -1,20 +1,9 @@
 --source include/have_rocksdb.inc
 
-# DATE attribute differential test.
-#
-# A DATE column in a BITLSM_INDEX is binned by the extractor as Enc::DATE3 --
-# the 3-byte Field_newdate packing (day + month*32 + year*512, little-endian)
-# read into an unsigned okey. The query translator packs a DATE comparand
-# through the SAME my_date_to_binary() the field uses, so the two must agree
-# byte for byte.
-#
-# A wrong packing does not crash and does not show up in the query-assembly
-# golden test (that asserts the translated STRING, not the okey) -- it silently
-# prunes away rows that should have matched. Only this differential assertion
-# catches it: FORCE INDEX(bi) (bitmap-pruned) must equal IGNORE INDEX(bi)
-# (full scan) for every query, in both the memtable and the flushed-SST state.
-#
-# No have_debug.inc here on purpose: this file must also run in release builds.
+# DATE attribute differential test, runnable in release builds. A comparand
+# packed differently from the stored 3-byte Field_newdate value does not crash;
+# it silently prunes matching rows. FORCE INDEX(bi) must equal IGNORE INDEX(bi)
+# for every query, in both the memtable and the flushed-SST state.
 
 CREATE TABLE t_date (
   id BIGINT NOT NULL,

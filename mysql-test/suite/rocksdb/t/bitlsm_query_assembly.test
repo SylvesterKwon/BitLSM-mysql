@@ -1,28 +1,10 @@
 --source include/have_rocksdb.inc
 --source include/have_debug.inc
 
-# M3b-2: BitLSM query assembly. The engine translates the WHERE pushed as an
-# index condition on a BITLSM_INDEX into a bit_lsm::BitLSMQuery (CNF), validates
-# it, and (debug builds) exposes the assembled query's ToString() through the
-# session status var rocksdb_bitlsm_last_query. This test drives a SELECT for
-# each WHERE shape and asserts the exact assembled-query string.
-#
-# The assembled query is only a PRUNING HINT and does NOT change result rows in
-# M3b-2 (that is M3b-3); correctness is still guaranteed by ICP re-evaluation.
-# The differential bitlsm_index_read test cannot see the translation (safe
-# conservative omission leaves results unchanged), so this test verifies
-# TRANSLATION COMPLETENESS -- the exact string -- directly.
-#
-# The invariant under test: the assembled query is a WEAKENING (necessary
-# condition) of the WHERE. Untranslatable sub-conditions are OMITTED, never
-# mistranslated:
-#   - AND: each conjunct is translated independently; unrepresentable conjuncts
-#     are dropped (dropping a conjunct only weakens).
-#   - OR:  translated only if EVERY disjunct is representable, else the whole OR
-#     is dropped (dropping a disjunct would strengthen -- unsafe).
-#   - A binary column is kEquality by default, so only EQUAL is
-#     representable on it; declaring the key part ORDERED makes range
-#     operators representable too (see the t_asm_ord section).
+# BitLSM query assembly. In debug builds the engine exposes the ToString() of
+# the query translated from the pushed WHERE via the session status var
+# rocksdb_bitlsm_last_query. Each case drives one WHERE shape and asserts the
+# exact string; translation rules are in storage/rocksdb/rdb_bitlsm_query.h.
 
 CREATE TABLE t_asm (
   id BIGINT NOT NULL,
@@ -33,11 +15,9 @@ CREATE TABLE t_asm (
   INDEX bi (a, b, c, dt) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 
-# d is a payload column NOT in bi, so selecting it makes bi non-covering and the
-# WHERE is pushed through Index Condition Pushdown -- the point the translator
-# reads. attr mapping: a -> a0 (signed int64), b -> a1 (double), c -> a2
-# (unordered binary string), dt -> a3 (unsigned int64 holding the 3-byte
-# Field_newdate packing).
+# d is not in bi (non-covering, so the WHERE is pushed via ICP). Attr mapping:
+# a -> a0 (signed int64), b -> a1 (double), c -> a2 (unordered binary string),
+# dt -> a3 (unsigned int64 holding the 3-byte Field_newdate packing).
 --let $t = t_asm
 
 INSERT INTO t_asm VALUES

@@ -14,7 +14,7 @@ INSERT INTO t_oc VALUES
 (10,1995,'B1','E',100),(11,1997,'B2','W',110),(12,1992,'B1','E',120);
 SET GLOBAL rocksdb_force_flush_memtable_now = 1;
 # (1) GROUP BY on leading keypart with later keyparts equality-bound —
-#     the shape that fragmented pre-C6. bi must equal the full scan.
+#     bi must equal the full scan.
 SELECT SUM(v), y, b FROM t_oc FORCE INDEX (bi)
 WHERE b='B1' AND r='E' GROUP BY y, b ORDER BY y, b;
 SUM(v)	y	b

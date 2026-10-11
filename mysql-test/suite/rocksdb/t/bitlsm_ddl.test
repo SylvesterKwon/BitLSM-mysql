@@ -1,8 +1,8 @@
 --source include/have_rocksdb.inc
 
-# M3a-1: BITLSM_INDEX DDL surface (parse + server-layer validation).
-# Non-PK-column check and CF constraints (D5) are validated in the storage
-# engine (M3a-2) and are intentionally NOT covered here.
+# BITLSM_INDEX DDL surface: parsing and server-layer validation. The
+# non-PK-column check and the column-family constraints are enforced by the
+# storage engine and are covered elsewhere.
 
 --echo # Accept: numeric + date + binary-string attributes on a non-PK secondary index
 CREATE TABLE t_ok (

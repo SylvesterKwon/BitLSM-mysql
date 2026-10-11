@@ -489,9 +489,9 @@ AccessPath *get_best_group_min_max(THD *thd, RANGE_OPT_PARAM *param,
       goto next_index;
     }
 
-    // A BITLSM_INDEX has no real secondary-key entries (D3): a loose (group-by)
-    // index skip scan walks the index keyspace directly, which is meaningless
-    // for a BitLSM index (and hangs the engine's read path). Never consider it.
+    // A BITLSM_INDEX has no secondary-key entries to iterate, so a group-by
+    // skip scan over its keyspace is meaningless and hangs the engine's read
+    // path.
     if (cur_index_info->is_bitlsm_index()) {
       cause = "bitlsm_index";
       goto next_index;

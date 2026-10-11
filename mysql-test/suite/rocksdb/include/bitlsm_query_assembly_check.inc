@@ -1,21 +1,12 @@
-# One BitLSM query-assembly check (M3b-2).
-#
-# Runs a SELECT that routes through the bitlsm index read path (FORCE INDEX(bi),
-# selecting the non-indexed payload d so the WHERE is pushed as an index
-# condition), then reads back the ToString() of the query the engine assembled
-# from that pushed WHERE via the debug session status var
-# rocksdb_bitlsm_last_query, echoes it (so the recorded .result is the golden
-# assertion), and hard-asserts it equals $expected.
-#
-# The assembled query is only a pruning HINT and does not affect result rows in
-# M3b-2, so this verifies TRANSLATION COMPLETENESS (the exact string) that the
-# differential bitlsm_index_read test cannot see.
+# One BitLSM query-assembly check: run a SELECT through the bitlsm read path
+# (FORCE INDEX(bi), selecting the non-indexed d so the WHERE is pushed as an
+# index condition), read the assembled query via rocksdb_bitlsm_last_query,
+# echo it into the .result and assert it equals $expected.
 #
 # Parameters:
 #   $t        - table to read (t_asm, or t_asm_ord for the ORDERED variant)
-#   $w        - WHERE predicate over the bi columns (a, b, c)
-#   $expected - the exact BitLSMQuery::ToString() the translator must produce
-#               ("" means no representable pruning condition)
+#   $w        - WHERE predicate over the bi columns
+#   $expected - exact BitLSMQuery::ToString() ("" = nothing representable)
 
 --disable_result_log
 --eval SELECT id, a, b, c, d FROM $t FORCE INDEX(bi) WHERE $w

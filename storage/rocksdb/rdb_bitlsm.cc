@@ -1,11 +1,10 @@
-/* Copyright (c) Meta Platforms, Inc. and affiliates. */
+// Copyright (c) 2026 Dohyun Kwon
+
 #include "./rdb_bitlsm.h"
 
 #include "./rdb_bitlsm_descriptor.h"
 
-/* rocksdb-internal headers, needed only for the estimator_attach casts (the
-   same DBImpl / ColumnFamilyHandleImpl casts BitLSMIterator and the standalone
-   BitLSM ctor already exercise). Contained to this TU. */
+/* rocksdb-internal headers, needed only for the estimator_attach casts. */
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 
@@ -21,9 +20,7 @@ Rdb_bitlsm_schema_key rdb_bitlsm_schema_key_of(
   Rdb_bitlsm_schema_key key;
   key.reserve(schema.index_types.size());
   for (const auto index_type : schema.index_types) {
-    // Placeholder enc; the walk below sets the real one for every attr. A slot
-    // the walk never names would mean a schema with an attribute no field
-    // feeds, which setup_bitlsm_index does not build.
+    // Placeholder enc/len; the walk below fills in every attribute.
     key.push_back({index_type, Rdb_bitlsm_attr_plan::Enc::BINARY_STR, 0});
   }
   for (const auto &e : plan.walk) {
@@ -42,12 +39,9 @@ bool Rdb_bitlsm_registry::bind(const std::string &cf_name,
   auto it = m_map.find(cf_name);
   if (it != m_map.end()) {
     if (it->second.schema_key != schema_key) {
-      // D5 violation: CF already hosts a different bitlsm schema.
-      return false;
+      return false;  // CF already hosts a different bitlsm schema
     }
-    // Same-schema rebind (table reopen): refresh the factory but keep the
-    // running estimator -- replacing the Entry would join and restart its
-    // worker on every reopen.
+    // Same-schema rebind (table reopen): keep the running estimator.
     it->second.factory = std::move(factory);
     return true;
   }
@@ -92,8 +86,8 @@ void Rdb_bitlsm_registry::estimator_destroy(const std::string &cf_name) {
     auto it = m_map.find(cf_name);
     if (it != m_map.end()) dead = std::move(it->second.estimator);
   }
-  // ~CardinalityEstimator joins the worker; run outside the registry lock so
-  // a concurrent flush-completion notify cannot deadlock against the join.
+  // ~CardinalityEstimator joins the worker. It runs outside the registry lock
+  // so a concurrent flush-completion notify cannot deadlock against the join.
 }
 
 void Rdb_bitlsm_registry::estimator_shutdown() {
@@ -104,13 +98,13 @@ void Rdb_bitlsm_registry::estimator_shutdown() {
       if (kv.second.estimator) dead.push_back(std::move(kv.second.estimator));
     }
   }
-  // Workers join here, outside the lock (same reasoning as estimator_destroy).
+  // Workers join here, outside the lock (see estimator_destroy).
 }
 
 size_t Rdb_bitlsm_registry::estimator_refresh_all() {
-  // Collect raw pointers under the lock, run the blocking refreshes outside
-  // it: TEST_Refresh waits on the worker, and a concurrent flush completion
-  // takes the registry lock in estimator_notify.
+  // Collect pointers under the lock, refresh outside it: TEST_Refresh waits on
+  // the worker, and a concurrent flush completion takes the lock in
+  // estimator_notify.
   std::vector<bit_lsm::CardinalityEstimator *> targets;
   {
     std::lock_guard<std::mutex> lk(m_mutex);
@@ -173,8 +167,7 @@ bool rdb_bitlsm_bind_persisted(const std::string &cf_name,
 
 rocksdb::UserDefinedIndexBuilder *Rdb_bitlsm_udi_factory::NewBuilder() const {
   auto f = Rdb_bitlsm_registry::instance().get(m_cf_name);
-  // null -> RocksDB does not install the UDI wrapper (zero per-row cost).
-  return f ? f->NewBuilder() : nullptr;
+  return f ? f->NewBuilder() : nullptr;  // null: no UDI wrapper for this CF
 }
 
 rocksdb::Status Rdb_bitlsm_udi_factory::NewBuilder(
@@ -187,23 +180,19 @@ rocksdb::Status Rdb_bitlsm_udi_factory::NewBuilder(
     return rocksdb::Status::OK();
   }
   if (registry.expects_sabi(m_cf_name)) {
-    // A descriptor for this CF exists in the data dictionary but its factory is
-    // missing. Writing the SST anyway would drop the bitmaps with no trace, so
-    // fail the flush/compaction instead.
+    // A persisted descriptor exists but no factory is bound. Writing the SST
+    // would silently drop its bitmaps, so fail the flush/compaction instead.
     return rocksdb::Status::Corruption(
         "bitlsm: column family '" + m_cf_name +
         "' has a persisted SABI descriptor but no bound builder");
   }
-  builder.reset();  // ordinary CF: no UDI wrapper, zero per-row cost
+  builder.reset();  // ordinary CF: no UDI wrapper
   return rocksdb::Status::OK();
 }
 
 namespace {
-// Process-global schema-less SABIFactory for the read path. A default-
-// constructed SABIFactory is reader-only: v5 SABI blobs carry their own attr
-// roles in the directory, so it needs no schema binding to open an SST. Const
-// read methods make it safe to share across CFs and threads. NewBuilder() is
-// never called on it (the build path uses the registry-bound factory).
+// Schema-less, reader-only SABIFactory shared by every CF and thread. SABI
+// blobs are self-describing, so no schema binding is needed to open an SST.
 const bit_lsm::SABIFactory &bitlsm_reader_factory() {
   static const bit_lsm::SABIFactory f;
   return f;
@@ -218,9 +207,8 @@ Rdb_bitlsm_udi_factory::NewReader(rocksdb::Slice &index_block) const {
 rocksdb::Status Rdb_bitlsm_udi_factory::NewReader(
     const rocksdb::UserDefinedIndexOption &option, rocksdb::Slice &index_block,
     std::unique_ptr<rocksdb::UserDefinedIndexReader> &reader) const {
-  // Validates the v5 footer/directory (rejects a missing/unsupported version,
-  // i.e. old v4 SSTs, loudly) then builds a self-describing reader -- no
-  // registry lookup, so DB open no longer races CF binding.
+  // Validates the SABI footer and builds a self-describing reader, with no
+  // registry lookup, so DB open does not depend on CF-binding order.
   return bitlsm_reader_factory().NewReader(option, index_block, reader);
 }
 

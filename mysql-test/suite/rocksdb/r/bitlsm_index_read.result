@@ -212,7 +212,7 @@ id	a	b	c	d
 10	50	50	zeta	NULL
 include/assert.inc [Q12 row NOT IN (must translate to nothing, stay correct): FORCE INDEX(bi) row set identical to full scan]
 #
-# ==== Phase 3: own uncommitted writes (option B: write-batch union) ====
+# ==== Phase 3: own uncommitted writes (write-batch union) ====
 # The committed base is now in an SST, so source (a) is the bitmap-pruned
 # committed rows and source (b) is this transaction's uncommitted writes.
 # Each case mutates rows inside a transaction and re-checks the same

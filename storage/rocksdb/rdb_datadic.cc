@@ -3720,21 +3720,10 @@ uint Rdb_key_def::setup_vector_index(const TABLE &tbl,
                              m_vector_index);
 }
 
-// Derive the extractor encoding AND the SABI index type for a BITLSM attribute
-// column from its Field type. Single source of truth so the build-time index
-// type (which picks kRange equal-mass vs kEquality frequency-balanced binning)
-// and the extract-time encoding can never disagree (a mismatch would mis-bin
-// rows). The index type comes from rdb_bitlsm_index_type_for(), the same helper
-// rdb_bitlsm_query.cc::field_to_attr reads: column type by default, overridden
-// by the key part's ORDERED / UNORDERED keyword.
-//
-// M3a-4 SCOPE: only the encodings below are implemented. DATE/NEWDATE packs
-// into a 3-byte order-monotone okey (Enc::DATE3, below). DATETIME/DATETIME2/
-// TIMESTAMP/TIMESTAMP2 are refused by the DDL gate in
-// sql_table.cc::bitlsm_type_supported and only reach here defensively, same as
-// TIME/TIME2/YEAR/BLOB -- none of them have a packed->monotone-okey conversion
-// written. Extend both this switch and Rdb_bitlsm_extractor when adding a
-// type.
+// Derive the extractor encoding and the SABI index type of a BITLSM attribute
+// column together so binning and extraction agree. DATETIME/TIMESTAMP are
+// rejected at DDL (sql_table.cc). Extend both this switch and
+// Rdb_bitlsm_extractor when adding a type.
 static bool bitlsm_derive_enc(const Field *field,
                               Rdb_bitlsm_attr_plan::Enc *enc,
                               bit_lsm::IndexType *index_type,
@@ -3772,13 +3761,12 @@ static bool bitlsm_derive_enc(const Field *field,
                                               declared_unordered);
       return true;
     default:
-      return false;  // not yet supported by the extractor
+      return false;  // not supported by the extractor
   }
 }
 
-// Physical shape of a STORE_ALL value field, matching exactly how
-// Rdb_converter::encode_value_slice writes it (VARCHAR / BLOB|JSON / else). Used
-// for every walked field (target or skipped) so the cursor advances correctly.
+// Physical shape of a STORE_ALL value field, matching how
+// Rdb_converter::encode_value_slice writes it.
 static Rdb_bitlsm_attr_plan::Shape bitlsm_shape_of(const Field *field,
                                                    uint32_t *len) {
   switch (field->real_type()) {
@@ -3806,8 +3794,7 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
     return HA_EXIT_SUCCESS;
   }
 
-  // Defensive: the server layer (prepare_bitlsm_index) already enforces a
-  // plain secondary index, but re-check in case a KEY reaches here mislabeled.
+  // prepare_bitlsm_index already enforces a plain secondary index; re-check.
   if (is_primary_key()) {
     LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                     "BITLSM_INDEX is not supported on the primary key");
@@ -3818,23 +3805,20 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
                     "BITLSM_INDEX is only supported on user tables");
     return HA_ERR_UNSUPPORTED;
   }
-  // No TTL / special index flags (the bitmap has no notion of TTL rows yet).
+  // The bitmap has no notion of TTL rows.
   if (m_index_flags_bitmap != 0) {
     LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                     "BITLSM_INDEX is not supported with TTL or index flags");
     return HA_ERR_UNSUPPORTED;
   }
 
-  // D10: attribute columns must not be primary-key columns. MyRocks stores PK
-  // columns only in the key (not the value), and the compaction-thread
-  // extractor (M3a-4) reads only the value; a PK-column attribute would be
-  // invisible to it. (Skipped for hidden-PK tables: no user PK columns exist.)
+  // Attribute columns must not be primary-key columns: MyRocks stores PK
+  // columns only in the key, and the extractor reads only the value.
   if (!Rdb_key_def::table_has_hidden_pk(tbl)) {
     const KEY *key_info = &tbl.key_info[m_keyno];
     const KEY *pk_info = &tbl.key_info[tbl.s->primary_key];
-    // Only the user-declared key parts are attributes; a secondary index's
-    // actual_key_parts also includes PK columns appended for covering, which
-    // would false-match the PK-membership check below.
+    // Only user-declared key parts are attributes; actual_key_parts also
+    // includes the PK columns appended for covering.
     for (uint i = 0; i < key_info->user_defined_key_parts; i++) {
       const Field *field = key_info->key_part[i].field;
       for (uint kp = 0; kp < pk_info->user_defined_key_parts; kp++) {
@@ -3852,10 +3836,7 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
   const KEY *ki = &tbl.key_info[m_keyno];
   const bool hidden_pk = Rdb_key_def::table_has_hidden_pk(tbl);
 
-  // (1) Derive per-attribute encoding + role from the Field types. This is the
-  // single source of truth: schema.index_types (build-time binning) and the
-  // extractor encodings come from the same switch, so they cannot disagree.
-  // Reject types the extractor does not yet handle (M3a-4 scope).
+  // Per-attribute encoding and index type.
   bit_lsm::SABISchema schema;
   schema.index_types.reserve(ki->user_defined_key_parts);
   // field_index -> (attr slot, encoding) for the target columns.
@@ -3869,8 +3850,8 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
                            (ki->m_bitlsm_ordered_mask >> i) & 1U,
                            (ki->m_bitlsm_unordered_mask >> i) & 1U)) {
       LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
-                      "BITLSM_INDEX: attribute type not yet supported by the "
-                      "extractor (M3a-4 scope)");
+                      "BITLSM_INDEX: attribute type not supported by the "
+                      "extractor");
       return HA_ERR_UNSUPPORTED;
     }
     schema.index_types.push_back(index_type);
@@ -3879,10 +3860,9 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
   }
   schema.rho = 0.001;  // default bitmap budget; tunable later
 
-  // The extractor classifies preceding value fields via the PK's pack info
-  // (can_unpack / has_unpack_info). setup() runs PK-first in alloc_key_buffers,
-  // but other callers (add-index / restore) give no such guarantee, so force
-  // the PK's (idempotent) setup here rather than risk misclassifying a field.
+  // The walk plan below needs the PK's pack info (can_unpack /
+  // has_unpack_info). Not every caller sets up the PK first, so run its
+  // (idempotent) setup here.
   const std::shared_ptr<Rdb_key_def> &pk_def = tbl_def.get_pk_def();
   const KEY *pk_info =
       hidden_pk ? nullptr : &tbl.key_info[tbl.s->primary_key];
@@ -3891,11 +3871,9 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
     if (pk_rtn) return pk_rtn;
   }
 
-  // (2) Build the immutable walk plan snapshot. Replicates the value-blob
-  // layout logic of Rdb_converter::setup_field_encoders / encode_value_slice:
-  // null-bitmap bit assignment (every nullable field, in field order),
-  // STORE_ALL vs STORE_NONE/SOME (PK columns decodable from key/unpack_info are
-  // absent from the value), and per-field physical shape.
+  // Walk plan. Replicates the value-blob layout of
+  // Rdb_converter::setup_field_encoders / encode_value_slice: null-bitmap bit
+  // assignment, which fields are stored in the value, and per-field shape.
   auto plan = std::make_shared<Rdb_bitlsm_attr_plan>();
   plan->attr_num = schema.attr_num();
   plan->ttl_bytes =
@@ -3908,8 +3886,8 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
   for (uint i = 0; i < tbl.s->fields; i++) {
     const Field *field = tbl.field[i];
 
-    // Null-bitmap slot: assigned to EVERY nullable field in field order,
-    // regardless of storage type or virtual-ness (matches setup_field_encoders).
+    // Every nullable field gets a null-bitmap bit, in field order, regardless
+    // of storage type or virtual-ness (matches setup_field_encoders).
     const bool nullable = field->is_nullable();
     uint32_t this_null_offset = 0;
     uint8_t this_null_mask = 0;
@@ -3924,8 +3902,8 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
       }
     }
 
-    // Storage type: a PK column decodable from the key (STORE_NONE) or from
-    // key + unpack_info (STORE_SOME) is not present in the value blob.
+    // A PK column decodable from the key (STORE_NONE) or from key plus
+    // unpack_info (STORE_SOME) is absent from the value blob.
     bool store_all = true;
     if (pk_info != nullptr) {
       for (uint kp = 0; kp < pk_info->user_defined_key_parts; kp++) {
@@ -3961,25 +3939,18 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
   }
   if (cur_null_mask != 0x1) null_bytes_length++;  // trailing partial byte
   plan->null_bytes_len = null_bytes_length;
-  // Fields past the last attribute never need walking.
   if (last_target < 0) {
-    // No attribute landed in the value -- should be impossible after the checks
-    // above (attributes are non-PK, non-virtual). Fail loud rather than build a
-    // degenerate plan.
+    // Unreachable after the checks above (attributes are non-PK, non-virtual).
     LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                     "BITLSM_INDEX: no attribute column found in the primary-key "
                     "value (internal inconsistency)");
     return HA_ERR_UNSUPPORTED;
   }
-  plan->walk.resize(last_target + 1);
+  plan->walk.resize(last_target + 1);  // later fields are never walked
 
-  // (3) CF binding: bind the SABIFactory to the PRIMARY KEY's data CF. SABI is
-  // embedded in and reads the PK CF's row values, so it must live where the rows
-  // do. The bitlsm index writes no SK entries (D3 suppression), so its own CF is
-  // vestigial and is deliberately IGNORED -- the index needs no cfname of its
-  // own; whatever it inherits is irrelevant. The registry is always keyed by the
-  // PK data CF, so two tables trip the D5 one-schema-per-CF check only when they
-  // genuinely share a data CF.
+  // Bind the SABIFactory to the primary key's data CF: SABI is built from and
+  // reads the PK row values, so it lives where the rows do. The bitlsm index
+  // writes no entries of its own, so its own CF is unused.
   const std::string pk_cf_name = pk_def->get_cf().GetName();
 
   std::shared_ptr<const Rdb_bitlsm_attr_plan> const_plan = plan;
@@ -3989,8 +3960,7 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
       });
   if (!Rdb_bitlsm_registry::instance().bind(
           pk_cf_name, rdb_bitlsm_schema_key_of(schema, *plan), factory)) {
-    // D5/D17: this CF already hosts a different bitlsm schema. Fail loudly
-    // instead of silently letting the last writer win.
+    // This CF already hosts a different bitlsm schema.
     LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                     "BITLSM_INDEX: column family '%s' already hosts a different "
                     "bitlsm schema (only one bitlsm table per CF is supported)",
@@ -3998,17 +3968,9 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
     return HA_ERR_UNSUPPORTED;
   }
 
-  // (3b) Persist the build descriptor next to the data, keyed by the PK's
-  // GL_INDEX_ID. Rdb_ddl_manager::populate replays it at DB open, before auto
-  // compactions are re-enabled, so the SST build path stops depending on a
-  // table being open. Write-through on bind is sufficient: a SABI-less SST can
-  // only exist if rows were written, writing rows requires an open table, and
-  // an open table runs exactly this code.
-  //
-  // Already persisted -> compare bytes. A mismatch means the value-blob layout
-  // this table produces today differs from the one the persisted bitmaps were
-  // built with; continuing would mis-extract the existing rows, so fail the
-  // open instead.
+  // Persist the build descriptor so Rdb_ddl_manager::populate can rebind the
+  // CF at DB open. A stored descriptor must match byte for byte: the existing
+  // bitmaps were built with that layout, so a mismatch fails the open.
   {
     Rdb_bitlsm_descriptor desc;
     desc.schema = schema;
@@ -4042,10 +4004,8 @@ uint Rdb_key_def::setup_bitlsm_index(const TABLE &tbl,
     }
   }
 
-  // (4) M5: attach the cardinality estimator to the bound CF (idempotent
-  // across reopen -- a running worker is kept). Non-blocking: the ctor spawns
-  // the refresh worker and primes the initial build asynchronously. `schema`
-  // was copied into the SABIFactory above, so moving it out here is safe.
+  // Attach the cardinality estimator (idempotent across reopen; non-blocking).
+  // `schema` was copied into the SABIFactory above, so moving it is safe.
   if (rdb_bitlsm_estimator_enabled()) {
     Rdb_bitlsm_registry::instance().estimator_attach(
         pk_cf_name, rdb_get_rocksdb_db()->GetBaseDB(), &pk_def->get_cf(),
@@ -5174,10 +5134,8 @@ bool Rdb_ddl_manager::populate(uint32_t validate_tables, bool lock) {
                         tdef->full_tablename().c_str());
         return true;
       }
-      // Re-establish the BitLSM SABI build binding for this CF before auto
-      // compactions are re-enabled (ha_rocksdb.cc, right after ddl_manager
-      // init). Descriptors are keyed by the PK's GL_INDEX_ID because SABI is
-      // embedded in the PK data CF's row values.
+      // Rebind the SABI build factory for this CF (descriptors are keyed by
+      // the PK's GL_INDEX_ID) before auto compactions are re-enabled.
       if (index_info.m_index_type == Rdb_key_def::INDEX_TYPE_PRIMARY ||
           index_info.m_index_type == Rdb_key_def::INDEX_TYPE_HIDDEN_PRIMARY) {
         std::string bitlsm_blob;
@@ -5185,8 +5143,7 @@ bool Rdb_ddl_manager::populate(uint32_t validate_tables, bool lock) {
           rocksdb::ColumnFamilyHandle *const cfh =
               m_cf_manager->get_cf(gl_index_id.cf_id);
           if (cfh == nullptr) {
-            // No handle means no CF to write to either, so nothing here can
-            // lose its SABI blocks. Log and carry on.
+            // No handle means no CF to write to, so no SST can lose its SABI.
             // NO_LINT_DEBUG
             LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
                             "BITLSM_INDEX: no column family handle for cf_id "
@@ -5196,11 +5153,9 @@ bool Rdb_ddl_manager::populate(uint32_t validate_tables, bool lock) {
                             gl_index_id.index_id,
                             tdef->full_tablename().c_str());
           } else if (!rdb_bitlsm_bind_persisted(cfh->GetName(), bitlsm_blob)) {
-            // Undecodable blob, or a D5 schema conflict on this CF. Do NOT
-            // fail startup: that would leave no way to even DROP the offending
-            // table. Mark the CF instead -- expects_sabi() with no factory
-            // makes the build path fail this CF's flushes and compactions
-            // loudly, so a SABI-less SST still cannot appear.
+            // Undecodable blob or a schema conflict. Do not fail startup, which
+            // would leave no way to DROP the table; mark the CF so its flushes
+            // and compactions fail instead and no SABI-less SST can appear.
             Rdb_bitlsm_registry::instance().mark_expected(cfh->GetName());
             // NO_LINT_DEBUG
             LogPluginErrMsg(ERROR_LEVEL, ER_LOG_PRINTF_MSG,
@@ -6100,8 +6055,8 @@ void Rdb_dict_manager::put_bitlsm_descriptor(rocksdb::WriteBatch &batch,
   Rdb_buf_writer<Rdb_key_def::INDEX_NUMBER_SIZE * 3> key_writer;
   dump_index_id(&key_writer, Rdb_key_def::BITLSM_INDEX_INFO, gl_index_id);
 
-  // The blob is variable-length (one walk entry per value field), so it does
-  // not fit the fixed-size Rdb_buf_writer the other records use.
+  // The blob is variable-length, so it does not fit the fixed-size
+  // Rdb_buf_writer the other records use.
   std::string value;
   value.reserve(Rdb_key_def::VERSION_SIZE + blob.size());
   uchar version_buf[Rdb_key_def::VERSION_SIZE];

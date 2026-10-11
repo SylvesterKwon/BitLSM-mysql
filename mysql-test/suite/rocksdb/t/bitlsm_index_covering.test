@@ -1,13 +1,9 @@
 --source include/have_rocksdb.inc
 
-# P0 correctness: a BITLSM_INDEX writes NO secondary-key entries (D3); its reads
-# are served by SABI bitmap pruning + PK re-fetch, never index-only. Before the
-# fix the engine advertised HA_KEYREAD_ONLY for the bitlsm index, so the
-# optimizer could plan a COVERING / index-only scan -- an unhinted COUNT(*), or
-# a SELECT of only indexed columns -- which reads the empty SK keyspace and
-# returns WRONG results (e.g. COUNT(*) WHERE a=10 returned 0/garbage instead of
-# 5). The fix clears HA_KEYREAD_ONLY for bitlsm indexes so every read fetches
-# the full row. This test pins covering reads + COUNT(*) to the full-scan answer.
+# A BITLSM_INDEX writes no secondary-key entries, so an index-only (covering)
+# scan over it would read an empty keyspace and return wrong results. The engine
+# must not advertise HA_KEYREAD_ONLY for it; covering reads and COUNT(*) must
+# match the full-scan answer.
 
 CREATE TABLE t_cov (
   id BIGINT NOT NULL,
@@ -24,9 +20,9 @@ INSERT INTO t_cov VALUES
 --echo # Force flush so reads come from an SST (where SABI block-skip engages).
 SET GLOBAL rocksdb_force_flush_memtable_now = 1;
 
---echo # ==== (1) unhinted COUNT(*) with a WHERE on bitlsm columns (the P0 shape) ====
---echo # Must equal the full-scan count. Before the fix a covering index-only
---echo # scan over the empty bitlsm keyspace returned the wrong number.
+--echo # ==== (1) unhinted COUNT(*) with a WHERE on bitlsm columns ====
+--echo # Must equal the full-scan count: a covering index-only scan over the
+--echo # empty bitlsm keyspace would return the wrong number.
 SELECT COUNT(*) FROM t_cov WHERE a = 10;
 --let $c_auto = `SELECT COUNT(*) FROM t_cov WHERE a = 10`
 --let $c_full = `SELECT COUNT(*) FROM t_cov IGNORE INDEX(bi) WHERE a = 10`

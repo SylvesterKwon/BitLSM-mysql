@@ -304,12 +304,9 @@ class ha_rocksdb : public my_core::handler, public blob_buffer {
   bool m_full_key_lookup = false;
 
   /*
-    M3b-3: candidate primary keys for a BITLSM_INDEX read, replacing M3b-1's PK
-    full scan. Built in index_read_intern() as the union of (a) SABI bitmap-
-    pruned committed rows and (b) the current transaction's own uncommitted PK
-    writes (write batch), deduped and filtered to this table's PK index_id.
-    index_next_with_direction_intern() walks this set, authoritatively fetching
-    and re-verifying each entry. m_bitlsm_cand_pos is the forward scan cursor.
+    Candidate primary keys for a BITLSM_INDEX read, built in index_read_intern()
+    and walked by index_next_with_direction_intern(). m_bitlsm_cand_pos is the
+    forward scan cursor.
   */
   std::vector<std::string> m_bitlsm_candidates;
   size_t m_bitlsm_cand_pos = 0;
@@ -973,9 +970,8 @@ class ha_rocksdb : public my_core::handler, public blob_buffer {
                            key_range *const max_key) override
       MY_ATTRIBUTE((__warn_unused_result__));
 
-  // M5 (BitLSM): planning-time cardinality estimate for a BITLSM_INDEX.
-  // Runs the SAME translation as the read path (rdb_bitlsm_assemble_query +
-  // EncodeQuery) against the registry-attached estimator of the PK data CF.
+  // Planning-time cardinality estimate for a BITLSM_INDEX, from the estimator
+  // attached to the PK data CF. Returns false when no estimate is available.
   bool bitlsm_estimate_selectivity(uint inx, Item *cond, double *selectivity,
                                    ulonglong *physical_rows,
                                    key_part_map *covered_parts,

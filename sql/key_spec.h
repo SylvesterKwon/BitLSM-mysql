@@ -91,12 +91,9 @@ class KEY_CREATE_INFO {
 extern KEY_CREATE_INFO default_key_create_info;
 
 // BITLSM_INDEX only: the optional per-key-part ORDERED / UNORDERED keyword.
-// It selects which predicates the attribute's bins serve -- ORDERED cuts bins
-// by equal mass over sorted values and answers ranges, UNORDERED bins by a
-// frequency-balanced value dictionary and answers equality alone. NOT_SPECIFIED
-// leaves the choice to the column type (numeric -> ordered, binary string ->
-// unordered), which is what every index declared before this keyword existed
-// gets, so the default is unchanged.
+// ORDERED bins by equal mass over sorted values and answers ranges; UNORDERED
+// bins by a frequency-balanced value dictionary and answers equality only.
+// NOT_SPECIFIED follows the column type: numeric ORDERED, binary UNORDERED.
 enum class Bitlsm_key_part_type { NOT_SPECIFIED, ORDERED, UNORDERED };
 
 class Key_part_spec {

@@ -1,9 +1,7 @@
-/* Copyright (c) Meta Platforms, Inc. and affiliates.
+// Copyright (c) 2026 Dohyun Kwon
 
-   Unit test for the BitLSM row-value decoder (M3a-4). Exercises
-   Rdb_bitlsm_extractor::ExtractAll over hand-built MyRocks value blobs and
-   plans, so it depends only on rdb_bitlsm_extractor.h + bit_lsm_encoding.h --
-   no TABLE or Field access, no RocksDB storage-engine link. */
+/* Unit test for Rdb_bitlsm_extractor::ExtractAll over hand-built MyRocks value
+   blobs. Depends only on rdb_bitlsm_extractor.h and bit_lsm_encoding.h. */
 
 #include <cstdint>
 #include <cstring>
@@ -24,11 +22,9 @@ using Enc = Rdb_bitlsm_attr_plan::Enc;
 using Shape = Rdb_bitlsm_attr_plan::Shape;
 using bit_lsm::EncodedAttr;
 
-// --- little helpers to assemble raw value/key blobs ------------------------
-
 void put_u8(std::string *s, uint8_t v) { s->push_back(static_cast<char>(v)); }
 
-// append `len` little-endian bytes of an unsigned value
+// Append `len` little-endian bytes of an unsigned value.
 void put_le(std::string *s, uint64_t v, unsigned len) {
   for (unsigned i = 0; i < len; ++i)
     s->push_back(static_cast<char>((v >> (8 * i)) & 0xff));
@@ -46,7 +42,7 @@ void put_f32(std::string *s, float f) {
   s->append(b, 4);
 }
 
-// 4-byte big-endian index-number prefix + arbitrary pk-key tail
+// 4-byte big-endian index-number prefix plus an arbitrary PK tail.
 std::string make_key(uint32_t index_number, std::string_view tail = "pk") {
   std::string k;
   put_u8(&k, (index_number >> 24) & 0xff);
@@ -57,10 +53,8 @@ std::string make_key(uint32_t index_number, std::string_view tail = "pk") {
   return k;
 }
 
-// An EncodedAttr borrows: binary attrs view `value`, numeric attrs view the
-// extractor's okey scratch. The extractor here is local, so its scratch dies
-// at return -- copy every view into an owning string before handing results
-// to the assertions.
+// EncodedAttr views borrow from `value` or the extractor's scratch, which is
+// local to run(); copy them into owning strings before asserting.
 using OwnedAttr = std::variant<std::monostate, std::string>;
 
 std::vector<OwnedAttr> run(const Rdb_bitlsm_attr_plan &plan,
@@ -112,12 +106,8 @@ Rdb_bitlsm_attr_plan::WalkEntry varlen(uint32_t prefix_bytes, bool nullable,
   return e;
 }
 
-// --- tests ------------------------------------------------------------------
-
-// One row exercising: signed int, a variable-length NON-target field before
-// later targets, unsigned int, double, DATE(3B), VARBINARY, and a NULL
-// attribute at the end. Also confirms the CR-1 key filter passes for a matching
-// index number.
+// One row with every encoding, a skipped variable-length non-target field, and
+// a NULL attribute at the end.
 TEST(BitlsmDecoder, MixedRowExtractsAllTypes) {
   const uint32_t kIdxNo = 42;
   Rdb_bitlsm_attr_plan plan;
@@ -171,9 +161,8 @@ TEST(BitlsmDecoder, MixedRowExtractsAllTypes) {
   EXPECT_TRUE(std::holds_alternative<std::monostate>(out[5]));  // NULL
 }
 
-// CR-1: a row whose key prefix does not match this table's PK index number must
-// yield all-monostate (it belongs to a foreign index sharing the CF). A too-
-// short key is treated the same way.
+// A row whose key prefix is not this table's PK index number (a foreign row
+// sharing the CF), or whose key is too short, yields all-NULL.
 TEST(BitlsmDecoder, ForeignRowAndShortKeyAreAllNull) {
   Rdb_bitlsm_attr_plan plan;
   plan.attr_num = 1;
@@ -184,28 +173,26 @@ TEST(BitlsmDecoder, ForeignRowAndShortKeyAreAllNull) {
   std::string v;
   put_le(&v, uint32_t(-5), 4);
 
-  // Matching index number -> extracts normally (sanity anchor).
+  // Matching index number extracts normally.
   {
     auto out = run(plan, make_key(42), v);
     ASSERT_TRUE(std::holds_alternative<std::string>(out[0]));
     EXPECT_EQ(std::get<std::string>(out[0]), bit_lsm::OkeyToBytes(bit_lsm::I64ToOkey(-5)));
   }
-  // Different index number -> foreign row -> monostate.
+  // Foreign index number.
   {
     auto out = run(plan, make_key(99), v);
     EXPECT_TRUE(std::holds_alternative<std::monostate>(out[0]));
   }
-  // Key shorter than 4 bytes -> monostate.
+  // Key shorter than 4 bytes.
   {
     auto out = run(plan, std::string_view("\x00\x00", 2), v);
     EXPECT_TRUE(std::holds_alternative<std::monostate>(out[0]));
   }
 }
 
-// Sign extension for sub-8-byte widths (INT24, TINY) plus okey monotonicity for
-// signed integers.
+// Sign extension for sub-8-byte widths (INT24, TINY) and signed okey order.
 TEST(BitlsmDecoder, SignExtensionAndSignedMonotonicity) {
-  // INT24 = -3, then a TINY = -1, both signed.
   Rdb_bitlsm_attr_plan plan;
   plan.attr_num = 2;
   plan.null_bytes_len = 0;
@@ -223,13 +210,12 @@ TEST(BitlsmDecoder, SignExtensionAndSignedMonotonicity) {
   ASSERT_TRUE(std::holds_alternative<std::string>(out[1]));
   EXPECT_EQ(std::get<std::string>(out[1]), bit_lsm::OkeyToBytes(bit_lsm::I64ToOkey(-1)));
 
-  // Order preservation: -3 < 0 < 5 must hold in okey space.
+  // -3 < 0 < 5 must hold in okey space.
   EXPECT_LT(bit_lsm::I64ToOkey(-3), bit_lsm::I64ToOkey(0));
   EXPECT_LT(bit_lsm::I64ToOkey(0), bit_lsm::I64ToOkey(5));
 }
 
-// FLOAT (4B) decode and okey monotonicity for floating point (including across
-// the sign boundary).
+// FLOAT (4B) decode and floating-point okey order across the sign boundary.
 TEST(BitlsmDecoder, Float32AndFloatMonotonicity) {
   Rdb_bitlsm_attr_plan plan;
   plan.attr_num = 1;
@@ -248,8 +234,8 @@ TEST(BitlsmDecoder, Float32AndFloatMonotonicity) {
   EXPECT_LT(bit_lsm::F64ToOkey(0.0), bit_lsm::F64ToOkey(3.5));
 }
 
-// Unsigned-integer decode plus the TTL prefix + unpack_info block skip. The
-// null bitmap sits AFTER the 8-byte TTL; the unpack block is [tag][u16 BE len].
+// Unsigned decode behind a TTL prefix and an unpack_info block. The null
+// bitmap follows the 8-byte TTL; the unpack block is [tag][u16 BE len].
 TEST(BitlsmDecoder, TtlAndUnpackInfoSkip) {
   Rdb_bitlsm_attr_plan plan;
   plan.attr_num = 1;
@@ -262,7 +248,7 @@ TEST(BitlsmDecoder, TtlAndUnpackInfoSkip) {
   std::string v;
   put_le(&v, 0, 8);      // 8-byte TTL (contents irrelevant)
   put_u8(&v, 0x00);      // null bitmap: attr present
-  // unpack_info block: tag(0x02) + u16 big-endian total-length(5) + 2 payload
+  // unpack_info block: tag 0x02, u16 big-endian total length 5, 2 payload bytes
   put_u8(&v, 0x02);
   put_u8(&v, 0x00);
   put_u8(&v, 0x05);      // total block length = 5 bytes

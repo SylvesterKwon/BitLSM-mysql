@@ -1,22 +1,12 @@
-# Differential check for one bitlsm index read (M3b-1).
-#
-# A BITLSM_INDEX writes no secondary-key entries, so a normal range scan finds
-# nothing. When the index is chosen, the engine instead full-scans the PK data
-# CF and lets ICP filter each row against the pushed WHERE. This helper asserts
-# that the FORCE INDEX(bi) row set is byte-for-byte identical to the same query
-# resolved by a full table scan (IGNORE INDEX(bi)), for the SAME predicate.
+# Differential check for one bitlsm index read: FORCE INDEX(bi) must equal the
+# full scan (IGNORE INDEX(bi)). The rows are recorded so a divergence shows in
+# the diff; set equality is enforced via include/assert.inc.
 #
 # Parameters:
 #   $qtitle - human description of the query
 #   $w      - WHERE predicate over the bi columns (a, b, c)
-#
-# The FORCE INDEX(bi) rows are recorded (so a divergence is visible in the diff)
-# and the set equality is machine-enforced via include/assert.inc (so a
-# recorded-but-wrong result cannot pass silently).
 
-# Selecting the non-indexed payload column d makes bi non-covering, so the
-# server pushes the WHERE as an index condition (ICP) -- exercising the engine's
-# check_index_cond() filter -- rather than post-filtering a covered row.
+# d is not in bi: non-covering, so the WHERE is pushed as an index condition.
 --echo # $qtitle
 --eval SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE $w ORDER BY id
 

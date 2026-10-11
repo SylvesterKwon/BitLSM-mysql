@@ -10516,10 +10516,8 @@ static Sys_var_uint Sys_fb_vector_index_cost_factor(
     VALID_RANGE(1, 100000), DEFAULT(1000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
     NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(nullptr));
 
-// BitLSM (SABI) index optimizer knobs (M4b). See index_range_scan_plan.cc,
-// check_quick_select(), the bitlsm_synthetic block: a dead-simple,
-// SABI-API-free selectivity estimate turns a pushed WHERE into a candidate-row
-// count and prices the BitLSM access as candidate * per-fetch cost / factor.
+// BitLSM index optimizer knobs; consumed by the BITLSM_INDEX branch of
+// check_quick_select() in index_range_scan_plan.cc.
 static Sys_var_double Sys_bitlsm_index_cost_factor(
     "bitlsm_index_cost_factor",
     "Divides the estimated cost of a BITLSM_INDEX candidate scan. A larger "

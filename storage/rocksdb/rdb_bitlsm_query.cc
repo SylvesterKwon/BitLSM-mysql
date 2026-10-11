@@ -1,26 +1,21 @@
-/* Copyright (c) Meta Platforms, Inc. and affiliates. */
+// Copyright (c) 2026 Dohyun Kwon
 
 #include "./rdb_bitlsm_query.h"
 
-/* rdb_bitlsm_index_type_for(): the index-type policy, shared with
-   rdb_datadic.cc so build-time binning and query-time comparands agree. */
 #include "./rdb_bitlsm_extractor.h"
 
 #include <cstdint>
 #include <string>
 #include <unordered_map>
 
-/* MySQL server: Item tree, Field metadata, KEY. */
 #include "sql/field.h"
 #include "sql/item.h"
-#include "sql/item_cmpfunc.h"  // Item_cond, Item_func_in
+#include "sql/item_cmpfunc.h"
 #include "sql/item_func.h"
-#include "sql/item_row.h"  // Item_row (row-constructor IN predicand)
+#include "sql/item_row.h"
 #include "sql/key.h"
 #include "sql/sql_list.h"
 
-/* my_date_to_binary / non_zero_time / TIME_FUZZY_DATE: the DATE comparand is
- * packed exactly the way Field_newdate stores the column. */
 #include "my_time.h"
 
 namespace myrocks {
@@ -34,29 +29,19 @@ using bit_lsm::CompareOp;
 using bit_lsm::OrClause;
 using bit_lsm::QueryCondition;
 
-// Which variant alternative an attribute's comparand must use. Mirrors the
-// role/encoding derivation in rdb_datadic.cc::bitlsm_derive_enc so the query's
-// comparand type can never disagree with how rows were binned. SKIP marks an
-// attribute the query translator does not know how to encode a literal for:
-// conditions on it are conservatively omitted. After DATE support landed no
-// type reachable through a valid BITLSM_INDEX maps to SKIP -- it is kept as a
-// defensive default.
+// Which variant alternative an attribute's comparand uses. Must agree with the
+// encoding rdb_datadic.cc::bitlsm_derive_enc binned the rows with. SKIP marks a
+// type no literal can be encoded for; conditions on it are omitted.
 enum class ValKind { SKIP, I64, U64, DBL, STR, DATE };
 
-// Per-attribute translation metadata, keyed by the table field index.
 struct AttrMeta {
   uint32_t attr_idx;  // position in the index's user-defined key parts
   ValKind kind;
-  // Which predicates this attr's bins serve. kEquality rejects every non-EQUAL
-  // operator at Validate, so the translator must omit those conditions rather
-  // than emit a query that fails validation.
-  bit_lsm::IndexType index_type;
+  bit_lsm::IndexType index_type;  // kEquality attrs accept EQUAL only
 };
 
-// Map a Field to (AttrSpec, ValKind). All types here are the ones the extractor
-// accepts (the table would not exist otherwise). Anything unexpected still gets
-// a placeholder AttrSpec so attr_idx alignment is preserved, but is marked SKIP
-// so no condition is emitted for it.
+// Map a Field to (AttrSpec, ValKind). An unexpected type still gets a
+// placeholder AttrSpec so attr_idx alignment is preserved, but is marked SKIP.
 static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind,
                           bool declared_ordered, bool declared_unordered) {
   using bit_lsm::IndexType;
@@ -90,7 +75,7 @@ static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind,
                        PhysicalType::kFloat, 8, nullable);
       *kind = ValKind::DBL;
       return;
-    case MYSQL_TYPE_STRING:  // CHAR/BINARY -- fixed width (binary collation)
+    case MYSQL_TYPE_STRING:  // CHAR/BINARY, fixed width (binary collation)
       *spec = AttrSpec(rdb_bitlsm_index_type_for(true, declared_ordered,
                                                  declared_unordered),
                        PhysicalType::kBinary,
@@ -104,13 +89,8 @@ static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind,
       *kind = ValKind::STR;
       return;
     case MYSQL_TYPE_NEWDATE:  // DATE (Field_newdate: 3 bytes, LE packed)
-      // kUint matches the extractor, which reads the 3 LE bytes and runs them
-      // through U64ToOkey; the comparand is packed the same way. `width` is
-      // filler -- AttrSpec widths are 1/2/4/8 so 3 is not expressible, and
-      // nothing on this path decodes it: the adapter walks the MyRocks value
-      // blob with its own Rdb_bitlsm_attr_plan rather than the core's
-      // physical-type row layout, and Validate branches on physical type
-      // only, never on width.
+      // Width 4 is filler: AttrSpec cannot express 3, and nothing on this path
+      // reads the width (the extractor walks the row with its own plan).
       *spec = AttrSpec(rdb_bitlsm_index_type_for(false, declared_ordered,
                                                  declared_unordered),
                        PhysicalType::kUint, 4, nullable);
@@ -123,7 +103,6 @@ static void field_to_attr(const Field *f, AttrSpec *spec, ValKind *kind,
   }
 }
 
-// Shared context for one translation: field_index -> attr metadata.
 struct Ctx {
   std::unordered_map<uint, AttrMeta> by_field;
 };
@@ -141,7 +120,7 @@ static const Field *index_field_of(Item *it, const Ctx &ctx, AttrMeta *meta) {
 }
 
 // Map a comparison functype to a CompareOp; `flip` is true when the index field
-// is on the RIGHT-hand side (const OP field), which reverses the direction.
+// is on the right-hand side (const OP field), which reverses the direction.
 static bool map_op(Item_func::Functype ft, bool flip, CompareOp *op) {
   switch (ft) {
     case Item_func::EQ_FUNC:
@@ -165,8 +144,8 @@ static bool map_op(Item_func::Functype ft, bool flip, CompareOp *op) {
 }
 
 // Extract a constant literal from `it` into `*out`, coerced to `kind`. Returns
-// false if the literal is NULL or (for an unsigned attr) negative -- in either
-// case the condition is omitted rather than risk a non-weakening translation.
+// false when no comparand can be emitted safely (NULL, a negative value for an
+// unsigned attr, an unrepresentable DATE); the caller omits the condition.
 static bool extract_value(
     Item *it, ValKind kind,
     std::variant<int64_t, uint64_t, double, std::string> *out) {
@@ -180,8 +159,7 @@ static bool extract_value(
     case ValKind::U64: {
       const longlong v = it->val_int();
       if (it->null_value) return false;
-      // A negative comparand against an unsigned attr has no safe okey; omit.
-      if (!it->unsigned_flag && v < 0) return false;
+      if (!it->unsigned_flag && v < 0) return false;  // no okey for it
       *out = static_cast<uint64_t>(v);
       return true;
     }
@@ -202,23 +180,16 @@ static bool extract_value(
       MYSQL_TIME ltime;
       if (it->get_date(&ltime, TIME_FUZZY_DATE)) return false;
       if (it->null_value) return false;
-      // A comparand carrying a time part is compared as DATETIME: the DATE
-      // column widens to midnight, so `d < '2020-01-01 10:00:00'` MATCHES
-      // d = 2020-01-01. Truncating to the date part would emit
-      // `okey < packed(2020-01-01)` and prune that row away -- a
-      // STRENGTHENING, which loses rows. Omit instead.
+      // A comparand with a time part is compared as DATETIME, where the DATE
+      // column widens to midnight: `d < '2020-01-01 10:00:00'` matches
+      // d = 2020-01-01. Truncating it to a date would prune that row.
       if (non_zero_time(ltime)) return false;
-      // Zero month/day, e.g. '2020-06-00'. Item::get_date() reaches
-      // str_to_datetime_with_warn(), which does NOT apply MODE_NO_ZERO_IN_DATE,
-      // so it parses; the comparator's get_mysql_time_from_str() DOES apply it,
-      // fails, and get_datetime_value() then silently compares against packed
-      // 0 -- weaker than any real date. Emitting a comparand here would prune
-      // rows the server counts as matching, i.e. NARROW. Omit instead.
+      // A zero month or day ('2020-06-00') parses here but fails in the
+      // server's comparator, which then compares against packed 0. Any
+      // comparand we emit would prune rows the server counts as matching.
       if (ltime.month == 0 || ltime.day == 0) return false;
-      // Pack through the SAME function Field_newdate::store_internal uses
-      // (sql/field.cc), so these are byte-for-byte the bytes the extractor
-      // reads back. Writing the formula out by hand here would silently
-      // diverge if MySQL ever changed the layout.
+      // Pack with the same function Field_newdate::store_internal uses, so the
+      // bytes match what the extractor reads back from the row.
       uchar buf[3];
       my_date_to_binary(&ltime, buf);
       *out = static_cast<uint64_t>(buf[0]) |
@@ -232,8 +203,7 @@ static bool extract_value(
   }
 }
 
-// Try to translate a binary comparison (`field OP const` / `const OP field`)
-// into one QueryCondition. Returns false (omit) on any unrepresentable shape.
+// `field OP const` or `const OP field` -> one QueryCondition.
 static bool make_condition(Item_func *f, const Ctx &ctx, QueryCondition *cond) {
   if (f->argument_count() != 2) return false;
   Item *a0 = f->arguments()[0];
@@ -256,10 +226,7 @@ static bool make_condition(Item_func *f, const Ctx &ctx, QueryCondition *cond) {
 
   CompareOp op;
   if (!map_op(f->functype(), flip, &op)) return false;
-  // kEquality attrs serve `=` only; a non-EQUAL op is not representable and
-  // Validate would reject the whole query, so omit the condition instead.
-  // A binary column indexed kRange takes range operators like any other attr:
-  // its bytes are its order.
+  // Validate rejects a non-EQUAL op on a kEquality attr; omit it instead.
   if (meta.index_type == bit_lsm::IndexType::kEquality &&
       op != CompareOp::EQUAL)
     return false;
@@ -270,8 +237,7 @@ static bool make_condition(Item_func *f, const Ctx &ctx, QueryCondition *cond) {
   return true;
 }
 
-// Translate a positive `field IN (c1, c2, ...)` into EQUAL conditions appended
-// to *clause (all on the same attr). Returns false (omit) otherwise.
+// Positive `field IN (c1, c2, ...)` -> EQUAL terms appended to *clause.
 static bool make_in_terms(Item_func_in *in, const Ctx &ctx, OrClause *clause) {
   if (in->negated) return false;  // NOT IN is a conjunction of !=, not an OR
   const uint n = in->argument_count();
@@ -293,14 +259,9 @@ static bool make_in_terms(Item_func_in *in, const Ctx &ctx, OrClause *clause) {
   return true;
 }
 
-// A positive `field BETWEEN lo AND hi` is the conjunction `field >= lo AND
-// field <= hi`: TWO independent clause_groups. Handled at the conjunction level
-// (not in collect_disjunction, which builds a single OR clause) because it
-// contributes two groups. kRange attrs only -- a kEquality attr has no
-// representable range. Both bounds are extracted BEFORE either group is pushed,
-// so a partial (potentially non-weakening) translation is never emitted.
-// Returns false (caller drops the whole conjunct -> safe weakening) on NOT
-// BETWEEN or any unrepresentable shape.
+// Translate a positive `field BETWEEN lo AND hi` (kRange attrs only) into the
+// clause_groups `>= lo` and `<= hi`. Both bounds are extracted before either
+// group is pushed. Returns false on NOT BETWEEN or any unrepresentable shape.
 static bool make_between_groups(Item_func *f, const Ctx &ctx, BitLSMQuery *q) {
   if (static_cast<Item_func_opt_neg *>(f)->negated) return false;
   if (f->argument_count() != 3) return false;
@@ -334,23 +295,12 @@ static bool make_between_groups(Item_func *f, const Ctx &ctx, BitLSMQuery *q) {
   return true;
 }
 
-// Translate a positive row-constructor IN -- `(c0, c1, ...) IN ((v00, v01,
-// ...), (v10, v11, ...), ...)` -- by DISTRIBUTING it per column:
-//
-//   (a,b) IN ((1,2),(3,4))
-//     == (a=1 AND b=2) OR (a=3 AND b=4)   -- DNF; CNF cannot express it
-//     <= (a=1 OR a=3) AND (b=2 OR b=4)    -- per column: a safe weakening
-//
-// Each column contributes ONE clause_group of EQUALs, so this lives at the
-// conjunction level (like make_between_groups) rather than in
-// collect_disjunction, which builds a single OR clause. The extra combinations
-// the distributed form admits (a=1 AND b=4) cost fetches and are dropped by the
-// ICP re-verify -- never a correctness problem.
-//
-// Unlike BETWEEN's two bounds, per-column clauses are INDEPENDENT: a column
-// whose values do not all translate is dropped ALONE and the remaining groups
-// are still a superset of the original condition. Returns false (nothing
-// emitted) only when the SHAPE is unusable.
+// Translate a positive row-constructor IN by distributing it per column, a safe
+// weakening of the DNF the row form denotes:
+//   (a,b) IN ((1,2),(3,4))  ==  (a=1 AND b=2) OR (a=3 AND b=4)
+//                           <=  (a=1 OR a=3) AND (b=2 OR b=4)
+// Each column becomes one clause_group of EQUALs; a column whose values do not
+// all translate is dropped alone. Returns false only on an unusable shape.
 static bool make_row_in_groups(Item_func_in *in, const Ctx &ctx,
                                BitLSMQuery *q) {
   if (in->negated) return false;  // NOT IN is not a disjunction of EQUALs
@@ -361,8 +311,7 @@ static bool make_row_in_groups(Item_func_in *in, const Ctx &ctx,
   const uint cols = pred->cols();
   if (cols == 0) return false;
 
-  // Every RHS element must be a row of the same arity; otherwise values cannot
-  // be lined up with columns at all.
+  // Every RHS element must be a row of the same arity.
   for (uint i = 1; i < n; i++) {
     Item *const e = in->arguments()[i]->real_item();
     if (e->type() != Item::ROW_ITEM) return false;
@@ -372,16 +321,11 @@ static bool make_row_in_groups(Item_func_in *in, const Ctx &ctx,
   bool any = false;
   for (uint j = 0; j < cols; j++) {
     AttrMeta meta{};
-    // NOTE: the out-of-index case does not actually arrive here -- a row
-    // constructor mixing indexed and non-indexed columns is rejected earlier by
-    // uses_index_fields_only() and never pushed. Kept for safety; the reachable
-    // partial-failure path is a value that fails to extract.
     if (index_field_of(pred->element_index(j), ctx, &meta) == nullptr) continue;
     if (meta.kind == ValKind::SKIP) continue;
 
-    // Build the column's clause COMPLETELY before publishing it: a
-    // half-translated OR clause would be a strengthening of this column's
-    // constraint, which loses rows.
+    // Build the column's clause completely before publishing it; a partial OR
+    // clause would strengthen the condition.
     OrClause clause;
     bool ok = true;
     for (uint i = 1; i < n; i++) {
@@ -401,18 +345,16 @@ static bool make_row_in_groups(Item_func_in *in, const Ctx &ctx,
       }
       clause.push_back(std::move(c));
     }
-    if (!ok || clause.empty()) continue;  // drop THIS column only
+    if (!ok || clause.empty()) continue;  // drop this column only
     q->clause_groups.push_back(std::move(clause));
     any = true;
   }
   return any;
 }
 
-// Append the OR-terms of a purely disjunctive, fully representable item to
-// *clause. A single comparison is a degenerate 1-term disjunction; IN expands
-// to n terms; OR is the union of its operands' terms (all-or-nothing). Any
-// non-disjunctive shape (e.g. an AND nested inside an OR) returns false so the
-// caller drops the whole clause -- preserving the weakening invariant.
+// Append the OR-terms of a purely disjunctive item (a comparison, an IN-list,
+// or an OR of those) to *clause. Returns false on any other shape, e.g. an AND
+// nested inside an OR, so the caller drops the whole clause.
 static bool collect_disjunction(Item *it, const Ctx &ctx, OrClause *clause) {
   if (it->type() == Item::COND_ITEM) {
     Item_cond *c = static_cast<Item_cond *>(it);
@@ -440,13 +382,8 @@ static bool collect_disjunction(Item *it, const Ctx &ctx, OrClause *clause) {
       case Item_func::IN_FUNC:
         return make_in_terms(static_cast<Item_func_in *>(f), ctx, clause);
       case Item_func::MULT_EQUAL_FUNC: {
-        // A multiple-equality inside an OR arm (planning-time shape: see
-        // collect_conjunction -- optimize_cond rewrites equalities in every
-        // arm too, and the execution-time ICP tree has them substituted
-        // back). Arm semantics: every member field equals the shared
-        // constant. Emitting any member as an OR term only WIDENS the union
-        // (each term is a superset of the arm), so the weakening invariant
-        // holds even when some members are skipped.
+        // Item_equal inside an OR arm (planning-time shape). Each member alone
+        // is a superset of the arm, so emitting any subset only widens the OR.
         Item_equal *ie = static_cast<Item_equal *>(f);
         Item *cst = ie->const_arg();
         if (cst == nullptr || !cst->const_item()) return false;
@@ -472,8 +409,7 @@ static bool collect_disjunction(Item *it, const Ctx &ctx, OrClause *clause) {
 }
 
 // Walk the AND-spine: each conjunct becomes its own clause_group. Nested ANDs
-// are flattened; a conjunct that is not representable as a pure disjunction is
-// silently dropped (dropping a conjunct only weakens the query).
+// are flattened; an unrepresentable conjunct is dropped.
 static void collect_conjunction(Item *it, const Ctx &ctx, BitLSMQuery *q) {
   if (it->type() == Item::COND_ITEM) {
     Item_cond *c = static_cast<Item_cond *>(it);
@@ -485,13 +421,8 @@ static void collect_conjunction(Item *it, const Ctx &ctx, BitLSMQuery *q) {
     }
     // A top-level OR falls through to collect_disjunction below.
   }
-  // A multiple-equality node (Item_equal, built by optimize_cond). PLANNING-
-  // time conditions carry these; the execution-time ICP tree has plain
-  // field=const again because substitute_for_best_equal_field runs after
-  // range analysis. Semantics: every member field equals the shared constant
-  // = an AND of equalities, so translating any subset is a weakening.
-  // Without a constant (pure column-to-column chain) nothing is
-  // representable.
+  // Item_equal (from optimize_cond) appears only in planning-time conditions.
+  // It is an AND of `member = const`, so any subset of members may be emitted.
   if (it->type() == Item::FUNC_ITEM &&
       static_cast<Item_func *>(it)->functype() == Item_func::MULT_EQUAL_FUNC) {
     Item_equal *ie = static_cast<Item_equal *>(it);
@@ -512,10 +443,8 @@ static void collect_conjunction(Item *it, const Ctx &ctx, BitLSMQuery *q) {
     }
     return;
   }
-  // A row-constructor IN -- `(a,b) IN ((1,2),(3,4))` -- distributes into one
-  // clause_group per column (see make_row_in_groups), so like BETWEEN it
-  // cannot go through collect_disjunction. A SCALAR IN keeps falling through
-  // to collect_disjunction, which turns it into a single OR clause.
+  // A row-constructor IN yields one clause_group per column, so it cannot go
+  // through collect_disjunction. A scalar IN falls through to it.
   if (it->type() == Item::FUNC_ITEM &&
       static_cast<Item_func *>(it)->functype() == Item_func::IN_FUNC) {
     Item_func_in *const in = static_cast<Item_func_in *>(it);
@@ -524,10 +453,7 @@ static void collect_conjunction(Item *it, const Ctx &ctx, BitLSMQuery *q) {
       return;
     }
   }
-  // `field BETWEEN lo AND hi` expands to two clause_groups (>= lo, <= hi).
-  // collect_disjunction can't represent it (a conjunction is not a single OR
-  // term), so handle it here; an unrepresentable BETWEEN is dropped (a dropped
-  // conjunct only weakens -> safe).
+  // BETWEEN expands to two clause_groups, so it is handled here too.
   if (it->type() == Item::FUNC_ITEM &&
       static_cast<Item_func *>(it)->functype() == Item_func::BETWEEN) {
     make_between_groups(static_cast<Item_func *>(it), ctx, q);
@@ -544,9 +470,7 @@ static void collect_conjunction(Item *it, const Ctx &ctx, BitLSMQuery *q) {
 bool rdb_bitlsm_assemble_query(const KEY &key_info, Item *cond,
                                BitLSMQuery *out_query,
                                BitLSMOptions *out_options) {
-  // (1) Build the schema/options from the index Field types (single source of
-  // truth for index type, physical type and comparand variant), and the
-  // field_index -> attr map.
+  // Options and the field_index -> attr map, both from the index Field types.
   Ctx ctx;
   out_options->attr_specs.clear();
   out_options->attr_specs.reserve(key_info.user_defined_key_parts);
@@ -567,12 +491,10 @@ bool rdb_bitlsm_assemble_query(const KEY &key_info, Item *cond,
   out_options->rho = 0.001;     // matches setup_bitlsm_index default
   out_options->read_seqno = 0;  // unused by Validate/ToString
 
-  // (2) Walk the pushed condition into a CNF BitLSMQuery.
   out_query->clause_groups.clear();
   if (cond != nullptr) collect_conjunction(cond, ctx, out_query);
 
-  // (3) Validate; on failure degrade to an empty (no-pruning) query, which is
-  // still a valid weakening.
+  // On validation failure degrade to an empty (no-pruning) query.
   const rocksdb::Status s = out_query->Validate(*out_options);
   if (!s.ok()) {
     out_query->clause_groups.clear();

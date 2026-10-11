@@ -9,9 +9,9 @@ INSERT INTO t_cov VALUES
 (5,30,5.5,'x'),(6,10,6.5,'y'),(7,20,7.5,'x'),(8,10,8.5,'x');
 # Force flush so reads come from an SST (where SABI block-skip engages).
 SET GLOBAL rocksdb_force_flush_memtable_now = 1;
-# ==== (1) unhinted COUNT(*) with a WHERE on bitlsm columns (the P0 shape) ====
-# Must equal the full-scan count. Before the fix a covering index-only
-# scan over the empty bitlsm keyspace returned the wrong number.
+# ==== (1) unhinted COUNT(*) with a WHERE on bitlsm columns ====
+# Must equal the full-scan count: a covering index-only scan over the
+# empty bitlsm keyspace would return the wrong number.
 SELECT COUNT(*) FROM t_cov WHERE a = 10;
 COUNT(*)
 5

@@ -10,7 +10,7 @@ INSERT INTO t_le VALUES
 SET GLOBAL rocksdb_force_flush_memtable_now = 1;
 # (1) The assembled SABI query for a leading equality INCLUDES the leading
 #     attribute a0 (proving it was pushed via ICP, not consumed by a ref
-#     key). Before C4 this was just [a2='x'] with a0 absent.
+#     key).
 #   assembled = [a2='x' AND a0=10]
 #
 # (2) The leading equality is routed through a range (whole-index) access,

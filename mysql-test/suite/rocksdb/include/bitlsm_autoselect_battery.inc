@@ -1,5 +1,5 @@
-# M4a auto-selection battery. Sourced once with data in the memtable and once
-# after a forced flush. Each block:
+# Auto-selection battery. Sourced once with data in the memtable and once after
+# a forced flush. Each block:
 #   1. EXPLAIN (no FORCE INDEX) and machine-assert key = bi.
 #   2. Differential: the auto-selected result equals IGNORE INDEX (full scan).
 
@@ -16,7 +16,7 @@ EXPLAIN SELECT id, a, b, c, d FROM t_read WHERE b < 100 AND c = 'gamma';
 
 --let $qtitle = A1 non-leading AND (b<100 AND c='gamma'), auto-selected
 --let $w = b < 100 AND c = 'gamma'
---source suite/rocksdb/include/bitlsm_m4a_autoselect_check.inc
+--source suite/rocksdb/include/bitlsm_autoselect_check.inc
 
 --echo #
 --echo # (2) single non-leading equality (c only), no hint.
@@ -27,13 +27,13 @@ EXPLAIN SELECT id, a, b, c, d FROM t_read WHERE b < 100 AND c = 'gamma';
 
 --let $qtitle = A2 single non-leading equality (c='gamma'), auto-selected
 --let $w = c = 'gamma'
---source suite/rocksdb/include/bitlsm_m4a_autoselect_check.inc
+--source suite/rocksdb/include/bitlsm_autoselect_check.inc
 
 --echo #
 --echo # (3) middle-column range only (b), no hint.
 --let $qtitle = A3 middle-column range (b >= 0.0 AND b < 50.0), auto-selected
 --let $w = b >= 0.0 AND b < 50.0
---source suite/rocksdb/include/bitlsm_m4a_autoselect_check.inc
+--source suite/rocksdb/include/bitlsm_autoselect_check.inc
 
 --echo #
 --echo # (4) REGRESSION: a LEADING 'a' predicate must still work (normal path).
@@ -44,10 +44,10 @@ EXPLAIN SELECT id, a, b, c, d FROM t_read WHERE b < 100 AND c = 'gamma';
 
 --let $qtitle = A4 leading predicate (a>=10), auto-selected
 --let $w = a >= 10
---source suite/rocksdb/include/bitlsm_m4a_autoselect_check.inc
+--source suite/rocksdb/include/bitlsm_autoselect_check.inc
 
 --echo #
 --echo # (5) empty result via non-leading predicate.
 --let $qtitle = A5 non-leading empty (c='nope')
 --let $w = c = 'nope'
---source suite/rocksdb/include/bitlsm_m4a_autoselect_check.inc
+--source suite/rocksdb/include/bitlsm_autoselect_check.inc

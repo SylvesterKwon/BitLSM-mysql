@@ -8,7 +8,7 @@ INDEX bi (a, b, c) BITLSM_INDEX
 SELECT COUNT(*) FROM t_gate;
 COUNT(*)
 2000
-# ==== Phase 1: memtable only (M4b sysvar fallback drives the cost) ====
+# ==== Phase 1: memtable only (sysvar fallback drives the cost) ====
 # (a) bare SELECT, selective indexed eq + NON-index predicate -> bi
 include/assert.inc [gate/fallback: bare mixed-predicate SELECT reaches bi]
 SET GLOBAL rocksdb_force_flush_memtable_now = 1;

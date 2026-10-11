@@ -1,5 +1,5 @@
-/* M2 smoke: prove the BitLSM bitmap API links and runs inside rocksdb_se.
-   TEMPORARY -- replaced by Rdb_bitlsm_handler in M3. */
+/* TODO: remove. Startup smoke check that the BitLSM API links into rocksdb_se;
+   the real read path (rdb_bitlsm_read.cc) exercises the same API. */
 #include <memory>
 #include <string>
 #include <vector>

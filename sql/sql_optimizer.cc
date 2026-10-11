@@ -6051,19 +6051,11 @@ bool JOIN::estimate_rowcount() {
     add_loose_index_scan_and_skip_scan_keys(this, tab);
 
     /*
-      C8 (BitLSM): a BITLSM_INDEX answers arbitrary attribute-subset
-      predicates, so it must reach range analysis whenever ANY of its
-      columns is constrained. Stock const_keys marking is leading-keypart
-      only (add_key_field uses field->key_start), and until now non-leading
-      bitlsm predicates rode in through two ACCIDENTAL side doors: the
-      skip-scan key collection (which intersects part_of_key over every
-      WHERE field, so one non-index column empties it) and the GROUP
-      BY/loose-scan collection (absent for plain SELECTs). A bare SELECT
-      mixing indexed and non-indexed predicates therefore never ran range
-      analysis and silently lost the index, FORCE INDEX included. Mark the
-      front door deliberately: union (not intersect) of the WHERE fields'
-      bitlsm-key memberships. Downstream stays unchanged -- the bitlsm
-      branch of check_quick_select is already gate-exempt and DML-guarded.
+      A BITLSM_INDEX answers predicates on any subset of its columns, so it
+      must reach range analysis whenever any of them is constrained. Stock
+      const_keys marking covers leading keyparts only (add_key_field uses
+      field->key_start), so mark the union of the WHERE fields' bitlsm-key
+      memberships here.
     */
     if (where_cond != nullptr) {
       bool has_bitlsm_key = false;
@@ -6744,23 +6736,11 @@ bool uses_index_fields_only(Item *item, TABLE *tbl, uint keyno,
                                     other_tbls_ok);
     case Item::ROW_ITEM: {
       /*
-        C9 (BitLSM): a row constructor -- the `(a, b)` in
-        `(a,b) IN ((1,2),(3,4))` -- is index-only exactly when every element
-        is. Stock code has no case for it, so it falls through to the "play it
-        safe" default, make_cond_for_index() drops the whole predicate, and it
-        is never pushed as an index condition.
-
-        For a BITLSM_INDEX that is the difference between pruning and a full
-        candidate scan. The bitlsm translator reads the PUSHED condition, so a
-        predicate that never reaches ICP can never prune -- even though the
-        range optimizer happily costs and picks the index for this shape, which
-        is what makes the gap silent: the plan looks right and the scan is
-        unpruned.
-
-        Gated on the index actually being a BITLSM_INDEX so that no other
-        engine's plans change: for every other index this keeps returning false
-        exactly as before. Same containment C4 (sql_planner.cc) and C8 (above)
-        use.
+        A row constructor, the `(a, b)` in `(a,b) IN ((1,2),(3,4))`, is
+        index-only exactly when every element is. Without this case it falls
+        to the conservative default and is never pushed as an index condition,
+        and a predicate that is not pushed cannot prune a BITLSM_INDEX read.
+        Gated on BITLSM_INDEX so no other index's plans change.
       */
       if (tbl == nullptr || tbl->key_info == nullptr || keyno >= tbl->s->keys ||
           !tbl->key_info[keyno].is_bitlsm_index())

@@ -181,11 +181,10 @@ class KEY {
   bool is_bitlsm_index() const { return m_is_bitlsm; }
 
   /*
-    BITLSM_INDEX: which key parts carried an explicit ORDERED / UNORDERED
-    keyword, as bit i = key part i. A part named in neither mask takes the
-    default for its column type. Persisted in the data dictionary (dd_table.cc)
-    because the SSTs were binned under whatever was declared -- a reopened
-    table that fell back to the default would mis-bin against them.
+    BITLSM_INDEX: key parts that carried an explicit ORDERED / UNORDERED
+    keyword, bit i = key part i. A part in neither mask takes its column type's
+    default. Persisted in the data dictionary because the SSTs were binned
+    under the declared layout.
   */
   uint m_bitlsm_ordered_mask = 0;
   uint m_bitlsm_unordered_mask = 0;

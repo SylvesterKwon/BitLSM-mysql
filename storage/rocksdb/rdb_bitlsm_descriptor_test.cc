@@ -1,4 +1,5 @@
-/* Copyright (c) Meta Platforms, Inc. and affiliates. */
+// Copyright (c) 2026 Dohyun Kwon
+
 #include "./rdb_bitlsm_descriptor.h"
 
 #include <gtest/gtest.h>
@@ -80,8 +81,8 @@ TEST(RdbBitlsmDescriptor, RoundTrip) {
   }
 }
 
-// Two descriptors that differ in ANY field must serialize differently: the
-// open-time verification compares serialized bytes and nothing else.
+// Descriptors that differ in any field must serialize differently: table open
+// compares the serialized bytes and nothing else.
 TEST(RdbBitlsmDescriptor, ByteComparisonDetectsSchemaChange) {
   const std::string a = rdb_bitlsm_serialize_descriptor(make_desc());
 

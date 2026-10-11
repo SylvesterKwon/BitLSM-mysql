@@ -1,21 +1,9 @@
 --source include/have_rocksdb.inc
 
-# M3b-3: bitlsm index read served by SABI bitmap pruning + own-writes union.
-#
-# A BITLSM_INDEX (a, b, c) has NO secondary-key entries of its own (D3), so a
-# normal index range scan finds nothing. When the optimizer picks the index
-# (FORCE INDEX(bi)), the engine serves the read from a candidate PK set built
-# as (a) SABI bitmap-pruned COMMITTED rows (a BitLSMIterator that skips SST
-# blocks whose bins cannot satisfy the pushed WHERE) UNION (b) this
-# transaction's own uncommitted PK writes, then authoritatively re-fetches and
-# re-verifies each -- returning results IDENTICAL to a full table scan.
-#
-# This test is DIFFERENTIAL: for every query it asserts FORCE INDEX(bi) ==
-# IGNORE INDEX(bi) (full scan) in both the memtable and the flushed-SST states
-# (Phases 1-2). Because FORCE INDEX now prunes via the bitmap, this proves the
-# pruning + the extractor okey encoding are correct end-to-end. Phase 3 adds
-# own-writes cases (in-transaction INSERT/UPDATE/DELETE) that exercise the
-# write-batch union (option B) against a committed base already in an SST.
+# BITLSM_INDEX read path, differential test. A read is served from a candidate
+# PK set (bitmap-pruned committed rows plus this transaction's uncommitted
+# writes), each re-fetched and re-verified. Every query asserts FORCE INDEX(bi)
+# == IGNORE INDEX(bi) in the memtable and flushed-SST states.
 
 --echo # Mixed-type bitlsm table (INT signed, DOUBLE, VARBINARY), with negative
 --echo # values and NULLs in each index column. The bi index carries no cfname.
@@ -27,8 +15,7 @@ CREATE TABLE t_read (
   INDEX bi (a, b, c) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 
-# d is a payload column NOT in bi, so queries selecting it make the index
-# non-covering and force the WHERE through Index Condition Pushdown.
+# d is not in bi: keeps the read non-covering so the WHERE goes through ICP.
 INSERT INTO t_read VALUES
   (1,  -50,  -1.5, 'alpha', 100),
   (2,    0,   0.0, 'beta',  200),
@@ -46,12 +33,10 @@ INSERT INTO t_read VALUES
 --echo # path (otherwise the differential checks below would pass trivially via a
 --echo # table scan on both sides). EXPLAIN shows key=bi, and because d is not in
 --echo # the index the WHERE is pushed as an index condition (ICP). key_len is masked:
-# BitLSM routes reads through the synthetic whole-index range (key_len=0) so the
-# leading predicate stays a residual condition pushed via ICP (that is what makes
-# the leading attribute prune the SABI bitmap); the exact key_len is incidental.
+# BitLSM reads go through a synthetic whole-index range, so the leading predicate
+# stays an ICP residual and the exact key_len is incidental.
 --replace_column 8 # 10 # 11 #
 EXPLAIN SELECT id, a, b, c, d FROM t_read FORCE INDEX(bi) WHERE a >= 0 AND b < 100 AND c = 'gamma';
-# Machine-enforced routing guards (range access and exact/ref access).
 --let $bi_range_key = query_get_value(EXPLAIN SELECT id FROM t_read FORCE INDEX(bi) WHERE a >= 10, key, 1)
 --let $assert_text = FORCE INDEX(bi) range access is routed to the bitlsm index
 --let $assert_cond = "$bi_range_key" = "bi"
@@ -71,7 +56,7 @@ SET GLOBAL rocksdb_force_flush_memtable_now = 1;
 --source suite/rocksdb/include/bitlsm_index_read_battery.inc
 
 --echo #
---echo # ==== Phase 3: own uncommitted writes (option B: write-batch union) ====
+--echo # ==== Phase 3: own uncommitted writes (write-batch union) ====
 --echo # The committed base is now in an SST, so source (a) is the bitmap-pruned
 --echo # committed rows and source (b) is this transaction's uncommitted writes.
 --echo # Each case mutates rows inside a transaction and re-checks the same

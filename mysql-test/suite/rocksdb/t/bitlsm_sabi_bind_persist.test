@@ -1,14 +1,9 @@
 --source include/have_rocksdb.inc
 
-# The SABI blocks in a CF's SSTs must survive a compaction that runs while no
-# client has opened the table -- i.e. the build binding must come from the data
-# dictionary at DB open, not from Rdb_key_def::setup at first table open.
-# Before that fix the compaction below rewrote every SST without its SABI
-# block, and the planner silently fell back to its magic selectivity constants.
-#
-# No golden row counts here on purpose: the estimates are captured while the
-# table is open and bound, then re-measured after the blind compaction. The
-# invariant is that they do not move.
+# SABI blocks must survive a compaction that runs while no client has the table
+# open: the build binding comes from the data dictionary at DB open, not from
+# the first table open. The estimates are captured with the table open and
+# re-measured after the blind compaction; they must not move.
 
 # udt-in-mem serves bitlsm reads with a PK scan, but the estimates asserted
 # below come from the planner, not the read path, so the test runs everywhere.

@@ -417,10 +417,9 @@ bool Rdb_cf_options::get_cf_options(const std::string &cf_name,
             Rdb_cf_manager::is_cf_name_reverse(cf_name));
   }
 
-  // Install a per-CF BitLSM UDI factory on data CFs. It stays dormant (null
-  // builder/reader) until Rdb_key_def::setup_bitlsm_index binds this cf_name,
-  // so non-bitlsm CFs pay no per-row cost (RocksDB skips the wrapper on a null
-  // builder). Reuses the shared block cache / table options.
+  // Install a per-CF BitLSM UDI factory on data CFs. It returns a null builder
+  // until Rdb_key_def::setup_bitlsm_index binds this cf_name, and RocksDB skips
+  // the UDI wrapper on a null builder, so non-bitlsm CFs pay no per-row cost.
   if (cf_name != DEFAULT_SYSTEM_CF_NAME && cf_name != DEFAULT_TMP_CF_NAME &&
       cf_name != DEFAULT_TMP_SYSTEM_CF_NAME) {
     const auto *bbt =

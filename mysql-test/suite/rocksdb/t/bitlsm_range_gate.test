@@ -1,15 +1,8 @@
 --source include/have_rocksdb.inc
 
-# C8: range analysis is gated on const_keys/skip_scan_keys, and stock
-# const_keys marking is leading-keypart only. Non-leading BITLSM predicates
-# used to reach range analysis only through two accidental side doors:
-# the skip-scan key collection (an INTERSECT over every WHERE field's
-# part_of_key, emptied by one non-index column) and the GROUP BY loose-scan
-# collection (absent for plain SELECTs). A bare SELECT mixing indexed and
-# non-indexed predicates therefore never ran range analysis and silently
-# lost the index -- FORCE INDEX included. estimate_rowcount now marks
-# const_keys for every BITLSM index with at least one WHERE-referenced
-# column (union, immune to non-index fields).
+# Stock const_keys marking is leading-keypart only, so without BitLSM-specific
+# marking a bare SELECT mixing indexed and non-indexed predicates never reaches
+# range analysis and loses the index, FORCE INDEX included.
 
 CREATE TABLE t_gate (
   id BIGINT NOT NULL,
@@ -19,7 +12,7 @@ CREATE TABLE t_gate (
   INDEX bi (a, b, c) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 
-# 2000 rows; a: 1000 distinct (eq = 2 rows), note: NOT in bi.
+# a: 1000 distinct (eq = 2 rows); note is not in bi.
 --disable_query_log
 let $i = 0;
 while ($i < 2000) {
@@ -29,7 +22,7 @@ while ($i < 2000) {
 --enable_query_log
 SELECT COUNT(*) FROM t_gate;
 
---echo # ==== Phase 1: memtable only (M4b sysvar fallback drives the cost) ====
+--echo # ==== Phase 1: memtable only (sysvar fallback drives the cost) ====
 --echo # (a) bare SELECT, selective indexed eq + NON-index predicate -> bi
 --let $k = query_get_value(EXPLAIN SELECT d FROM t_gate WHERE a = 503 AND note = 'n503', key, 1)
 --let $assert_text = gate/fallback: bare mixed-predicate SELECT reaches bi

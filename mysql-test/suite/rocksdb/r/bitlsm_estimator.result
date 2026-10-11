@@ -12,9 +12,9 @@ SELECT COUNT(*) FROM t_est;
 COUNT(*)
 2000
 #
-# ==== Phase 1: memtable only -> no stats yet (D-E3), decisions are the
-# ==== M4b sysvar fallback, verbatim. Magic prices b<=1 AND c BETWEEN as
-# ==== 0.33*0.33 = 11% and picks bi -- the q2_2-shaped mis-selection.
+# ==== Phase 1: memtable only -> no stats yet, so decisions come from the
+# ==== sysvar fallback. It prices b<=1 AND c BETWEEN as
+# ==== 0.33*0.33 = 11% and picks bi (a mis-selection).
 include/assert.inc [memtable-only: fallback magic routes range+string-range to bi]
 SET GLOBAL rocksdb_force_flush_memtable_now = 1;
 SET GLOBAL rocksdb_bitlsm_estimator_refresh = 1;
@@ -29,7 +29,7 @@ include/assert.inc [estimator: dropped string range no longer shrinks fetch cost
 # (c) OR-of-equalities: optimize_cond wraps each OR arm's equality in a
 #     multiple-equality (Item_equal) at PLANNING time; both translator
 #     walks must unwrap it or the whole OR is dropped (all-or-nothing)
-#     and the estimate silently degrades to the sysvar magic. Covers
+#     and the estimate silently degrades to the sysvar fallback. Covers
 #     ORDERED and UNORDERED arms (SSB q3_3/q3_4 shape).
 include/assert.inc [estimator: OR of two selective ORDERED equalities routes to bi]
 include/assert.inc [estimator: OR of two UNORDERED equalities routes to bi]

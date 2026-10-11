@@ -1,44 +1,30 @@
-/* Copyright (c) Meta Platforms, Inc. and affiliates. */
+// Copyright (c) 2026 Dohyun Kwon
+
 #pragma once
 
 /* BitLSM query type (compiled into rocksdb_se from the BitLSM submodule). */
-#include "bit_lsm_query.h"  // bit_lsm::BitLSMQuery, bit_lsm::BitLSMOptions
+#include "bit_lsm_query.h"
 
 class Item;
 struct KEY;
 
 namespace myrocks {
 
-// M3b-2: translate a pushed index condition (a MySQL Item tree) into a
-// bit_lsm::BitLSMQuery over the columns of `key_info` (a BITLSM_INDEX). The
-// result is a CONSERVATIVE weakening (a necessary condition) of `cond`: any row
-// the query excludes, `cond` also excludes. Correctness of the read is
-// guaranteed elsewhere (ICP re-evaluation); this query is only a pruning hint,
-// so untranslatable sub-conditions are silently OMITTED, never mistranslated.
+// Translate a pushed index condition (a MySQL Item tree) into a
+// bit_lsm::BitLSMQuery over the columns of `key_info` (a BITLSM_INDEX).
 //
-// Rules (see the M3b-2 design):
-//   - AND: each conjunct becomes its own clause_group; unrepresentable
-//     conjuncts are dropped (dropping a conjunct only weakens -> safe).
-//   - OR:  becomes one OR-clause ONLY IF every disjunct is representable;
-//     otherwise the whole OR is omitted (dropping a disjunct would strengthen).
-//   - `field <cmp> const` on an index column -> one QueryCondition.
-//   - `field IN (c1, c2, ...)` -> an OR-clause of EQUAL conditions.
-//   - `(c0, c1, ...) IN ((v00, ...), (v10, ...), ...)` (row constructor) ->
-//     one clause_group of EQUALs PER COLUMN. That is a weakening of the DNF
-//     the row form denotes, which CNF cannot express exactly.
-//   - kEquality attrs: only EQUAL is representable; a binary column
-//     indexed kRange takes range operators like any other attr.
-//   - functions, column-to-column, IS NULL, NOT IN, arithmetic, subqueries,
-//     attr types the extractor cannot bin: omitted.
+// The query is a conservative weakening of `cond`: any row it excludes, `cond`
+// excludes too. ICP re-checks every candidate, so untranslatable parts are
+// omitted, never mistranslated:
+//   - AND: one clause_group per conjunct; an unrepresentable one is dropped.
+//   - OR: one OR-clause if every disjunct is representable, else omitted whole.
+//   - `field <cmp> const` -> one condition; `field IN (...)` -> an OR-clause of
+//     EQUALs; `field BETWEEN lo AND hi` -> two clause_groups; a row-constructor
+//     IN -> one clause_group of EQUALs per column.
+//   - kEquality attrs accept EQUAL only. Everything else is omitted.
 //
-// `*out_options` is (re)built from the index Field types so the comparand
-// variant type matches each attribute (signed int -> int64, unsigned -> uint64,
-// float/double -> double, binary string -> string). The assembled query is
-// Validate()d against it; on validation failure the query is emptied (degrades
-// to "no pruning", which is still a valid weakening).
-//
-// Returns true if a valid (possibly empty) query was produced; false if
-// Validate() rejected it (in which case *out_query is emptied).
+// `*out_options` is rebuilt from the index Field types. Returns false if
+// Validate() rejected the query, in which case *out_query is emptied.
 bool rdb_bitlsm_assemble_query(const KEY &key_info, Item *cond,
                                bit_lsm::BitLSMQuery *out_query,
                                bit_lsm::BitLSMOptions *out_options);

@@ -4,10 +4,9 @@ if [ -z "$PATH" ]; then
     export PATH="/sbin:/usr/sbin:/bin:/usr/bin"
 fi
 
-# Apply BitLSM's additive rocksdb patch to the bundled rocksdb (idempotent).
-# The patch ships inside the BitLSM submodule (rocksdb/patches/); MyRocks owns
-# *applying* it. Absolute paths: `git -C <rdb>` changes dir, so a relative patch
-# path would not resolve. Skip if already applied (reverse-check succeeds).
+# Apply BitLSM's rocksdb patch (shipped in the submodule under rocksdb/patches/)
+# to the bundled rocksdb. Idempotent: skipped when the reverse check succeeds.
+# Absolute paths because `git -C` changes directory.
 RDB_ABS="$(pwd)/rocksdb/third_party/rocksdb"
 PATCH_ABS="$(pwd)/rocksdb/patches/rocksdb-bitlsm.patch"
 if [ -f "$PATCH_ABS" ]; then
@@ -37,10 +36,8 @@ do
 done
 rm $MKFILE
 
-# BitLSM bitmap-layer sources, compiled into the plugin against the single
-# rocksdb. This list is owned by MyRocks (BitLSM stays free of consumer-specific
-# files); update it when bumping the BitLSM submodule. roaring comes via
-# FetchContent (see CMakeLists).
+# BitLSM bitmap-layer sources compiled into the plugin. Update this list when
+# bumping the BitLSM submodule. roaring comes via FetchContent (see CMakeLists).
 for f in \
   src/include/sabi_factory.cpp \
   src/include/sabi_builder.cpp \

@@ -1,0 +1,36 @@
+--source include/have_rocksdb.inc
+
+# The optimizer auto-selects a BITLSM_INDEX (no FORCE INDEX) for predicates on
+# non-leading index columns, which the stock leading-column gate in
+# index_range_scan_plan.cc would discard. EXPLAIN must show key=bi.
+
+CREATE TABLE t_read (
+  id BIGINT NOT NULL,
+  a INT, b DOUBLE, c VARBINARY(16),
+  d INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_read_cf',
+  INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+INSERT INTO t_read VALUES
+  (1,  -50,  -1.5, 'alpha', 100),
+  (2,    0,   0.0, 'beta',  200),
+  (3,   10,   2.5, 'gamma', 300),
+  (4,   10,   2.5, 'gamma', 400),
+  (5,   25,  99.9, 'delta', 500),
+  (6,  100, 100.0, 'x',     600),
+  (7,   10,  NULL, 'gamma', 700),
+  (8, NULL,   2.5, 'gamma', 800),
+  (9,   10,   2.5, NULL,    900),
+  (10,  50,  50.0, 'zeta',  NULL);
+
+--echo #
+--echo # ==== Phase 1: data in the memtable ====
+--source suite/rocksdb/include/bitlsm_autoselect_battery.inc
+
+--echo #
+--echo # ==== Phase 2: data flushed to an SST (SABI block present) ====
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+--source suite/rocksdb/include/bitlsm_autoselect_battery.inc
+
+DROP TABLE t_read;

@@ -327,13 +327,9 @@ IF(WITH_EMBEDDED_SERVER)
   ADD_SUBDIRECTORY(unittest)
 ENDIF()
 
-# Standalone gtest for the BitLSM row-value decoder (M3a-4). The decoder header
-# (rdb_bitlsm_extractor.h) depends only on bit_lsm_encoding.h, so this test links
-# nothing from the storage engine -- it drives ExtractAll over hand-built value
-# blobs. Build + run: `ninja rdb_bitlsm_decoder_test && \
-#   ./storage/rocksdb/rdb_bitlsm_decoder_test`. All include dirs it needs
-# (rocksdb/src/include, ${ROCKSDB_ROOT}/include, the fused gtest) are already in
-# INCLUDE_DIRECTORIES above.
+# Standalone gtest for the BitLSM row-value decoder. rdb_bitlsm_extractor.h
+# depends only on bit_lsm_encoding.h, so this links nothing from the engine.
+# Run: ninja rdb_bitlsm_decoder_test && storage/rocksdb/rdb_bitlsm_decoder_test
 IF (NOT HAVE_EXTERNAL_ROCKSDB)
   SET(GTEST_FUSED_DIR ${ROCKSDB_ROOT}/third-party/gtest-1.8.1/fused-src)
   ADD_EXECUTABLE(rdb_bitlsm_decoder_test
@@ -342,16 +338,13 @@ IF (NOT HAVE_EXTERNAL_ROCKSDB)
     ${GTEST_FUSED_DIR}/gtest/gtest_main.cc)
   TARGET_INCLUDE_DIRECTORIES(rdb_bitlsm_decoder_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
-  # -w silences the fused gtest sources; C++20 (needed by the BitLSM headers) is
-  # applied by the rdb_cxx20_tgt FOREACH below, matching the other RocksDB
-  # targets.
+  # -w silences the fused gtest sources; C++20 comes from the FOREACH below.
   TARGET_COMPILE_OPTIONS(rdb_bitlsm_decoder_test PRIVATE -w)
   TARGET_LINK_LIBRARIES(rdb_bitlsm_decoder_test pthread)
 ENDIF()
 
-# Standalone gtest for the persisted BitLSM build descriptor. Same rationale as
-# the decoder test above: rdb_bitlsm_descriptor.h pulls in no server or RocksDB
-# headers, so the serialization can be exercised without linking the engine.
+# Standalone gtest for the persisted BitLSM build descriptor (same setup as the
+# decoder test).
 IF (NOT HAVE_EXTERNAL_ROCKSDB)
   ADD_EXECUTABLE(rdb_bitlsm_descriptor_test
     rdb_bitlsm_descriptor_test.cc

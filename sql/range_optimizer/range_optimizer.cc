@@ -599,8 +599,8 @@ int test_quick_select(THD *thd, MEM_ROOT *return_mem_root,
                                   keys_to_use, table, query_block, &param)) {
     return 0;
   }
-  // M5 (BitLSM): let check_quick_select's BitLSM branch estimate from the
-  // same condition the read path will assemble its bitmap query from.
+  // Lets check_quick_select's BitLSM branch estimate from the same condition
+  // the read path will build its bitmap query from.
   param.bitlsm_cond = cond;
 
   /*

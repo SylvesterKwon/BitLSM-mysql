@@ -1,18 +1,11 @@
 --source include/have_rocksdb.inc
 
-# C6: a BITLSM_INDEX must NOT advertise index order (HA_READ_ORDER/
-# HA_READ_PREV). The candidate iterator returns rows in PK/SST order, not in
-# bi keypart order; if the optimizer trusts index order it skips sort/temp
-# for ORDER BY / GROUP BY it deems satisfied by the index (e.g. GROUP BY on
-# the leading keypart with later keyparts bound by equality) and
-# stream-aggregates an unordered input -> silently wrong, fragmented groups.
-# Found by the myrocks_integration_test fingerprint gate on SSB-flat q2_3
-# (7 groups -> 1,915 fragments); spec: 2026-07-18-bitlsm-bi-order-contract-bug.
-#
-# udt-in-mem combo is skipped: C1 falls back to full-candidate reads there,
-# and this test asserts plan shape, which is out of that combo's scope.
+# A BITLSM_INDEX must not advertise index order (HA_READ_ORDER / HA_READ_PREV):
+# candidates come back in PK order, so an ORDER BY / GROUP BY the optimizer
+# deemed satisfied by the index would stream unordered input into fragmented
+# groups. udt-in-mem is skipped: it serves bitlsm reads with a PK scan.
 if (`SELECT @@rocksdb_enable_udt_in_mem`) {
-  --skip Test asserts bi plan shape; udt-in-mem uses the C1 fallback path
+  --skip Test asserts the bi plan shape; udt-in-mem uses the UDT fallback path
 }
 
 CREATE TABLE t_oc (
@@ -26,7 +19,7 @@ CREATE TABLE t_oc (
 ) ENGINE=ROCKSDB;
 
 # PK order deliberately interleaves y so a stream-aggregate over PK-ordered
-# candidates would fragment the y groups (pre-C6 symptom).
+# candidates would fragment the y groups.
 INSERT INTO t_oc VALUES
   (1,1997,'B1','E',10),(2,1992,'B1','E',20),(3,1997,'B1','E',30),
   (4,1992,'B1','E',40),(5,1995,'B1','E',50),(6,1997,'B1','E',60),
@@ -35,7 +28,7 @@ INSERT INTO t_oc VALUES
 SET GLOBAL rocksdb_force_flush_memtable_now = 1;
 
 --echo # (1) GROUP BY on leading keypart with later keyparts equality-bound —
---echo #     the shape that fragmented pre-C6. bi must equal the full scan.
+--echo #     bi must equal the full scan.
 SELECT SUM(v), y, b FROM t_oc FORCE INDEX (bi)
 WHERE b='B1' AND r='E' GROUP BY y, b ORDER BY y, b;
 SELECT SUM(v), y, b FROM t_oc IGNORE INDEX (bi)

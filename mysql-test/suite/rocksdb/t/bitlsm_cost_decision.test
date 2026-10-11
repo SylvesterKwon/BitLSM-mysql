@@ -1,0 +1,40 @@
+--source include/have_rocksdb.inc
+
+# Sysvar-driven BITLSM_INDEX cost with the engine estimator disabled. The range
+# optimizer classifies each constrained keypart (equality / IN-list / range),
+# multiplies the selectivity sysvars and prices the access as prune + candidate
+# re-fetches. bitlsm_index_cost_factor tunes the preference.
+
+--echo # sysvar defaults (double; session, HINT_UPDATEABLE)
+SELECT @@session.bitlsm_index_cost_factor, @@session.bitlsm_eq_selectivity,
+       @@session.bitlsm_range_selectivity;
+
+CREATE TABLE t_read (
+  id BIGINT NOT NULL,
+  a INT, b INT, c INT,
+  d INT,
+  PRIMARY KEY (id) COMMENT 'cfname=t_cost_cf',
+  INDEX bi (a, b, c) BITLSM_INDEX
+) ENGINE=ROCKSDB;
+
+# Controlled cardinality: a 3-way equality matches few rows while a broad
+# non-leading range matches about a third. d is not in bi (non-covering).
+--disable_query_log
+let $i = 0;
+while ($i < 2000) {
+  eval INSERT INTO t_read VALUES ($i, $i % 100, $i % 40, $i % 25, $i);
+  inc $i;
+}
+--enable_query_log
+SELECT COUNT(*) FROM t_read;
+
+--echo #
+--echo # ==== Phase 1: data in the memtable ====
+--source suite/rocksdb/include/bitlsm_cost_decision_battery.inc
+
+--echo #
+--echo # ==== Phase 2: data flushed to an SST (SABI block present) ====
+SET GLOBAL rocksdb_force_flush_memtable_now = 1;
+--source suite/rocksdb/include/bitlsm_cost_decision_battery.inc
+
+DROP TABLE t_read;

@@ -7257,16 +7257,10 @@ static bool prepare_preexisting_foreign_key(
 /**
   set vector index info to key_info
 */
-// §3.5 attribute type support for BITLSM_INDEX. ORDERED: integer/float/DATE
-// (<=8B, order-preserving okey); UNORDERED equality on raw bytes => binary
-// collation strings only. Everything else (DECIMAL/BLOB/TEXT/JSON/ENUM/SET/
-// non-binary string) is rejected.
-//
-// DATETIME/TIMESTAMP are NOT here even though they are <=8B temporals: the
-// engine-side extractor (rdb_datadic.cc::bitlsm_derive_enc) has no encoding for
-// them, so accepting them at DDL only defers the failure to table open, where
-// it surfaces as HA_ERR_UNSUPPORTED. Keep this list equal to what the extractor
-// actually supports.
+// Column types a BITLSM_INDEX accepts: integer/float/DATE (order-preserving
+// okey of <= 8 bytes) and binary-collation strings. Keep in sync with the
+// engine extractor (rdb_datadic.cc bitlsm_derive_enc), which has no
+// DATETIME/TIMESTAMP encoding.
 static bool bitlsm_type_supported(const Create_field *cf) {
   switch (cf->sql_type) {
     case MYSQL_TYPE_TINY:
@@ -7280,24 +7274,17 @@ static bool bitlsm_type_supported(const Create_field *cf) {
     case MYSQL_TYPE_NEWDATE:
       return true;
     case MYSQL_TYPE_VARCHAR:
-      // SABI bins and compares a binary attribute by memcmp over the bytes the
-      // row stores, so the collation must agree that those bytes ARE the value.
-      // Binary sort order alone is not enough: utf8mb4_bin and latin1_bin are
-      // MY_CS_BINSORT but PAD SPACE, where SQL holds 'ab' = 'ab ' while memcmp
-      // does not. A row stored with a trailing space would then be pruned away
-      // from a query that must match it -- a false negative the engine's
-      // per-row re-check cannot recover, because the candidate never arrives.
-      // NO PAD binary collations (binary, *_0900_bin) have no such gap.
+      // The bitmap compares stored bytes by memcmp, so the collation must treat
+      // those bytes as the value. A PAD SPACE collation holds 'ab' = 'ab '
+      // while memcmp does not, and a pruned row never reaches the re-check.
       return cf->charset != nullptr &&
              (cf->charset == &my_charset_bin ||
               ((cf->charset->state & MY_CS_BINSORT) &&
                cf->charset->pad_attribute == NO_PAD));
     case MYSQL_TYPE_STRING:
-      // CHAR/BINARY is stored space-padded in the row, so the stored bytes
-      // differ from the comparand a query supplies ('ab' vs "ab  ") and the
-      // same false negative applies even under NO PAD. Supporting it means
-      // trimming on both the extract and the compare side; until that exists,
-      // refuse it at DDL rather than bin it wrong.
+      // TODO: support CHAR/BINARY. It is stored space-padded, so the stored
+      // bytes differ from a query's comparand even under NO PAD; both the
+      // extract and the compare side would need to trim.
       return false;
     default:
       return false;
@@ -7305,16 +7292,13 @@ static bool bitlsm_type_supported(const Create_field *cf) {
 }
 
 // Validate a BITLSM_INDEX declaration and stamp KEY::m_is_bitlsm. Server-layer
-// checks only (D3 non-unique, D10 non-virtual, §3.5 supported types); the
-// non-PK-column check and CF constraints (D5) run in the storage engine
-// (Rdb_key_def setup, M3a-2), mirroring how fb_vector splits validation.
-// Returns true on error (my_error already raised).
+// checks only; the non-PK-column and column-family checks run in the engine
+// (Rdb_key_def setup). Returns true on error (my_error already raised).
 static bool prepare_bitlsm_index(const Key_spec *key, KEY *key_info,
                                  List<Create_field> *create_list) {
   if (!key->key_create_info.m_is_bitlsm) {
-    // The keyword selects a BITLSM bin layout and means nothing to any other
-    // index type. Refuse it there rather than accept and ignore it, which
-    // would read as "this index answers ranges that way" and not be true.
+    // ORDERED/UNORDERED means nothing on another index type; refuse it rather
+    // than silently ignore it.
     for (const Key_part_spec *kp : key->columns) {
       if (kp->get_bitlsm_type() != Bitlsm_key_part_type::NOT_SPECIFIED) {
         my_error(ER_WRONG_ARGUMENTS, MYF(0),
@@ -7325,7 +7309,7 @@ static bool prepare_bitlsm_index(const Key_spec *key, KEY *key_info,
     return false;  // not a bitlsm index
   }
 
-  // D3: virtual keyspace => plain non-unique secondary index only.
+  // A BITLSM_INDEX has no keyspace of its own, so it cannot enforce uniqueness.
   if (key->type != KEYTYPE_MULTIPLE) {
     my_error(ER_WRONG_ARGUMENTS, MYF(0),
              "BITLSM_INDEX can only be a plain (non-PRIMARY/UNIQUE) index");
@@ -7363,19 +7347,18 @@ static bool prepare_bitlsm_index(const Key_spec *key, KEY *key_info,
     if (cf == nullptr) continue;  // resolved by the generic key column builder
 
     if (kp->get_prefix_length() != 0) {
-      // SABI bins the whole stored value; a prefix length would be accepted
-      // and then ignored, so the index would not be the one the user asked
-      // for. Refuse rather than quietly widen it.
+      // The bitmap bins the whole stored value; a prefix length would be
+      // silently ignored, so refuse it.
       my_error(ER_WRONG_ARGUMENTS, MYF(0),
                "BITLSM_INDEX does not support a key part prefix length");
       return true;
     }
-    if (cf->is_virtual_gcol()) {  // D10: value doesn't store virtual columns
+    if (cf->is_virtual_gcol()) {  // the row value stores no virtual columns
       my_error(ER_WRONG_ARGUMENTS, MYF(0),
                "BITLSM_INDEX cannot index a virtual generated column");
       return true;
     }
-    if (!bitlsm_type_supported(cf)) {  // §3.5
+    if (!bitlsm_type_supported(cf)) {
       my_error(ER_WRONG_ARGUMENTS, MYF(0),
                "BITLSM_INDEX column type is not supported");
       return true;

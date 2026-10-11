@@ -7,7 +7,7 @@ CREATE TABLE t_read (
 id BIGINT NOT NULL,
 a INT, b INT, c INT,
 d INT,
-PRIMARY KEY (id) COMMENT 'cfname=t_m4b_cf',
+PRIMARY KEY (id) COMMENT 'cfname=t_cost_cf',
 INDEX bi (a, b, c) BITLSM_INDEX
 ) ENGINE=ROCKSDB;
 SELECT COUNT(*) FROM t_read;
@@ -30,10 +30,10 @@ include/assert.inc [S2 single equality (c=7): chosen-plan row set identical to f
 include/assert.inc [non-selective range (c>=1) does NOT auto-select bi]
 include/assert.inc [N1 non-selective range (c>=1): chosen-plan row set identical to full scan]
 #
-# (N2) NON-SELECTIVE IN-list c=1 OR c=3 OR c=5 (dead-simple estimator
+# (N2) NON-SELECTIVE IN-list c=1 OR c=3 OR c=5 (the sysvar estimator
 #      scores 3 points at 3*eq=0.3, above the ~0.2 threshold -> NOT bi).
 #      Exercises the n-point IN-list classification. (The real match is
-#      ~12% of rows; a correlation-aware estimate is M5.)
+#      ~12% of rows; the sysvar estimator is not correlation-aware.)
 include/assert.inc [non-selective IN-list (c in 1,3,5) does NOT auto-select bi]
 include/assert.inc [N2 IN-list (c=1 OR c=3 OR c=5): chosen-plan row set identical to full scan]
 #
@@ -69,10 +69,10 @@ include/assert.inc [S2 single equality (c=7): chosen-plan row set identical to f
 include/assert.inc [non-selective range (c>=1) does NOT auto-select bi]
 include/assert.inc [N1 non-selective range (c>=1): chosen-plan row set identical to full scan]
 #
-# (N2) NON-SELECTIVE IN-list c=1 OR c=3 OR c=5 (dead-simple estimator
+# (N2) NON-SELECTIVE IN-list c=1 OR c=3 OR c=5 (the sysvar estimator
 #      scores 3 points at 3*eq=0.3, above the ~0.2 threshold -> NOT bi).
 #      Exercises the n-point IN-list classification. (The real match is
-#      ~12% of rows; a correlation-aware estimate is M5.)
+#      ~12% of rows; the sysvar estimator is not correlation-aware.)
 include/assert.inc [non-selective IN-list (c in 1,3,5) does NOT auto-select bi]
 include/assert.inc [N2 IN-list (c=1 OR c=3 OR c=5): chosen-plan row set identical to full scan]
 #

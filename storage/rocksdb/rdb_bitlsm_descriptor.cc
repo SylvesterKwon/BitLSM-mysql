@@ -1,4 +1,5 @@
-/* Copyright (c) Meta Platforms, Inc. and affiliates. */
+// Copyright (c) 2026 Dohyun Kwon
+
 #include "./rdb_bitlsm_descriptor.h"
 
 #include <cstring>
@@ -66,8 +67,8 @@ class Reader {
 
   bool bad() const { return m_bad; }
   bool at_end() const { return !m_bad && m_pos == m_buf.size(); }
-  // Sanity-bound an element count before reserving: every element costs at
-  // least one byte, so a count larger than what is left is corrupt.
+  // Every element costs at least one byte, so a count larger than the
+  // remaining input is corrupt. Checked before reserve().
   bool count_fits(uint32_t n) const {
     return !m_bad && n <= m_buf.size() - m_pos;
   }
@@ -85,21 +86,21 @@ std::string rdb_bitlsm_serialize_descriptor(
   std::string out;
   put_u16(&out, RDB_BITLSM_DESCRIPTOR_VERSION);
 
-  // --- schema ---
+  // schema
   put_u32(&out, static_cast<uint32_t>(desc.schema.index_types.size()));
   for (const auto index_type : desc.schema.index_types) {
     put_u8(&out, static_cast<uint8_t>(index_type));
   }
   put_double(&out, desc.schema.rho);
 
-  // --- plan header ---
+  // plan header
   put_u32(&out, desc.plan.attr_num);
   put_u32(&out, desc.plan.ttl_bytes);
   put_u32(&out, desc.plan.null_bytes_len);
   put_u8(&out, desc.plan.maybe_unpack_info ? 1 : 0);
   put_u32(&out, desc.plan.pk_index_number);
 
-  // --- walk list ---
+  // walk list
   put_u32(&out, static_cast<uint32_t>(desc.plan.walk.size()));
   for (const auto &e : desc.plan.walk) {
     put_u8(&out, static_cast<uint8_t>(e.shape));
@@ -125,9 +126,7 @@ bool rdb_bitlsm_deserialize_descriptor(std::string_view blob,
   out->schema.index_types.reserve(index_type_count);
   for (uint32_t i = 0; i < index_type_count; ++i) {
     const uint8_t v = r.u8();
-    // Wire values are unchanged by the AttrRole -> IndexType rename:
-    // UNORDERED(0)/ORDERED(1) became kEquality(0)/kRange(1), same numbering,
-    // so descriptors written before the rename still decode correctly.
+    // Wire values: 0 = kEquality, 1 = kRange. Do not renumber.
     if (v > static_cast<uint8_t>(bit_lsm::IndexType::kRange)) return false;
     out->schema.index_types.push_back(static_cast<bit_lsm::IndexType>(v));
   }

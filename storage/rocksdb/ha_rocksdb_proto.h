@@ -78,7 +78,7 @@ extern const std::string TRUNCATE_TABLE_PREFIX;
 
 rocksdb::TransactionDB *rdb_get_rocksdb_db();
 
-// M5: rocksdb_bitlsm_estimator sysvar (estimator attach gate at table open).
+// Value of the rocksdb_bitlsm_estimator sysvar.
 bool rdb_bitlsm_estimator_enabled();
 
 class Rdb_cf_manager;

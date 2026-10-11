@@ -1,19 +1,11 @@
 --source include/have_rocksdb.inc
 
-# The per-key-part ORDERED keyword decides how the SSTs were binned, so it has
-# to survive the DD round-trip with the BITLSM marker itself: a reopened table
-# that fell back to the binary default would bin against SSTs built the other
-# way. bitlsm_ddl_persist covers the marker; this covers the keyword.
-#
-# Measured the way bitlsm_date_prune measures, and for the same reason: the row
-# set is correct either way (ICP re-checks every candidate), so only the
-# CANDIDATE COUNT shows whether the range actually pruned.
-# rocksdb_number_multiget_keys_read counts one per candidate.
+# The per-key-part ORDERED keyword decides how the SSTs are binned, so it must
+# survive the DD round-trip. Measured like bitlsm_date_prune: only the candidate
+# count (rocksdb_number_multiget_keys_read) shows whether the range pruned.
 
-# Under UDT the read path skips the bitmap entirely and full-scans the PK, so
-# there is no pruning to measure. Own file rather than an if-branch inside
-# bitlsm_ddl_persist: a branch would emit different output per combination and
-# a single recorded .result cannot match both.
+# Under UDT the read path full-scans the PK, so there is no pruning to measure.
+# A separate file because one recorded .result cannot cover both combinations.
 --let $udt = `SELECT @@rocksdb_enable_udt_in_mem`
 if ($udt) {
 --skip BitLSM keyword pruning runs under non-UDT combinations only
