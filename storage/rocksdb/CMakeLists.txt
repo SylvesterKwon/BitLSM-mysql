@@ -196,7 +196,6 @@ SET(ROCKSDB_SE_SOURCES
   sql_dd.cc sql_dd.h
   rdb_cmd_srv_helper.cc rdb_cmd_srv_helper.h
   rdb_vector_db.cc rdb_vector_db.h
-  rdb_bitlsm_smoke.cc
   rdb_bitlsm.cc rdb_bitlsm.h
   rdb_bitlsm_descriptor.cc rdb_bitlsm_descriptor.h
   rdb_bitlsm_query.cc rdb_bitlsm_query.h

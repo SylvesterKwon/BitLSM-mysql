@@ -143,9 +143,6 @@ extern "C" void RocksDbThreadYield() {
 
 namespace myrocks {
 
-// Defined in rdb_bitlsm_smoke.cc.
-bool rdb_bitlsm_smoke_check();
-
 #ifndef NDEBUG
 // Debug builds only: the last BitLSM query assembled from a pushed WHERE on
 // this connection, exposed as the session status var rocksdb_bitlsm_last_query.
@@ -9934,10 +9931,6 @@ static int rocksdb_init_func(void *const p) {
   int ret = rocksdb_init_internal(p);
   if (ret) {
     rocksdb_done_func(p);
-  } else {
-    // TODO: remove this startup smoke check (see rdb_bitlsm_smoke.cc).
-    LogPluginErrMsg(INFORMATION_LEVEL, ER_LOG_PRINTF_MSG, "BitLSM API smoke: %s",
-                    myrocks::rdb_bitlsm_smoke_check() ? "OK" : "FAILED");
   }
   return ret;
 }
